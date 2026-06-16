@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────
+#  MECA Agent — Configuration TEMPLATE
+#
+#  LOCAL DEV ONLY. Copy this to config/config.yaml
+#  and fill in your real credentials:
+#
+#     cp config/config.example.yaml config/config.yaml
+#
+#  config/config.yaml is gitignored and must NEVER be committed.
+#
+#  In GitHub Actions there is NO config.yaml — every value below
+#  is supplied as a GitHub Secret / env var instead (see README).
+#  The env var name for each field is shown in the comment.
+# ─────────────────────────────────────────────
+
+# ── MECA ProMeister Portal ───────────────────
+portal:
+  username: "YOUR_MECA_LOGIN"          # env: PORTAL_USERNAME
+  password: "YOUR_MECA_PASSWORD"       # env: PORTAL_PASSWORD
+  bookings_path: "/Booking/Index"      # env: PORTAL_BOOKINGS_PATH (optional)
+  debug: false                         # env: PORTAL_DEBUG (true/false) — headful browser
+
+# ── Claude AI (used by improve.py) ───────────
+anthropic:
+  api_key: "YOUR_ANTHROPIC_KEY"        # env: ANTHROPIC_API_KEY
+
+# ── SMS Settings ─────────────────────────────
+sms:
+  provider: "46elks"                   # env: SMS_PROVIDER (46elks | twilio)
+  recipient_number: "+46700000000"     # env: SMS_RECIPIENT_NUMBER (comma-separated OK)
+  sender_name: "MECA"                  # env: SMS_SENDER_NAME (max 11 chars)
+  api_user: "YOUR_46ELKS_USER"         # env: SMS_API_USER
+  api_password: "YOUR_46ELKS_PASSWORD" # env: SMS_API_PASSWORD
+  # Twilio (only if provider == twilio)
+  twilio_account_sid: ""               # env: TWILIO_ACCOUNT_SID
+  twilio_auth_token: ""                # env: TWILIO_AUTH_TOKEN
+  twilio_from_number: ""               # env: TWILIO_FROM_NUMBER
+
+# ── Booking trigger ──────────────────────────
+trigger:
+  # "email"  → only scrape the portal when a MECA "booking made" email
+  #            has arrived in Gmail (timely + gentle on the portal).
+  # "always" → scrape every scheduled run regardless (works without Gmail).
+  mode: "always"                       # env: BOOKING_TRIGGER_MODE
+  # Gmail search query that matches the MECA booking-notification email.
+  # Tune the from:/subject: to whatever MECA actually sends you.
+  email_query: 'newer_than:1d (subject:bokning OR subject:booking)'  # env: BOOKING_EMAIL_QUERY
+
+# ── MECA Parts Portal (pro.meca.se) — optional ───
+parts_portal:
+  username: "YOUR_PARTS_LOGIN"         # env: PARTS_PORTAL_USERNAME
+  password: "YOUR_PARTS_PASSWORD"      # env: PARTS_PORTAL_PASSWORD
+  test_email: "you@example.com"        # env: PARTS_PORTAL_TEST_EMAIL
+
+# ── Workshop details (used in messages) ──────
+workshop:
+  phone: "016-00 00 00"
+  email: "you@example.com"
+  name: "Your Workshop AB"
+  city: "Eskilstuna"

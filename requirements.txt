@@ -1,0 +1,8 @@
+anthropic>=0.69.0
+playwright>=1.40.0
+pyyaml>=6.0
+# Gmail trigger (email-gated mode). Optional locally; required in CI for trigger.mode=email.
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1

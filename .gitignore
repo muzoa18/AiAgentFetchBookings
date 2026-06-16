@@ -1,0 +1,31 @@
+# ── Secrets — NEVER commit these ────────────────────────────────
+# Real credentials live in GitHub Secrets (CI) or locally only.
+config/config.yaml
+config/gmail_credentials.json
+config/gmail_token.json
+config/browser_context_parts/
+*.env
+.env
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ── IDE ─────────────────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── Runtime logs & screenshots (noisy) ──────────────────────────
+# NOTE: logs/run_history.jsonl is intentionally NOT ignored — it is
+# the structured history the improve agent reads, and the daily
+# workflow commits it back so it survives between CI runs.
+logs/*.log
+logs/*.png
+logs/proposals/
+
+# ── Playwright ──────────────────────────────────────────────────
+playwright-report/

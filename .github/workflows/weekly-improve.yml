@@ -1,0 +1,45 @@
+name: Weekly Self-Improve
+
+# Once a week, Claude reviews the codebase + run history and proposes fixes.
+# Changes are applied to a branch and opened as a Pull Request for review —
+# nothing reaches the live portal automation unreviewed.
+on:
+  schedule:
+    - cron: "0 6 * * 1"        # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  improve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run improve agent (apply-all + syntax check)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python improve.py --apply-all
+
+      - name: Open Pull Request with proposed changes
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: improve/weekly
+          delete-branch: true
+          commit-message: "ai: weekly self-improve proposals"
+          title: "🤖 Weekly self-improve — review proposed changes"
+          body-path: improve_reports/latest.md
+          labels: automated, self-improve

@@ -1,0 +1,90 @@
+name: MECA Booking Agent
+
+# Runs frequently during business hours. In "email" trigger mode it cheaply
+# checks Gmail first and only logs into the portal when MECA has emailed that a
+# booking was made. Cron is in UTC — Sweden is UTC+1 (winter) / UTC+2 (summer),
+# so 05–16 UTC ≈ 06–18 (winter) / 07–19 (summer) local. Adjust if needed.
+on:
+  schedule:
+    - cron: "*/30 5-16 * * 1-6"   # every 30 min, Mon–Sat, business hours (UTC)
+  workflow_dispatch:               # allow manual runs from the Actions tab
+
+# Don't let two runs overlap (they both push state back to main).
+concurrency:
+  group: meca-bookings
+  cancel-in-progress: false
+
+permissions:
+  contents: write                  # needed to commit seen_ids / run history back
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Restore Gmail credentials (for email-gated trigger)
+        env:
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+          GMAIL_CREDENTIALS_JSON: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
+        run: |
+          mkdir -p config
+          if [ -n "$GMAIL_TOKEN_JSON" ]; then
+            printf '%s' "$GMAIL_TOKEN_JSON" > config/gmail_token.json
+            printf '%s' "$GMAIL_CREDENTIALS_JSON" > config/gmail_credentials.json
+            echo "Gmail credentials restored."
+          else
+            echo "No Gmail secrets set — email trigger will fail-open (always run)."
+          fi
+
+      - name: Run booking agent
+        env:
+          PORTAL_USERNAME:      ${{ secrets.PORTAL_USERNAME }}
+          PORTAL_PASSWORD:      ${{ secrets.PORTAL_PASSWORD }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          SMS_PROVIDER:         ${{ secrets.SMS_PROVIDER }}
+          SMS_RECIPIENT_NUMBER: ${{ secrets.SMS_RECIPIENT_NUMBER }}
+          SMS_SENDER_NAME:      ${{ secrets.SMS_SENDER_NAME }}
+          SMS_API_USER:         ${{ secrets.SMS_API_USER }}
+          SMS_API_PASSWORD:     ${{ secrets.SMS_API_PASSWORD }}
+          # "email" gates on a MECA notification; "always" scrapes every run.
+          BOOKING_TRIGGER_MODE: ${{ vars.BOOKING_TRIGGER_MODE || 'always' }}
+          BOOKING_EMAIL_QUERY:  ${{ vars.BOOKING_EMAIL_QUERY }}
+        run: python agent.py
+
+      - name: Persist state back to repo
+        if: ${{ always() }}
+        run: |
+          git config user.name  "meca-agent[bot]"
+          git config user.email "meca-agent[bot]@users.noreply.github.com"
+          git add config/seen_ids.txt config/seen_email_ids.txt logs/run_history.jsonl 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+          else
+            git commit -m "chore: update booking state [skip ci]"
+            git push
+          fi
+
+      - name: Upload logs & screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meca-logs-${{ github.run_id }}
+          path: |
+            logs/*.log
+            logs/*.png
+          if-no-files-found: ignore
+          retention-days: 14
