@@ -69,6 +69,18 @@ def fetch_bookings(config: dict) -> list[dict]:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
+
+            # Verify login actually succeeded — password field should be gone.
+            still_on_login = False
+            for sel in LOGIN_SELECTORS["password"]:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    still_on_login = True
+                    break
+            if still_on_login:
+                log.error("Still on login form after submit — login likely failed.")
+                page.screenshot(path="logs/login_failed.png")
+                return []
             log.info("Logged in. URL: %s", page.url)
 
             # ── Step 2: Go to booking list if not already there ───────────────
@@ -431,7 +443,13 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            qty = ""
+            if len(cells) > 3:
+                cand = cells[3].inner_text().strip()
+                # Only accept short pure-integer quantities (e.g. '1', '4'),
+                # never prices, percentages or SEK amounts.
+                if re.fullmatch(r"\d{1,3}", cand):
+                    qty = cand
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":

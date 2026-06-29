@@ -137,11 +137,20 @@ def run():
             )
 
     save_seen_ids(seen_ids)
-    log.info("Done. Sent %d new SMS notification(s).", new_count)
+    pending = sum(
+        1 for b in bookings
+        if b.get("id") in seen_ids
+        and b.get("booking_type") in ("Förfrågan", "Offert")
+    )
+    log.info(
+        "Done. Sent %d new SMS notification(s). %d pending Förfrågan/Offert still on Nya tab.",
+        new_count, pending,
+    )
     log_run("booking_agent", {
         "bookings_found": len(bookings),
         "sms_sent":       new_count,
         "sms_failed":     sms_failed,
+        "pending_manual": pending,
     })
 
 
@@ -205,3 +214,9 @@ def build_sms(booking: dict) -> str:
 
 if __name__ == "__main__":
     run()
+
+# NOTE: parts_agent.py is referenced in SKILL.md as being launched for
+# Förfrågan bookings, but agent.py currently has no import or call to it.
+# Either restore parts_agent.py and wire it into the Förfrågan branch, or
+# update SKILL.md to reflect that Förfrågan handling is manual-only.
+
