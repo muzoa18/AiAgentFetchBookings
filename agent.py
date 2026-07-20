@@ -110,6 +110,19 @@ def run():
         seen_ids.add(booking_id)
         new_count += 1
 
+        # ── Förfrågan → build a quote via parts_agent ────────────────────────
+        if booking_type == "Förfrågan":
+            try:
+                from parts_agent import build_quote
+                reg = booking.get("reg_nr", "")
+                work = booking.get("services", []) or booking.get("parts", [])
+                log.info("Förfrågan %s — launching parts_agent for reg %s", booking_id, reg)
+                build_quote(config, reg_nr=reg, work=work, booking=booking)
+            except ImportError:
+                log.warning("parts_agent not available — skipping quote for %s", booking_id)
+            except Exception as exc:
+                log.exception("parts_agent failed for %s: %s", booking_id, exc)
+
         # ── Mark Hanterad (Bokning only — Förfrågan has no button) ───────────
         if not detail_url:
             log.warning("No detail URL for %s.", booking_id)
@@ -136,12 +149,19 @@ def run():
                 "Handle manually at: %s", booking_id, detail_url
             )
 
+    pending_manual = [
+        b.get("id", "unknown") for b in bookings
+        if b.get("id") in seen_ids and b.get("booking_type") in ("Förfrågan", "Offert")
+    ]
     save_seen_ids(seen_ids)
     log.info("Done. Sent %d new SMS notification(s).", new_count)
+    if pending_manual:
+        log.warning("%d booking(s) still need manual portal action: %s", len(pending_manual), pending_manual)
     log_run("booking_agent", {
         "bookings_found": len(bookings),
         "sms_sent":       new_count,
         "sms_failed":     sms_failed,
+        "pending_manual": len(pending_manual),
     })
 
 

@@ -431,7 +431,11 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            qty = ""
+            if len(cells) > 3:
+                cand = cells[3].inner_text().strip()
+                if re.fullmatch(r"\d{1,3}", cand):
+                    qty = cand
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":
@@ -580,7 +584,10 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             # Login
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
             page.wait_for_load_state("networkidle")
-            _fill_login(page, username, password)
+            if not _fill_login(page, username, password):
+                log.error("Login form not found during Hanterad step — aborting.")
+                page.screenshot(path="logs/hanterad_login_failed.png")
+                return False
             try:
                 page.wait_for_url(
                     lambda url: url != PORTAL_LOGIN_URL,
