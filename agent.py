@@ -132,9 +132,13 @@ def run():
 
         else:
             log.warning(
-                "Could not mark %s as Hanterad. "
+                "Could not mark %s as Hanterad \u2014 REMOVING from seen_ids so it is retried next run. "
                 "Handle manually at: %s", booking_id, detail_url
             )
+            # SMS already sent, but Hanterad failed. Keep it out of seen_ids so the
+            # next run retries the Hanterad step. Duplicate SMS risk is accepted here
+            # because an unconfirmed Bokning is worse than one extra SMS.
+            seen_ids.discard(booking_id)
 
     save_seen_ids(seen_ids)
     log.info("Done. Sent %d new SMS notification(s).", new_count)

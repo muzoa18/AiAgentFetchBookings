@@ -69,6 +69,14 @@ def fetch_bookings(config: dict) -> list[dict]:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
+
+            # Verify login actually succeeded: the password field should be gone
+            # and we should no longer be on the bare login URL.
+            still_on_login = page.query_selector("#password") is not None
+            if still_on_login or page.url.rstrip("/") == PORTAL_LOGIN_URL.rstrip("/"):
+                log.error("Login appears to have FAILED \u2014 still on login page. URL: %s", page.url)
+                page.screenshot(path="logs/login_failed.png")
+                return []
             log.info("Logged in. URL: %s", page.url)
 
             # ── Step 2: Go to booking list if not already there ───────────────
