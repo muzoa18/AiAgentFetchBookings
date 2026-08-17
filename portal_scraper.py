@@ -63,8 +63,8 @@ def fetch_bookings(config: dict) -> list[dict]:
 
             try:
                 page.wait_for_url(
-                    lambda url: "promeisterportal.com" in url and url != PORTAL_LOGIN_URL,
-                    timeout=15_000
+                    lambda url: "promeisterportal.com" in url and "Booking" in url,
+                    timeout=10_000
                 )
             except PWTimeout:
                 pass
@@ -431,7 +431,11 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            qty = ""
+            if len(cells) > 3:
+                raw_qty = cells[3].inner_text().strip()
+                if re.fullmatch(r"\d{1,3}", raw_qty):
+                    qty = raw_qty
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":
@@ -600,6 +604,7 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
 
             # Wait for page JS to fully initialise before interacting
             page.wait_for_timeout(1000)
+            _dismiss_cookies(page)
 
             # Locate the Hanterad action button (exact text, excludes "Hanterad 37" tab)
             hanterad_btn = page.locator("button, a").filter(

@@ -100,14 +100,14 @@ def run():
         sms_ok = send_sms(to=recipient, message=message, config=config)
 
         if not sms_ok:
-            log.error("SMS failed for %s — skipping Hanterad.", booking_id)
+            log.error("SMS failed for %s — will retry next run (not marking seen).", booking_id)
             log.error("SMS failure details: %s", booking)
-            seen_ids.add(booking_id)
             sms_failed += 1
             continue
 
         log.info("SMS sent successfully for %s.", booking_id)
         seen_ids.add(booking_id)
+        save_seen_ids(seen_ids)
         new_count += 1
 
         # ── Mark Hanterad (Bokning only — Förfrågan has no button) ───────────
@@ -129,6 +129,15 @@ def run():
                 "Booking %s is a %s — no Hanterad button. "
                 "Handle manually at: %s", booking_id, booking_type, detail_url
             )
+            if booking_type == "F\u00f6rfr\u00e5gan":
+                try:
+                    from parts_agent import build_quote_for_booking
+                    log.info("Launching parts_agent for F\u00f6rfr\u00e5gan %s ...", booking_id)
+                    build_quote_for_booking(config, booking)
+                except ImportError:
+                    log.warning("parts_agent not available — cannot build quote for %s.", booking_id)
+                except Exception as exc:
+                    log.exception("parts_agent failed for %s: %s", booking_id, exc)
 
         else:
             log.warning(
