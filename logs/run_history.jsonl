@@ -521,3 +521,4 @@
 {"timestamp": "2026-08-24T15:08:04.005029", "agent": "booking_agent", "bookings_found": 2, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-08-24T16:02:21.358217", "agent": "booking_agent", "bookings_found": 2, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-08-24T17:03:15.739646", "agent": "booking_agent", "bookings_found": 2, "sms_sent": 0, "sms_failed": 0}
+{"timestamp": "2026-08-25T05:23:57.495694", "agent": "booking_agent", "bookings_found": 3, "sms_sent": 1, "sms_failed": 0}
