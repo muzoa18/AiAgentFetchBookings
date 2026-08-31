@@ -1,0 +1,12 @@
+# Weekly improve report — 2026-08-31 12:32
+
+Claude proposed **5** change(s).
+
+## ✅ Applied (in this PR)
+- **Login success not verified — form fill may silently fail** (`portal_scraper.py`, impact: medium) — In portal_scraper._fill_login, after submitting, fetch_bookings waits for a URL change but swallows the PWTimeout with 'pass'. If login actually failed (wrong password, changed selector), the code proceeds and only later reports 'No booking links found', masking the real cause. Given many runs show bookings_found>0 but sms_sent=0, and the SKILL notes login selector concerns, an explicit login verification would surface real failures.
+- **qty index assumption in _extract_specification may be wrong** (`portal_scraper.py`, impact: low) — In portal_scraper._extract_specification, quantity is read from cells[3] unconditionally (qty = cells[3].inner_text() if len(cells) > 3). Different table layouts (services vs parts) may put qty in a different column, producing wrong 'x N' in SMS. This is fragile but low-risk to make defensive by validating the value is numeric.
+
+## ⚠️ Proposed but NOT applied (review manually)
+- **Bekräfta dialog handling in fetch_bookings never triggers Hanterad; Förfrågan handling missing parts_agent call** (`agent.py`, config_change) — agent.py claims Förfrågan bookings launch parts_agent.py (per docstring and SKILL.md), but agent.py never imports or calls parts_agent. mark_booking_handled returns None for Förfrågan and no quote is ever generated. This is a documented core feature that is silently absent.
+- **seen_ids marked before Hanterad succeeds — booking never re-attempted on failure** (`agent.py`, config_change) — In agent.py the booking_id is added to seen_ids immediately after SMS success, before mark_booking_handled runs. If Hanterad fails (handled_ok is False), the booking is permanently in seen_ids and will never be retried automatically — the log only warns 'Handle manually'. This causes silent unconfirmed bookings.
+- **Docstring/SKILL mismatch: parts_agent emails vs creates draft** (`agent.py`, config_change) — SKILL.md and agent docstrings describe parts_agent.py and email_agent.py behavior in detail, but neither file exists in the repo (marked FILE NOT FOUND). The booking Förfrågan flow and the entire email agent are documented as production features but have no source. This should be flagged; at minimum agent.py should not claim to launch a non-existent parts_agent without a guard. Covered functionally by proposal 1; here we only correct the misleading top docstring.
