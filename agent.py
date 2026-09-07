@@ -69,8 +69,10 @@ def run():
         return
 
     log.info("Found %d new booking(s) to process.", len(bookings))
-    new_count  = 0
-    sms_failed = 0
+    new_count    = 0
+    sms_failed   = 0
+    already_seen = 0
+    pending      = 0
 
     for booking in bookings:
         booking_id   = booking.get("id", "unknown")
@@ -78,7 +80,9 @@ def run():
         booking_type = booking.get("booking_type", "Bokning")
 
         if booking_id in seen_ids:
+            already_seen += 1
             if booking_type in ("Förfrågan", "Offert"):
+                pending += 1
                 log.warning(
                     "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
                     booking_type, booking_id, detail_url
@@ -137,11 +141,14 @@ def run():
             )
 
     save_seen_ids(seen_ids)
-    log.info("Done. Sent %d new SMS notification(s).", new_count)
+    log.info("Done. Sent %d new SMS notification(s). Already seen: %d (pending: %d).",
+             new_count, already_seen, pending)
     log_run("booking_agent", {
         "bookings_found": len(bookings),
         "sms_sent":       new_count,
         "sms_failed":     sms_failed,
+        "already_seen":   already_seen,
+        "pending":        pending,
     })
 
 
@@ -166,7 +173,7 @@ def build_sms(booking: dict) -> str:
     lines = [f"Ny {btype} - {nr}", f"Kund: {name}"]
     if phone:
         lines.append(f"Tel: {phone}")
-    if email:
+    if email and "@" in email:
         lines.append(f"Email: {email}")
     lines.append(f"Fordon: {vehicle_str}")
     lines.append(f"Datum: {date}")
