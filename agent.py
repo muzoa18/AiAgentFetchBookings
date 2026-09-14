@@ -71,6 +71,7 @@ def run():
     log.info("Found %d new booking(s) to process.", len(bookings))
     new_count  = 0
     sms_failed = 0
+    skipped_seen = 0
 
     for booking in bookings:
         booking_id   = booking.get("id", "unknown")
@@ -78,6 +79,7 @@ def run():
         booking_type = booking.get("booking_type", "Bokning")
 
         if booking_id in seen_ids:
+            skipped_seen += 1
             if booking_type in ("Förfrågan", "Offert"):
                 log.warning(
                     "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
@@ -115,6 +117,13 @@ def run():
             log.warning("No detail URL for %s.", booking_id)
             continue
 
+        if booking_type != "Bokning":
+            log.info(
+                "Booking %s is a %s — skipping Hanterad (no button exists). "
+                "Handle manually at: %s", booking_id, booking_type, detail_url
+            )
+            continue
+
         log.info("Marking %s as Hanterad ...", booking_id)
         handled_ok = mark_booking_handled(config, detail_url)
 
@@ -137,11 +146,12 @@ def run():
             )
 
     save_seen_ids(seen_ids)
-    log.info("Done. Sent %d new SMS notification(s).", new_count)
+    log.info("Done. Sent %d new SMS notification(s). Skipped %d already-seen.", new_count, skipped_seen)
     log_run("booking_agent", {
         "bookings_found": len(bookings),
         "sms_sent":       new_count,
         "sms_failed":     sms_failed,
+        "skipped_seen":   skipped_seen,
     })
 
 
