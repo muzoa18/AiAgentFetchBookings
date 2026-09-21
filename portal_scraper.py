@@ -54,7 +54,10 @@ def fetch_bookings(config: dict) -> list[dict]:
             # ── Step 1: Login ─────────────────────────────────────────────────
             log.info("Logging in ...")
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
-            page.wait_for_load_state("networkidle")
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PWTimeout:
+                log.warning("networkidle not reached within 15s on login page \u2014 continuing.")
 
             if not _fill_login(page, username, password):
                 log.error("Login form not found.")
@@ -431,7 +434,12 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            qty = ""
+            if len(cells) > 3:
+                raw_qty = cells[3].inner_text().strip()
+                # Only accept short pure-integer quantities (avoid prices/units)
+                if re.fullmatch(r"\d{1,3}", raw_qty):
+                    qty = raw_qty
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":
@@ -580,10 +588,12 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             # Login
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
             page.wait_for_load_state("networkidle")
-            _fill_login(page, username, password)
+            if not _fill_login(page, username, password):
+                log.error("Login form not found in Hanterad step.")
+                return False
             try:
                 page.wait_for_url(
-                    lambda url: url != PORTAL_LOGIN_URL,
+                    lambda url: "promeisterportal.com" in url and url != PORTAL_LOGIN_URL,
                     timeout=15_000
                 )
             except PWTimeout:
