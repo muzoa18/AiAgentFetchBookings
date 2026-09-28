@@ -71,6 +71,13 @@ def fetch_bookings(config: dict) -> list[dict]:
             page.wait_for_load_state("networkidle", timeout=15_000)
             log.info("Logged in. URL: %s", page.url)
 
+            # Verify login actually succeeded — if the password field is still
+            # present we are still on the login page and should abort early.
+            if page.query_selector("#password") or page.query_selector("input[type='password']"):
+                log.error("Still on login page after submit — login likely failed.")
+                page.screenshot(path="logs/login_failed.png")
+                return []
+
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
                 log.info("Navigating to: %s", booking_list_url)
@@ -431,7 +438,13 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            # qty is typically a small integer cell; guard against picking a
+            # price/percentage column by validating it is a plain number.
+            qty = ""
+            if len(cells) > 3:
+                raw_qty = cells[3].inner_text().strip()
+                if re.fullmatch(r"\d{1,3}", raw_qty):
+                    qty = raw_qty
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":

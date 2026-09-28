@@ -79,8 +79,8 @@ def run():
 
         if booking_id in seen_ids:
             if booking_type in ("Förfrågan", "Offert"):
-                log.warning(
-                    "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
+                log.info(
+                    "Already notified %s %s — SMS already sent, awaiting manual action: %s",
                     booking_type, booking_id, detail_url
                 )
             else:
