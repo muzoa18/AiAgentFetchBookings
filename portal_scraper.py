@@ -106,6 +106,24 @@ def fetch_bookings(config: dict) -> list[dict]:
                 }
             """)
             log.info("Nya tab JS result: %s", nya_result)
+            if "not found" in nya_result:
+                log.warning("Nya tab NOT found — portal UI may have changed. Dumping visible tab-like texts.")
+                try:
+                    tab_texts = page.evaluate("""
+                        () => {
+                            const out = [];
+                            const els = document.querySelectorAll('a, button, span, li, div');
+                            for (const el of els) {
+                                const t = (el.innerText || '').trim();
+                                if (t && t.length < 25 && el.children.length === 0) out.push(t);
+                            }
+                            return Array.from(new Set(out)).slice(0, 60);
+                        }
+                    """)
+                    log.warning("Candidate tab texts: %s", tab_texts)
+                    page.screenshot(path="logs/nya_tab_not_found.png")
+                except Exception as tab_e:
+                    log.warning("Tab diagnostic failed: %s", tab_e)
             page.wait_for_timeout(2000)
 
             # ── Step 6: Collect all booking links ─────────────────────────────
@@ -227,6 +245,23 @@ def _collect_booking_links(page) -> list[dict]:
 
     anchors = page.query_selector_all("a[href*='BookingInfo']")
     log.info("Raw BookingInfo anchors: %d", len(anchors))
+
+    # Diagnostic: if no BookingInfo anchors, dump all anchor hrefs so we can
+    # tell whether the portal changed its URL scheme or the Nya tab is empty.
+    if not anchors:
+        try:
+            all_anchors = page.query_selector_all("a")
+            log.warning("No BookingInfo anchors. Total anchors on page: %d", len(all_anchors))
+            sample = []
+            for a in all_anchors[:40]:
+                href = (a.get_attribute("href") or "").strip()
+                if href:
+                    sample.append(href)
+            log.warning("Sample anchor hrefs: %s", sample)
+            rows = page.query_selector_all("table tr")
+            log.warning("Table rows present: %d", len(rows))
+        except Exception as diag_e:
+            log.warning("Diagnostic dump failed: %s", diag_e)
 
     for a in anchors:
         href = (a.get_attribute("href") or "").strip()
@@ -464,13 +499,16 @@ def _detect_booking_type(page, full_text: str) -> str:
                     return "Bokning"
         except Exception:
             log.warning("Silenced exception in %s", __name__)
-    if "förfrågan" in text_lower: 
+    if "förfrågan" in text_lower or "forfragan" in text_lower:
         log.info("Detected type 'Förfrågan' from full text")
         return "Förfrågan"
-    if "offert" in text_lower: 
+    if "offert" in text_lower:
         log.info("Detected type 'Offert' from full text")
         return "Offert"
-    log.info("Defaulting to type 'Bokning'")
+    if "bokning" in text_lower:
+        log.info("Detected type 'Bokning' from full text")
+        return "Bokning"
+    log.warning("No booking-type keyword found in page — defaulting to 'Bokning'. Verify manually.")
     return "Bokning"
 
 

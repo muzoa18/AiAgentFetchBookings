@@ -51,7 +51,13 @@ def run():
     # In "email" mode we only scrape the portal when MECA has actually emailed
     # us that a booking was made. In "always" mode this is a no-op.
     from email_trigger import should_run
-    if not should_run(config):
+    try:
+        trigger_ok = should_run(config)
+    except Exception as trig_e:
+        # Never let a trigger-check failure silently suppress booking processing.
+        log.exception("Trigger check failed (%s) — proceeding to scrape anyway.", trig_e)
+        trigger_ok = True
+    if not trigger_ok:
         log.info("No new booking signal — nothing to do. Exiting.")
         log_run("booking_agent", {"bookings_found": 0, "sms_sent": 0, "sms_failed": 0, "skipped": True})
         return
@@ -100,9 +106,8 @@ def run():
         sms_ok = send_sms(to=recipient, message=message, config=config)
 
         if not sms_ok:
-            log.error("SMS failed for %s — skipping Hanterad.", booking_id)
+            log.error("SMS failed for %s — NOT marking seen so it retries next run.", booking_id)
             log.error("SMS failure details: %s", booking)
-            seen_ids.add(booking_id)
             sms_failed += 1
             continue
 
