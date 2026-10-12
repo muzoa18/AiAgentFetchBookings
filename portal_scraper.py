@@ -71,6 +71,19 @@ def fetch_bookings(config: dict) -> list[dict]:
             page.wait_for_load_state("networkidle", timeout=15_000)
             log.info("Logged in. URL: %s", page.url)
 
+            # Verify login actually succeeded — if a password field is still
+            # present we are almost certainly still on the login page.
+            still_login = False
+            for sel in LOGIN_SELECTORS["password"]:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    still_login = True
+                    break
+            if still_login:
+                log.error("Still on login page after submit — login likely FAILED.")
+                page.screenshot(path="logs/login_not_verified.png")
+                return []
+
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
                 log.info("Navigating to: %s", booking_list_url)
@@ -107,6 +120,15 @@ def fetch_bookings(config: dict) -> list[dict]:
             """)
             log.info("Nya tab JS result: %s", nya_result)
             page.wait_for_timeout(2000)
+
+            # Wait explicitly for booking rows to render after the Nya click.
+            # Fixed sleeps race against async table loading and cause 0 results.
+            try:
+                page.wait_for_selector("a[href*='BookingInfo']", timeout=10_000)
+                log.info("BookingInfo anchors present after Nya click.")
+            except PWTimeout:
+                log.warning("No BookingInfo anchors after 10s — Nya tab may not have loaded rows.")
+                page.screenshot(path="logs/nya_no_anchors.png")
 
             # ── Step 6: Collect all booking links ─────────────────────────────
             booking_links = _collect_booking_links(page)
@@ -161,7 +183,11 @@ def fetch_bookings(config: dict) -> list[dict]:
                 page.wait_for_timeout(1500)
 
         except PWTimeout:
-            log.error("Timeout.")
+            log.error("Timeout during booking scrape — results may be incomplete/empty.")
+            try:
+                page.screenshot(path="logs/fetch_timeout.png")
+            except Exception as _e:
+                log.warning("Could not screenshot on timeout: %s", _e)
         except Exception as exc:
             log.exception("Scraping error: %s", exc)
             try:
@@ -431,7 +457,12 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
+            qty = ""
+            if len(cells) > 3:
+                raw_qty = cells[3].inner_text().strip()
+                # Only accept a plain small integer as quantity; reject prices/SEK/garbage
+                if re.fullmatch(r"\d{1,3}", raw_qty):
+                    qty = raw_qty
             item = {"name": name, "qty": qty, "price": price}
 
             if category == "parts":
