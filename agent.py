@@ -51,7 +51,14 @@ def run():
     # In "email" mode we only scrape the portal when MECA has actually emailed
     # us that a booking was made. In "always" mode this is a no-op.
     from email_trigger import should_run
-    if not should_run(config):
+    trigger_mode = config.get("trigger", {}).get("mode", "always")
+    log.info("Trigger mode: %s", trigger_mode)
+    try:
+        gate_open = should_run(config)
+    except Exception as exc:
+        log.exception("Trigger gate raised — proceeding to scrape anyway: %s", exc)
+        gate_open = True
+    if not gate_open:
         log.info("No new booking signal — nothing to do. Exiting.")
         log_run("booking_agent", {"bookings_found": 0, "sms_sent": 0, "sms_failed": 0, "skipped": True})
         return
@@ -65,7 +72,10 @@ def run():
 
     if not bookings:
         log.info("No new bookings found on the Nya tab. Exiting.")
-        log_run("booking_agent", {"bookings_found": 0, "sms_sent": 0, "sms_failed": 0})
+        log_run("booking_agent", {
+            "bookings_found": 0, "sms_sent": 0, "sms_failed": 0,
+            "note": "fetch_bookings returned empty — see logs/no_bookings.png / login_not_confirmed.png if present",
+        })
         return
 
     log.info("Found %d new booking(s) to process.", len(bookings))

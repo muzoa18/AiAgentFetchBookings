@@ -71,6 +71,14 @@ def fetch_bookings(config: dict) -> list[dict]:
             page.wait_for_load_state("networkidle", timeout=15_000)
             log.info("Logged in. URL: %s", page.url)
 
+            # Verify login actually succeeded — password field should be gone
+            still_on_login = page.query_selector("#password, input[type='password']")
+            if still_on_login and still_on_login.is_visible():
+                log.error("Still on login page after submit — login likely FAILED.")
+                page.screenshot(path="logs/login_not_confirmed.png")
+                log.error("Page text: %s", page.inner_text("body")[:400])
+                return []
+
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
                 log.info("Navigating to: %s", booking_list_url)
@@ -95,14 +103,21 @@ def fetch_bookings(config: dict) -> list[dict]:
             nya_result = page.evaluate("""
                 () => {
                     const candidates = document.querySelectorAll('a, button, span, li, div');
+                    const seen = [];
+                    for (const el of candidates) {
+                        const text = (el.innerText || '').trim();
+                        if (text && text.length < 20 && /nya/i.test(text)) {
+                            seen.push(el.tagName + ':"' + text + '"');
+                        }
+                    }
                     for (const el of candidates) {
                         const text = (el.innerText || '').trim();
                         if (/^Nya\\b/.test(text) && text.length < 15) {
                             el.click();
-                            return 'clicked: ' + el.tagName + ' "' + text + '"';
+                            return 'clicked: ' + el.tagName + ' "' + text + '" | candidates=' + JSON.stringify(seen);
                         }
                     }
-                    return 'not found';
+                    return 'not found | nya-like candidates=' + JSON.stringify(seen);
                 }
             """)
             log.info("Nya tab JS result: %s", nya_result)
@@ -227,6 +242,15 @@ def _collect_booking_links(page) -> list[dict]:
 
     anchors = page.query_selector_all("a[href*='BookingInfo']")
     log.info("Raw BookingInfo anchors: %d", len(anchors))
+    if not anchors:
+        all_anchors = page.query_selector_all("a[href]")
+        log.warning("No BookingInfo anchors. Total anchors on page: %d", len(all_anchors))
+        sample = []
+        for a in all_anchors[:40]:
+            href = (a.get_attribute("href") or "").strip()
+            if href:
+                sample.append(href)
+        log.warning("Sample hrefs: %s", sample)
 
     for a in anchors:
         href = (a.get_attribute("href") or "").strip()
