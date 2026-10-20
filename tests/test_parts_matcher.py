@@ -18,7 +18,9 @@ def cand(title, brand, price=100, ref="x"):
 @pytest.mark.parametrize("name", [
     "Motorolja 5W-30", "Bromsvätska DOT4", "Kylarvätska G12", "Spolarvätska", "Växellådsolja 75W-90",
     "Servoolja", "AdBlue 10L", "Brake fluid DOT 4", "Engine oil 5W-30", "Coolant", "Frostskydd", "Olja",
-    "Motorolja och oljefilter",
+    "Motorolja och oljefilter", "Motorolja/oljefilter", "Motorolja,oljefilter", "Olja+filter", "Olja/Filter",
+    "Mobil 1 0W-40", "Castrol Edge 5W-30", "ATF", "Oljor", "Motoroljor", "Smörjfett", "Fett", "DOT4", "DOT 5.1",
+    "Grease", "Lubricant", "Glysantin G48", "Kylvätska",
 ])
 def test_fluids_detected(name):
     assert is_fluid(name)
@@ -26,6 +28,7 @@ def test_fluids_detected(name):
 
 @pytest.mark.parametrize("name", [
     "Oljefilter", "Oil filter", "Bromsskivor fram", "Bromsskiva", "Bromsbelägg", "Pollenfilter", "Tändstift",
+    "Luftfilter", "Bränslefilter", "Oljetrycksgivare",
 ])
 def test_non_fluids(name):
     assert not is_fluid(name)
@@ -146,3 +149,26 @@ def test_claude_picker_malformed_returns_no_match(text):
 def test_claude_picker_no_text_block_returns_no_match():
     client = FakeClient(SimpleNamespace(stop_reason="end_turn", content=[]))
     assert make_claude_picker("key", client=client)(LINE, [cand("a", "b")]) == (-1, 0.0)
+
+
+@pytest.mark.parametrize("brand,title", [
+    ("Pro Meister", "x"), ("Pro-Meister", "x"), ("ProMeister AB", "x"), ("Promeister\u200b", "x"),
+    ("", "ProMeis\u00adter x"), ("", "Pro\u00a0Meister x"), ("pro_meister", "x"), ("", "Pro-Meister belägg"),
+])
+def test_promeister_variants_forbidden(brand, title):
+    assert rank_candidates([cand(title, brand)], RULES) == []
+
+
+def test_forbid_list_is_normalised_substring():
+    rules = Rules((), ("Foo",), 10000, "approve")
+    assert rank_candidates([cand("a", "Foo Inc"), cand("Foo-brand part", "Z")], rules) == []
+
+
+def test_empty_forbid_entry_does_not_block_everything():
+    rules = Rules((), ("", "  "), 10000, "approve")
+    assert len(rank_candidates([cand("a", "Bar")], rules)) == 1
+
+
+def test_preferred_matching_is_normalised_substring():
+    a, b, c = cand("a", "Other"), cand("b", "BOSCH "), cand("c", "Bosch GmbH")
+    assert rank_candidates([a, b, c], RULES) == [b, c, a]

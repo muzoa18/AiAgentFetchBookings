@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 
 from rules import Rules
 
@@ -18,9 +19,13 @@ ALWAYS_FORBIDDEN = ("promeister",)
 FLUID_KEYWORDS = (
     "olja", "oil", "bromsvätska", "brake fluid", "kylarvätska", "coolant", "frostskydd",
     "antifreeze", "glykol", "spolarvätska", "washer fluid", "adblue", "vätska", "fluid",
+    "oljor", "fett", "grease", "lubricant", "smörj", "glysantin", "kylvätska",
 )
+# Patterns for fluids with no generic keyword: viscosity grades, brake fluid grades, ATF.
+FLUID_PATTERNS = (r"\b\d{1,2}w-?\d{2,3}\b", r"\bdot ?[345]\b", r"\batf\b")
 # Words containing "filter" (oljefilter, oil filter, pollenfilter) are parts, not fluids.
-_FILTER_WORD = re.compile(r"(?:\boil\s+)?\S*filter\S*")
+# Only the filter word itself is stripped, so "Olja/filter" still has its fluid word.
+_FILTER_WORD = re.compile(r"(?:\boil\s+)?[a-zåäö]*filter")
 
 PICK_SCHEMA = {
     "type": "object",
@@ -37,19 +42,21 @@ PICK_SYSTEM = (
 
 def is_fluid(name: str) -> bool:
     text = _FILTER_WORD.sub(" ", str(name).lower())
-    return any(k in text for k in FLUID_KEYWORDS)
+    return any(k in text for k in FLUID_KEYWORDS) or any(re.search(p, text) for p in FLUID_PATTERNS)
 
 
 def _norm(value) -> str:
-    return str(value or "").strip().lower()
+    """NFKC, drop format chars (zero-width, soft hyphen), lowercase, remove spaces/hyphens/underscores."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return re.sub(r"[\s\-_]+", "", text.lower())
 
 
 def _is_forbidden(cand: dict, rules: Rules) -> bool:
-    brand = _norm(cand.get("brand"))
     forbidden = {_norm(b) for b in rules.brand_forbid} | set(ALWAYS_FORBIDDEN)
-    if brand in forbidden:
-        return True
-    return any(f in _norm(cand.get("title")) for f in ALWAYS_FORBIDDEN)
+    forbidden.discard("")  # an empty entry would match everything
+    haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
+    return any(f in h for f in forbidden for h in haystacks)
 
 
 def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
@@ -58,7 +65,10 @@ def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
 
     def rank(cand: dict) -> int:
         brand = _norm(cand.get("brand"))
-        return prefer.index(brand) if brand in prefer else len(prefer)
+        for i, p in enumerate(prefer):
+            if p and p in brand:
+                return i
+        return len(prefer)
 
     return sorted(allowed, key=rank)  # sorted() is stable and returns a new list
 
