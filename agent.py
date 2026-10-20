@@ -1,19 +1,20 @@
 """
 MECA Booking Agent
 ==================
-Workflow (runs on a schedule via GitHub Actions; see .github/workflows/):
+Workflow (runs once a day on GitHub Actions; see .github/workflows/):
 
-  0. Trigger gate — in "email" mode, only proceed if MECA has emailed us
-     that a booking was made (the email has no details, so we still scrape)
   1. Log in to MECA ProMeister portal
   2. Open /Booking/Index → click Nya tab
   3. For each new booking, open detail page and extract info
-  4. Send SMS with booking details to configured numbers
+  4. Send a Telegram message with booking details to the owner's chat
   5. Click Hanterad → Bekräfta for confirmed Bokningar
-  6. Förfrågan bookings: SMS sent, logged — no Hanterad (button doesn't exist)
+  6. Förfrågan/Offert bookings: notified and logged — no Hanterad (button doesn't exist)
+
+If a Telegram message fails, the booking stays unseen (retried next run),
+Hanterad is skipped and run() returns exit code 1.
 
 Run manually:   python agent.py
-Schedule:       GitHub Actions cron (every 30 min, business hours)
+Schedule:       GitHub Actions cron (daily, Mon–Sat, ~17:00 Swedish time)
 Config:         env vars / GitHub Secrets (see config_loader.py + README)
 """
 
@@ -23,9 +24,9 @@ from datetime import datetime
 from pathlib import Path
 
 from config_loader import load_config
+from notifier import send_message
 from portal_scraper import fetch_bookings, mark_booking_handled
 from run_logger import log_run
-from sms_sender import send_sms
 from state import load_seen_ids, save_seen_ids
 
 Path("logs").mkdir(exist_ok=True)
@@ -40,21 +41,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def run():
+def run() -> int:
     log.info("=" * 55)
     log.info("MECA Agent starting — %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
     log.info("=" * 55)
 
     config   = load_config()
-
-    # ── Trigger gate ─────────────────────────────────────────────────────────
-    # In "email" mode we only scrape the portal when MECA has actually emailed
-    # us that a booking was made. In "always" mode this is a no-op.
-    from email_trigger import should_run
-    if not should_run(config):
-        log.info("No new booking signal — nothing to do. Exiting.")
-        log_run("booking_agent", {"bookings_found": 0, "sms_sent": 0, "sms_failed": 0, "skipped": True})
-        return
 
     seen_ids = load_seen_ids()
     log.info("Previously handled bookings: %d", len(seen_ids))
@@ -65,12 +57,12 @@ def run():
 
     if not bookings:
         log.info("No new bookings found on the Nya tab. Exiting.")
-        log_run("booking_agent", {"bookings_found": 0, "sms_sent": 0, "sms_failed": 0})
-        return
+        log_run("booking_agent", {"bookings_found": 0, "notified": 0, "notify_failed": 0})
+        return 0
 
     log.info("Found %d new booking(s) to process.", len(bookings))
-    new_count  = 0
-    sms_failed = 0
+    new_count     = 0
+    notify_failed = 0
 
     for booking in bookings:
         booking_id   = booking.get("id", "unknown")
@@ -87,30 +79,32 @@ def run():
                 log.info("Already handled: %s — skipping.", booking_id)
             continue
 
-        # ── Send SMS ──────────────────────────────────────────────────────────
-        message   = build_sms(booking)
-        recipient = config["sms"]["recipient_number"]
+        # ── Send Telegram message ─────────────────────────────────────────────
+        message = build_message(booking)
 
-        log.info("Sending SMS for %s (%s) ...", booking_id, booking_type)
-        log.info("─── SMS Preview ───────────────────────────────")
+        log.info("Sending Telegram message for %s (%s) ...", booking_id, booking_type)
+        log.info("─── Message Preview ───────────────────────────")
         for line in message.splitlines():
             log.info("  %s", line)
         log.info("───────────────────────────────────────────────")
 
-        sms_ok = send_sms(to=recipient, message=message, config=config)
-
-        if not sms_ok:
-            log.error("SMS failed for %s — skipping Hanterad.", booking_id)
-            log.error("SMS failure details: %s", booking)
-            seen_ids.add(booking_id)
-            sms_failed += 1
+        if not send_message(config, message):
+            # Leave the id unseen so the next run retries; skip Hanterad.
+            log.error("Telegram notification failed for %s — skipping Hanterad.", booking_id)
+            log.error("Notification failure details: %s", booking)
+            notify_failed += 1
             continue
 
-        log.info("SMS sent successfully for %s.", booking_id)
+        log.info("Notification sent successfully for %s.", booking_id)
         seen_ids.add(booking_id)
         new_count += 1
 
-        # ── Mark Hanterad (Bokning only — Förfrågan has no button) ───────────
+        # (Parts ordering will hook in here, after a successful notify.)
+
+        # ── Mark Hanterad (Bokning only — Förfrågan/Offert have no button) ───
+        if booking_type != "Bokning":
+            continue
+
         if not detail_url:
             log.warning("No detail URL for %s.", booking_id)
             continue
@@ -122,14 +116,6 @@ def run():
             log.info("=" * 50)
             log.info("Booking %s CONFIRMED as Hanterad.", booking_id)
             log.info("=" * 50)
-
-        elif handled_ok is None:
-            # Expected for Förfrågan — no Hanterad button exists
-            log.info(
-                "Booking %s is a %s — no Hanterad button. "
-                "Handle manually at: %s", booking_id, booking_type, detail_url
-            )
-
         else:
             log.warning(
                 "Could not mark %s as Hanterad. "
@@ -137,16 +123,17 @@ def run():
             )
 
     save_seen_ids(seen_ids)
-    log.info("Done. Sent %d new SMS notification(s).", new_count)
+    log.info("Done. Sent %d new notification(s), %d failed.", new_count, notify_failed)
     log_run("booking_agent", {
         "bookings_found": len(bookings),
-        "sms_sent":       new_count,
-        "sms_failed":     sms_failed,
+        "notified":       new_count,
+        "notify_failed":  notify_failed,
     })
+    return 1 if notify_failed else 0
 
 
-def build_sms(booking: dict) -> str:
-    """Build SMS text from booking detail page data."""
+def build_message(booking: dict) -> str:
+    """Build notification text from booking detail page data."""
     btype    = booking.get("booking_type", "Bokning")
     nr       = booking.get("booking_nr", "–")
     name     = booking.get("driver_name", "–")
@@ -204,4 +191,4 @@ def build_sms(booking: dict) -> str:
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run())

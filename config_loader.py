@@ -31,7 +31,6 @@ CONFIG_PATH = Path("config/config.yaml")
 REQUIRED_FIELDS = [
     ("portal", "username"),
     ("portal", "password"),
-    ("sms", "recipient_number"),
     ("telegram", "bot_token"),
     ("telegram", "chat_id"),
 ]
@@ -53,8 +52,6 @@ ENV_MAP = {
     ("sms", "twilio_from_number"):     "TWILIO_FROM_NUMBER",
     ("telegram", "bot_token"):         "TELEGRAM_BOT_TOKEN",
     ("telegram", "chat_id"):           "TELEGRAM_CHAT_ID",
-    ("trigger", "mode"):               "BOOKING_TRIGGER_MODE",
-    ("trigger", "email_query"):        "BOOKING_EMAIL_QUERY",
     ("parts_portal", "username"):      "PARTS_PORTAL_USERNAME",
     ("parts_portal", "password"):      "PARTS_PORTAL_PASSWORD",
     ("parts_portal", "test_email"):    "PARTS_PORTAL_TEST_EMAIL",
@@ -70,8 +67,6 @@ DEFAULTS = {
     ("portal", "debug"):         False,
     ("sms", "provider"):         "46elks",
     ("sms", "sender_name"):      "MECA",
-    ("trigger", "mode"):         "always",
-    ("trigger", "email_query"):  "newer_than:1d (subject:bokning OR subject:booking)",
 }
 
 _BOOL_FIELDS = {("portal", "debug")}
