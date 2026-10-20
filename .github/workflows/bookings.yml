@@ -61,6 +61,8 @@ jobs:
               exit 0
             fi
             echo "Push attempt $attempt failed; retrying."
+            # Undo a half-done rebase; --abort also restores the autostash.
+            git rebase --abort 2>/dev/null || true
             sleep $((attempt * 5))
           done
           echo "Could not push state after 3 attempts."

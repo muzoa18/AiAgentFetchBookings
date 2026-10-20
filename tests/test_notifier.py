@@ -77,16 +77,28 @@ def test_get_updates_drops_non_callbacks_and_normalises(monkeypatch):
         return FakeResp({"ok": True, "result": [
             {"update_id": 1, "message": {"text": "hi"}},
             {"update_id": 2, "callback_query": {
-                "id": "cb9", "data": "y:1",
+                "id": "cb9", "data": "y:1", "from": {"id": 42},
                 "message": {"message_id": 55, "chat": {"id": 42}}}},
         ]})
 
     monkeypatch.setattr(notifier.urllib.request, "urlopen", fake_urlopen)
     updates = notifier.get_updates(CONFIG, offset=10)
-    assert updates == [{"update_id": 2, "chat_id": "42", "callback_id": "cb9",
+    assert updates == [{"update_id": 2, "chat_id": "42", "user_id": "42", "callback_id": "cb9",
                         "data": "y:1", "message_id": 55}]
     assert seen[0]["offset"] == 10
     assert seen[0]["timeout"] == 0
+
+
+@pytest.mark.parametrize("cb_from", [None, {}, {"id": None}, "absent"])
+def test_get_updates_missing_from_gives_empty_user_id(monkeypatch, cb_from):
+    cb = {"id": "cb9", "data": "y:1", "message": {"message_id": 55, "chat": {"id": 42}}}
+    if cb_from != "absent":
+        cb["from"] = cb_from
+    monkeypatch.setattr(notifier.urllib.request, "urlopen", lambda req, timeout=None: FakeResp(
+        {"ok": True, "result": [{"update_id": 2, "callback_query": cb}]}))
+
+    (update,) = notifier.get_updates(CONFIG)
+    assert update["user_id"] == ""
 
 
 def test_send_failure_returns_false(monkeypatch):

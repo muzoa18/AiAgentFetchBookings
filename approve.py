@@ -6,7 +6,8 @@ Approve/Cancel taps on staged parts orders, checks out or cancels, and expires
 approvals older than 48 h.
 
 Fails closed. An order is placed only when ALL of these hold at tap time:
-  * the callback comes from the owner's chat id (config telegram.chat_id),
+  * it is tapped by the owner in their private chat (config telegram.chat_id
+    must be that private chat id; groups are never accepted),
   * it is on the booking's own approval message (stored message_id),
   * the booking is still "pending" (re-read from orders_state for every tap),
   * the approval is not older than 48 h.
@@ -60,6 +61,17 @@ def _parse(data):
     if not booking_id or booking_id != booking_id.strip() or any(c.isspace() for c in booking_id):
         return None
     return action, booking_id
+
+
+def _from_owner(update: dict, owner: str) -> bool:
+    """Only the owner, tapping in their own private chat with the bot, may act.
+
+    TELEGRAM_CHAT_ID must be the owner's PRIVATE chat id (a positive number); the
+    bot must not be used in groups. A group id (negative) is never accepted, even
+    if configured, because every group member could otherwise approve orders.
+    """
+    return (owner.isascii() and owner.isdigit() and int(owner) > 0
+            and update.get("chat_id") == owner and update.get("user_id") == owner)
 
 
 def _too_old(record: dict, now: datetime) -> bool:
@@ -176,8 +188,8 @@ def _cancel(config, session, booking_id, record, cb) -> bool:
 def _handle_one(config, session, rules, update, owner: str) -> tuple[int, bool]:
     """(actions taken, run must exit 1) for one normalised callback update."""
     import notifier
-    if not owner or update.get("chat_id") != owner:
-        log.warning("Ignoring callback from a foreign chat.")
+    if not _from_owner(update, owner):
+        log.warning("Ignoring callback not sent by the owner in their private chat.")
         return 0, False
     cb = update.get("callback_id")
     parsed = _parse(update.get("data"))

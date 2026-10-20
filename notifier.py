@@ -112,9 +112,11 @@ def get_updates(config: dict, offset=None) -> list:
         if not cb:
             continue
         msg = cb.get("message") or {}
+        user_id = (cb.get("from") or {}).get("id")
         updates.append({
             "update_id": upd.get("update_id"),
             "chat_id": str(msg.get("chat", {}).get("id", "")),
+            "user_id": "" if user_id is None else str(user_id),
             "callback_id": cb.get("id"),
             "data": cb.get("data"),
             "message_id": msg.get("message_id"),

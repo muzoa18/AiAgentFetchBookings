@@ -49,9 +49,13 @@ def stage(booking_id="B1", message_id=77, updated_at=None, booking_nr="OLRD-3630
         orders_state.ORDERS_FILE.write_text(json.dumps(data), encoding="utf-8")
 
 
-def tap(update_id, data="approve:B1", message_id=77, chat_id="42"):
-    return {"update_id": update_id, "chat_id": chat_id, "callback_id": f"cb{update_id}",
-            "data": data, "message_id": message_id}
+_SAME = object()
+
+
+def tap(update_id, data="approve:B1", message_id=77, chat_id="42", user_id=_SAME):
+    return {"update_id": update_id, "chat_id": chat_id,
+            "user_id": chat_id if user_id is _SAME else user_id,
+            "callback_id": f"cb{update_id}", "data": data, "message_id": message_id}
 
 
 class FakePortal:
@@ -268,6 +272,39 @@ def test_empty_configured_chat_id_accepts_nobody(tg):
 
     assert tg["answers"] == []
     assert status() == "pending"
+
+
+@pytest.mark.parametrize("configured,chat,user", [
+    ("-1001234", "-1001234", "42"),        # group configured as the chat id, member taps
+    ("-1001234", "-1001234", "-1001234"),  # even if ids line up, groups are never trusted
+    ("42", "42", "43"),                    # private chat, different user
+    ("42", "42", ""),                      # tapping user unknown
+    ("42", "42", None),
+    ("abc", "abc", "abc"),                 # not a numeric private chat id
+    ("+42", "+42", "+42"),
+])
+def test_only_owner_in_private_chat_may_tap(tg, configured, chat, user):
+    stage()
+    tg["updates"] = [tap(5, chat_id=chat, user_id=user)]
+    config = {"telegram": {"bot_token": "123:ABC", "chat_id": configured}}
+
+    assert approve.handle_updates(config, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert tg["answers"] == []
+    assert tg["cleared"] == []
+    assert tg["sent"] == []
+    assert status() == "pending"
+    assert orders_state.last_update_id() == 5
+
+
+def test_owner_tap_with_int_configured_chat_id_works(tg):
+    stage()
+    factory = PortalFactory()
+    tg["updates"] = [tap(5, chat_id="42", user_id="42")]
+    config = {"telegram": {"bot_token": "123:ABC", "chat_id": 42}}
+
+    assert approve.handle_updates(config, factory, APPROVE) == 1
+    assert status() == "ordered"
 
 
 def test_stale_message_id_ignored(tg):
@@ -612,3 +649,4 @@ def test_persist_step_rebases_and_retries(name):
     assert "config/orders.json" in persist["run"]
     assert "git pull --rebase --autostash origin main" in persist["run"]
     assert "exit 1" in persist["run"]
+    assert "git rebase --abort 2>/dev/null || true" in persist["run"]
