@@ -53,10 +53,18 @@ jobs:
           git add config/seen_ids.txt config/orders.json logs/run_history.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No state changes to commit."
-          else
-            git commit -m "chore: update booking state [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "chore: update booking state [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main && git push; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying."
+            sleep $((attempt * 5))
+          done
+          echo "Could not push state after 3 attempts."
+          exit 1
 
       - name: Upload logs & screenshots
         if: ${{ always() }}
