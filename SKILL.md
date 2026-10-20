@@ -1,58 +1,60 @@
 # MECA Booking Agent — Skill File
 
+Context file read by `improve.py` on every weekly review. Keep it in sync with the code;
+anything described here that does not exist in the repo will mislead the improve agent.
+
 ## What this agent does
-Automates the full booking workflow for MD Bilreparationer (MECA workshop, Eskilstuna).
+Notifies the owner of MD Bilreparationer (MECA workshop, Eskilstuna) of new bookings from the
+MECA ProMeister portal. MECA's own notification email says only "a booking was made", with no
+details. The agent logs into the portal, scrapes the real booking, sends an SMS with everything,
+and marks confirmed bookings as handled.
 
-### Daily trigger (17:00 via Windows Task Scheduler)
-1. Logs into https://meca.promeisterportal.com
-2. Opens /Booking/Index → clicks "Nya" tab
-3. For each new booking, opens the detail page (BookingInfo)
-4. Extracts: customer name, phone, vehicle reg+model, workshop date, services, parts, fluids, total price
-5. Sends SMS via 46elks to configured recipient numbers
-6. If booking_type == "Bokning" → clicks Hanterad → Bekräfta (two-step confirmation)
-7. If booking_type == "Förfrågan" → launches parts_agent.py
+Runs entirely on **GitHub Actions** (no local machine, no Task Scheduler).
 
-### Förfrågan flow (parts_agent.py)
-1. Logs into https://pro.meca.se
-2. Loads vehicle by reg number (URL parameter)
-3. Searches each required part in the catalog search bar
-4. Claude AI picks the best matching part from search results
-5. Adds parts to cart
-6. Clicks Fritext → fills labor (Arbetstid, hours, rate)
-7. Writes AI-generated Offertnotering in Swedish
-8. Clicks "Skicka prisförslag (e-post)" → emails quote to test_email or customer
+### Booking run (`.github/workflows/bookings.yml`, every 30 min, Mon–Sat, 05–16 UTC)
+1. **Trigger gate** (`email_trigger.py`). In `email` mode, check Gmail for a not-yet-seen MECA
+   booking email and exit cheaply if there is none. In `always` mode, skip the gate.
+   Any Gmail error **fails open** (scrape anyway) so a real booking is never missed.
+2. Log in to https://meca.promeisterportal.com (Playwright, headless Chromium).
+3. Open `/Booking/Index` → click the **Nya** tab.
+4. For each booking not in `config/seen_ids.txt`, open the BookingInfo detail page and extract:
+   customer, phone, email, vehicle reg + model, workshop date, message, services, parts,
+   fluids, total price.
+5. Send an SMS via 46elks (Twilio supported) to every number in `recipient_number`.
+6. `Bokning` → click **Hanterad** → **Bekräfta**. `Förfrågan` / `Offert` → SMS only; there is
+   no Hanterad button, so they stay pending in the portal and are logged as `PENDING`.
+7. Commit `config/seen_ids.txt`, `config/seen_email_ids.txt` and `logs/run_history.jsonl` back
+   to `main` (state must survive between ephemeral CI runs).
+
+### Weekly self-improve (`.github/workflows/weekly-improve.yml`, Mondays 06:00 UTC)
+`python improve.py --apply-all` sends source + SKILL.md + recent logs to Claude, applies the
+proposals on a branch, runs `py_compile` on each changed `.py`, reverts any file that does not
+compile, writes `improve_reports/latest.md`, and opens a **Pull Request**. It never pushes to
+`main`; a human reviews and merges.
 
 ## File structure
 ```
-agent.py           — Main orchestrator. Run this daily.
-portal_scraper.py  — Login, Nya tab, detail page extraction, Hanterad click
-parts_agent.py     — Förfrågan handler: pro.meca.se login, parts search, quote email
-sms_sender.py      — 46elks SMS, supports multiple recipients (comma-separated)
-extractor.py       — (legacy) AI text extraction, mostly replaced by direct table parsing
-state.py           — seen_ids.txt persistence to avoid duplicate SMS
-config_loader.py   — Loads and validates config/config.yaml
-improve.py         — Self-improvement: sends code + logs to Claude, proposes changes
-SKILL.md           — This file. Describes the agent for improve.py context.
-config/
-  config.yaml        — Real credentials (never commit)
-  config.example.yaml — Template
-  seen_ids.txt       — Auto-created: tracks notified bookings
-logs/
-  agent.log          — Full run history
-  proposals/         — Saved improvement proposals from improve.py
+agent.py            Orchestrator: gate → scrape → SMS → Hanterad → state/log
+email_trigger.py    Gmail gate (should_run); tracks config/seen_email_ids.txt
+portal_scraper.py   Playwright login, Nya tab, detail extraction, Hanterad click
+sms_sender.py       46elks / Twilio, comma-separated recipients
+state.py            seen_ids.txt load/save (dedupe so one booking = one SMS)
+run_logger.py       Appends structured runs to logs/run_history.jsonl
+config_loader.py    Env-first config (GitHub Secrets) with config/config.yaml fallback
+improve.py          Weekly self-improve → PR
+extractor.py        LEGACY AI text extraction, superseded by direct table parsing
+inspect_portal.py   Dev helper for inspecting portal HTML when selectors break
+config/config.example.yaml   Template; env var name for each field is in its comments
 ```
+Not present any more: `parts_agent.py`, `email_agent.py`, Windows Task Scheduler jobs. The old
+Förfrågan quote-email flow and the Gmail draft-reply agent were removed.
 
-## Key implementation details
+## Booking types
+- **Bokning**: confirmed booking. SMS, then Hanterad → Bekräfta.
+- **Förfrågan**: price request. SMS only; needs manual action in the portal.
+- **Offert**: quote already sent. SMS only.
 
-### Portal selectors (confirmed working)
-- Login: `#userName`, `#password`, `button[type='submit']`
-- Cookie popup: `button:has-text('Accept All Cookies')`
-- Nya tab: JS evaluation matching element text starting with "Nya"
-- Booking links: `a[href*='BookingInfo']`, deduplicated by BookingID param
-- Hanterad: JS exact text match `=== 'Hanterad'`, then wait for Bekräfta dialog
-- Bekräfta: JS exact text match `=== 'Bekräfta'`
-
-### SMS format
+## SMS format
 ```
 Ny Bokning - OLRD-3630
 Kund: Mamadou Sowe
@@ -69,130 +71,37 @@ Vätskor/Oljor:
 ---
 Totalt: 3 709 SEK
 ```
+Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are omitted when empty.
 
-### Booking types
-- **Bokning** — confirmed booking. SMS + Hanterad click.
-- **Förfrågan** — price request. SMS + parts agent quote email.
-- **Offert** — quote already sent. SMS only, no action needed.
+## Scraper selectors and gotchas
+- Cookie popup must be dismissed before any click works.
+- Nya tab: JS evaluation matching element text that starts with "Nya".
+- Booking links: `a[href*='BookingInfo']`, deduplicated by BookingID param.
+- Hanterad: JS exact text match `=== 'Hanterad'`, then wait for the Bekräfta dialog; Bekräfta is
+  also an exact text match.
+- Specification table scraping stops at **Händelselogg** so event-log rows are not parsed.
+- SMS failure still adds the ID to `seen_ids` and skips Hanterad (avoids SMS spam on retry, but
+  the booking then needs manual follow-up; failures show as `sms_failed` in run history).
 
-### Known issues / watch areas
-- Specification table scraping stops at Händelselogg to avoid parsing event log rows
-- Cookie popup must be dismissed before any clicks work
-- pro.meca.se parts search selectors may need tuning (not yet battle-tested)
-- Fritext labor dialog selectors may need adjustment based on actual HTML
-
-## Config structure
-```yaml
-portal:
-  username: "..."
-  password: "..."
-  bookings_path: '/Booking/Index'
-  debug: false          # true = visible browser
-
-anthropic:
-  api_key: "sk-ant-..."
-
-sms:
-  provider: "46elks"
-  recipient_number: "+46709251764,+46705563181"
-  sender_name: "MECA"
-  api_user: "u..."
-  api_password: "..."
-
-parts_portal:
-  username: "..."
-  password: "..."
-  labor_hours: 1
-  test_email: "mdbilreparationer@gmail.com"
-```
+## Config (env var overrides config.yaml)
+Required: `PORTAL_USERNAME`, `PORTAL_PASSWORD`, `SMS_RECIPIENT_NUMBER`, `SMS_API_USER`,
+`SMS_API_PASSWORD`, `ANTHROPIC_API_KEY` (improve only).
+Optional: `SMS_PROVIDER`, `SMS_SENDER_NAME`, `GMAIL_TOKEN_JSON`, `GMAIL_CREDENTIALS_JSON`.
+Repo variables: `BOOKING_TRIGGER_MODE` (`email`|`always`), `BOOKING_EMAIL_QUERY`.
+Secrets live only in GitHub Secrets or the gitignored `config/config.yaml`.
 
 ## Improvement priorities (for improve.py)
-1. Reliability — any scraping failures or timeouts
-2. SMS content quality — wrong/missing fields
-3. Parts search accuracy — wrong parts selected
-4. Hanterad confirmation — any cases where it fails silently
-5. Performance — reduce browser open time
+1. Reliability: scraping failures, timeouts, selector drift after portal changes.
+2. Never missing a booking: gate must fail open; no silent SMS failures.
+3. SMS content quality: wrong or missing fields.
+4. Hanterad confirmation: cases where it fails silently.
+5. Performance: reduce browser open time and CI minutes.
 
-## Email Agent (email_agent.py)
-Runs every 30 minutes. Reads unread Gmail, uses Claude to draft replies.
+## Rules for proposed changes
+- Do not add dependencies or touch workflows/secrets handling without a clear reason.
+- Do not reference or recreate files listed under "Not present any more".
+- Keep changes small and syntax-checkable; every changed `.py` must compile.
 
-### Flow
-1. Fetch unread emails (excludes MECA portal notifications, noreply senders)
-2. Claude reads each email and decides:
-   - `ask_info` — missing reg number, mileage or problem description → asks customer
-   - `send_quote` — enough info → price estimate + booking suggestion
-   - `general_reply` — general question → helpful answer
-3. Creates Gmail DRAFT (never sends automatically)
-4. Marks original email as read
-5. Sends SMS to owner: "Nytt kundmail från X — utkast klart i Gmail"
-
-### State file
-config/seen_email_ids.txt — separate from booking seen_ids.txt
-
-### Setup required
-See GMAIL_SETUP.md — one-time Google OAuth setup needed.
-
-## Service Package Knowledge (email_agent.py)
-The AI knows these packages by name — mätarställning is NEVER required:
-
-| Customer says | Package | Price range |
-|---|---|---|
-| oljebyte, oljebyte + filter | Liten service | 800–1 200 kr |
-| stor service, full service | Stor service | 2 000–3 500 kr |
-| bromsar fram | Bromsbyte fram | 2 500–4 000 kr |
-| bromsar bak | Bromsbyte bak | 2 000–3 500 kr |
-| alla bromsar | Bromsbyte alla | 4 500–7 000 kr |
-| däckbyte, vinterdäck | Däckbyte | 600–900 kr |
-| felkod, diagnos | Diagnosläsning | från 500 kr |
-
-## Email Agent Rules
-- Read FULL thread — never ask for info already given
-- NEVER ask for mätarställning, årsmodell, or anything except regnr + work type
-- Only need: regnr + work type → send_quote immediately
-- Code override: if reg_nr + work_description extracted and only mätarställning missing → force send_quote
-- **SMS sent ONLY when action=send_quote AND PDF was successfully created**
-- No SMS for ask_info, general_reply, or failed quotes
-- Non-customer emails (suppliers, newsletters) → marked back as UNREAD in inbox (not added to seen_ids)
-- One action per sender per run (thread-based deduplication)
-- Supplier domains: riddermarkbil.se, dssparts.se, mekonomen.se, meca.se etc.
-
-## SMS logic summary
-| Situation | SMS? | Mark as read? |
-|---|---|---|
-| Quote created (PDF ready) | YES | YES |
-| Quote triggered but PDF failed | NO (warning logged) | YES |
-| ask_info draft created | NO | YES |
-| general_reply draft created | NO | YES |
-| Supplier/non-customer email | NO | MARKED BACK AS UNREAD |
-| action=ignore | NO | MARKED BACK AS UNREAD |
-
-## Log files monitored by improve.py
-- logs/agent.log — booking agent runs
-- logs/email_agent.log — email agent runs
-- logs/improve_auto.log — auto-improvement history
-
-## Work-to-parts mapping (_work_to_parts in email_agent.py)
-When an email quote is triggered, work description is mapped to actual parts.
-
-### Brand rules (enforced in both _work_to_parts and AI picker):
-- **Always Bosch** for filters, brake pads, discs, spark plugs
-- **Always Mobil 1** for motor oil
-- **Never ProMeister** branded parts — AI picker explicitly excludes them
-- Oil quantity is vehicle-dependent — looked up on pro.meca.se, not hardcoded
-
-### Service packages:
-| Customer says | Parts searched |
-|---|---|
-| oljebyte / liten service | Bosch oljefilter + Bosch pollenfilter kolfilter + Mobil 1 motorolja |
-| stor service / full service | Same + Bosch luftfilter + Bosch tändstift |
-| bromsbyte / broms fram | Bosch bromsbelägg fram + Bosch bromsskiva fram x2 |
-| bromsbyte bak | Bosch bromsbelägg bak + Bosch bromsskiva bak x2 |
-| bromsbyte alla | Both front and rear |
-| bromsvätska | Bosch bromsvätska DOT4 |
-| däckbyte | däck x4 (no brand — size varies) |
-| tändstift | Bosch tändstift |
-| (unknown) | Work description used as search term directly |
-
-### Note on pollenfilter:
-Liten service ALWAYS includes pollenfilter/kupéfilter (kolfilter).
-Search term "Bosch pollenfilter kolfilter" finds the activated carbon cabin filter.
+## Logs monitored by improve.py
+- `logs/run_history.jsonl`: structured per-run summary (the main signal, tracked in git).
+- `logs/agent.log`: only exists inside a CI run (gitignored), so it is usually absent.
