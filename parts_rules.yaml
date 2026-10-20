@@ -1,0 +1,5 @@
+# Parts-ordering rules. Edit here; no code changes needed.
+brand_prefer: [Bosch]        # tried first when matching parts
+brand_forbid: [ProMeister]   # never ordered
+ceiling_sek: 10000           # orders above this total are never placed
+mode: approve                # approve = ask owner first | auto = order directly
