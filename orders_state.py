@@ -36,11 +36,33 @@ def _load() -> dict:
         data = json.loads(ORDERS_FILE.read_text(encoding="utf-8"))
     except ValueError as e:
         raise ValueError(f"Corrupt order state file {ORDERS_FILE}: {e}") from e
-    if not isinstance(data, dict) or not isinstance(data.get("bookings", {}), dict):
-        raise ValueError(f"Corrupt order state file {ORDERS_FILE}: unexpected structure")
-    data.setdefault("last_update_id", None)
-    data.setdefault("bookings", {})
+    _validate(data)
     return data
+
+
+def _validate(data) -> None:
+    def bad(why: str):
+        return ValueError(f"Corrupt order state file {ORDERS_FILE}: {why}")
+
+    if not isinstance(data, dict):
+        raise bad("top level is not an object")
+    if not isinstance(data.get("bookings"), dict):
+        raise bad("'bookings' missing or not an object")
+    if "last_update_id" not in data:
+        raise bad("'last_update_id' missing")
+    luid = data["last_update_id"]
+    if luid is not None and (isinstance(luid, bool) or not isinstance(luid, int)):
+        raise bad("'last_update_id' is not an int or null")
+    for bid, rec in data["bookings"].items():
+        if not isinstance(rec, dict):
+            raise bad(f"record for booking {bid!r} is not an object")
+
+
+def _check_id(booking_id) -> None:
+    if not isinstance(booking_id, str):
+        raise TypeError(f"booking_id must be str, got {type(booking_id).__name__}")
+    if not booking_id.strip():
+        raise ValueError("booking_id must not be empty")
 
 
 def _save(data: dict) -> None:
@@ -61,12 +83,14 @@ def _now() -> str:
 
 
 def get(booking_id: str) -> dict | None:
+    _check_id(booking_id)
     return _load()["bookings"].get(booking_id)
 
 
 def put(booking_id: str, status: Status, plan: dict | None = None,
         message_id: int | None = None) -> None:
     """Set status; plan/message_id are kept from the existing record when None."""
+    _check_id(booking_id)
     if status not in STATUSES:
         raise ValueError(f"Unknown order status: {status!r}")
     data = _load()
@@ -82,6 +106,7 @@ def put(booking_id: str, status: Status, plan: dict | None = None,
 
 def claim(booking_id: str) -> bool:
     """Mark 'attempted' only if no record exists. Returns False otherwise."""
+    _check_id(booking_id)
     data = _load()
     if booking_id in data["bookings"]:
         return False

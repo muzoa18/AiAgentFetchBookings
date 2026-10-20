@@ -109,3 +109,80 @@ def test_file_format_is_stable(orders_file):
     data = json.loads(text)
     assert list(data["bookings"]) == ["B1", "B2"]
     assert text == json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+BAD_FILES = [
+    b"{}",
+    b"[]",
+    b'{"bookings": [], "last_update_id": null}',
+    b'{"bookings": null, "last_update_id": null}',
+    b'{"last_update_id": null}',
+    b'{"bookings": {"B1": "x"}, "last_update_id": null}',
+    b'{"bookings": {}, "last_update_id": "7"}',
+    b'{"bookings": {}, "last_update_id": true}',
+    b"",
+    b'\xef\xbb\xbf{"bookings": {}, "last_update_id": null}',
+]
+
+
+@pytest.mark.parametrize("content", BAD_FILES)
+def test_wrong_shape_file_raises_and_is_untouched(orders_file, content):
+    orders_file.parent.mkdir(parents=True)
+    orders_file.write_bytes(content)
+    calls = [
+        lambda: orders_state.claim("B1"),
+        lambda: orders_state.put("B1", "pending"),
+        lambda: orders_state.get("B1"),
+        orders_state.pending,
+        orders_state.last_update_id,
+        lambda: orders_state.set_last_update_id(1),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="orders.json"):
+            call()
+    assert orders_file.read_bytes() == content
+
+
+def test_bad_record_error_names_booking_id(orders_file):
+    orders_file.parent.mkdir(parents=True)
+    orders_file.write_text('{"bookings": {"B9": "x"}, "last_update_id": null}')
+    with pytest.raises(ValueError, match="B9"):
+        orders_state.get("B1")
+
+
+def test_fresh_file_always_has_both_keys(orders_file):
+    orders_state.claim("B1")
+    assert set(json.loads(orders_file.read_text())) == {"bookings", "last_update_id"}
+    orders_state.set_last_update_id(3)
+    assert orders_state.claim("B2") is True
+
+
+def test_non_str_booking_id_raises_and_file_unchanged(orders_file):
+    orders_state.claim("B1")
+    before = orders_file.read_bytes()
+    for call in (lambda: orders_state.claim(5), lambda: orders_state.put(5, "pending"),
+                 lambda: orders_state.get(5)):
+        with pytest.raises(TypeError):
+            call()
+    assert orders_file.read_bytes() == before
+
+
+def test_non_str_booking_id_raises_without_creating_file(orders_file):
+    with pytest.raises(TypeError):
+        orders_state.claim(5)
+    assert not orders_file.exists()
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "\t\n"])
+def test_blank_booking_id_raises(orders_file, bad):
+    for call in (lambda: orders_state.claim(bad), lambda: orders_state.put(bad, "pending"),
+                 lambda: orders_state.get(bad)):
+        with pytest.raises(ValueError):
+            call()
+    assert not orders_file.exists()
+
+
+def test_booking_ids_are_case_sensitive():
+    assert orders_state.claim("B1") is True
+    assert orders_state.claim("b1") is True
+    assert orders_state.claim("B1") is False
