@@ -52,7 +52,7 @@ def _norm(value) -> str:
     return re.sub(r"[\s\-_]+", "", text.lower())
 
 
-def _is_forbidden(cand: dict, rules: Rules) -> bool:
+def is_forbidden(cand: dict, rules: Rules) -> bool:
     forbidden = {_norm(b) for b in rules.brand_forbid} | set(ALWAYS_FORBIDDEN)
     forbidden.discard("")  # an empty entry would match everything
     haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
@@ -60,7 +60,7 @@ def _is_forbidden(cand: dict, rules: Rules) -> bool:
 
 
 def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
-    allowed = [c for c in candidates if not _is_forbidden(c, rules)]
+    allowed = [c for c in candidates if not is_forbidden(c, rules)]
     prefer = [_norm(b) for b in rules.brand_prefer]
 
     def rank(cand: dict) -> int:

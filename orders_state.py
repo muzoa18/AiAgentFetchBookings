@@ -117,6 +117,50 @@ def claim(booking_id: str) -> bool:
     return True
 
 
+# Plan marker for a booking queued for ordering but not yet started (crash recovery).
+QUEUED_PLAN = {"queued": True}
+
+
+def is_queued(record: dict | None) -> bool:
+    return (bool(record) and record.get("status") == "attempted"
+            and record.get("plan") == QUEUED_PLAN)
+
+
+def queue(booking_id: str) -> bool:
+    """Record 'attempted' with the queued marker only if no record exists."""
+    _check_id(booking_id)
+    data = _load()
+    if booking_id in data["bookings"]:
+        return False
+    data["bookings"][booking_id] = {
+        "status": "attempted", "plan": dict(QUEUED_PLAN), "message_id": None, "updated_at": _now(),
+    }
+    _save(data)
+    return True
+
+
+def begin(booking_id: str) -> bool:
+    """Like claim(), but also converts a queued record (exactly once) into a fresh 'attempted'."""
+    _check_id(booking_id)
+    data = _load()
+    record = data["bookings"].get(booking_id)
+    if record is not None and not is_queued(record):
+        return False
+    data["bookings"][booking_id] = {
+        "status": "attempted", "plan": None, "message_id": None, "updated_at": _now(),
+    }
+    _save(data)
+    return True
+
+
+def by_status(status: Status) -> list[tuple[str, dict]]:
+    if status not in STATUSES:
+        raise ValueError(f"Unknown order status: {status!r}")
+    bookings = _load()["bookings"]
+    return [(bid, bookings[bid]) for bid in sorted(bookings)
+            if bookings[bid].get("status") == status]
+
+
 def pending() -> list[tuple[str, dict]]:
     bookings = _load()["bookings"]
     return [(bid, bookings[bid]) for bid in sorted(bookings)

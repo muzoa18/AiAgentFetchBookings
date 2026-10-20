@@ -17,6 +17,11 @@ If a Telegram message fails, the booking stays unseen (retried next run),
 Hanterad is skipped and run() returns exit code 1. A parts order ending
 "failed" (or an invalid rules file) also makes run() return 1.
 
+Crash recovery: a booking is queued in config/orders.json right after its
+notify succeeds (before seen_ids is saved). At the start of the next run any
+record still "attempted" (queued, or interrupted mid-order) is reported to the
+owner and marked failed, so a killed job is never silent.
+
 Run manually:   python agent.py
 Schedule:       GitHub Actions cron (daily, Mon–Sat, ~17:00 Swedish time)
 Config:         env vars / GitHub Secrets (see config_loader.py + README)
@@ -28,10 +33,11 @@ from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
+import orders_state
 from config_loader import load_config
 from notifier import send_message
 from parts_matcher import make_claude_picker
-from parts_order import needs_portal, plan_and_stage, record_failure
+from parts_order import needs_portal, order_notify_failed, plan_and_stage, record_failure
 from rules import load_rules
 from portal_scraper import fetch_bookings, mark_booking_handled
 from run_logger import log_run
@@ -56,6 +62,9 @@ def run() -> int:
 
     config   = load_config()
 
+    # Before this run queues anything: report orders a previous run left unfinished.
+    swept_failed = _sweep_stale_orders(config)
+
     seen_ids = load_seen_ids()
     log.info("Previously handled bookings: %d", len(seen_ids))
 
@@ -66,8 +75,8 @@ def run() -> int:
     if not bookings:
         log.info("No new bookings found on the Nya tab. Exiting.")
         log_run("booking_agent", {"bookings_found": 0, "notified": 0, "notify_failed": 0,
-                                  "orders_staged": 0, "orders_failed": 0})
-        return 0
+                                  "orders_staged": 0, "orders_failed": swept_failed})
+        return 1 if swept_failed else 0
 
     log.info("Found %d new booking(s) to process.", len(bookings))
     new_count     = 0
@@ -114,6 +123,10 @@ def run() -> int:
             continue
 
         if booking.get("parts") or booking.get("fluids"):
+            try:
+                orders_state.queue(booking.get("id"))
+            except Exception:
+                log.exception("Could not queue %s for parts ordering.", booking_id)
             to_order.append(booking)
 
         if not detail_url:
@@ -140,6 +153,7 @@ def run() -> int:
     save_seen_ids(seen_ids)
 
     orders_staged, orders_failed = _order_parts(config, to_order)
+    orders_failed += swept_failed
 
     log.info("Done. Sent %d new notification(s), %d failed. Orders staged %d, failed %d.",
              new_count, notify_failed, orders_staged, orders_failed)
@@ -151,6 +165,32 @@ def run() -> int:
         "orders_failed":  orders_failed,
     })
     return 1 if notify_failed or orders_failed else 0
+
+
+def _sweep_stale_orders(config: dict) -> int:
+    """Report and fail every order record left 'attempted' by an earlier run. Returns count."""
+    try:
+        stale = orders_state.by_status("attempted")
+    except Exception:
+        log.exception("Order state file unreadable — cannot check for interrupted orders.")
+        send_message(config, "Orderstatusfilen (config/orders.json) kunde inte läsas – "
+                             "kontrollera den. Inga beställningar görs.")
+        return 1
+    for booking_id, record in stale:
+        if orders_state.is_queued(record):
+            text = (f"Delbeställning för {booking_id} kördes aldrig (jobbet avbröts). "
+                    "Beställ för hand.")
+        else:
+            text = (f"Delbeställning för {booking_id} avbröts mitt i körningen: "
+                    "kontrollera pro.meca.se, ordern kan ha lagts.")
+        log.error("Stale order record %s (%s).", booking_id, record.get("plan"))
+        if not send_message(config, text):
+            log.error("Stale-order message for %s was not delivered.", booking_id)
+        try:
+            orders_state.put(booking_id, "failed")
+        except Exception:
+            log.exception("Could not mark stale order %s failed.", booking_id)
+    return len(stale)
 
 
 def _missing_ordering_settings(config: dict) -> list[str]:
@@ -183,7 +223,10 @@ def _order_parts(config: dict, bookings: list[dict]) -> tuple[int, int]:
     except Exception:
         log.exception("parts_rules.yaml is invalid — no parts ordering this run.")
         send_message(config, "Regelfilen är ogiltig – inga beställningar")
-        return 0, 1
+        # Close the queued records now, so the next run does not report them as aborted.
+        statuses = [record_failure(config, b, "regelfilen parts_rules.yaml är ogiltig")
+                    for b in bookings]
+        return 0, 1 + statuses.count("failed")
 
     staged = failed = 0
     tools, setup_error = None, None
@@ -211,7 +254,8 @@ def _order_parts(config: dict, bookings: list[dict]) -> tuple[int, int]:
                 log.info("Parts order for %s: %s", booking.get("id"), status)
                 if status in ("pending", "ordered"):
                     staged += 1
-                elif status == "failed":
+                if status == "failed" or (status == "ordered"
+                                          and order_notify_failed(booking.get("id"))):
                     failed += 1
     except Exception:
         log.exception("Closing the parts portal failed.")

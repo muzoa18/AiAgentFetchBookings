@@ -197,7 +197,10 @@ def test_invalid_rules_file_keeps_notifying_and_exits_1(env, monkeypatch):
     assert env["portal_opened"] == 0
     assert env["sent"].count("Regelfilen är ogiltig – inga beställningar") == 1
     assert env["logged"]["notified"] == 2
-    assert env["logged"]["orders_failed"] == 1
+    # 1 for the rules file + each queued booking closed as failed (not left for the sweep)
+    assert env["logged"]["orders_failed"] == 3
+    assert orders_state.get("B1")["status"] == "failed"
+    assert orders_state.by_status("attempted") == []
 
 
 def test_mark_booking_handled_raising_does_not_skip_save(env, monkeypatch):
@@ -239,3 +242,87 @@ def test_missing_ordering_credentials_fail_closed(env, monkeypatch):
     assert env["portal_opened"] == 0
     assert orders_state.get("B1")["status"] == "failed"
     assert any("anthropic.api_key" in t for t in env["sent"])
+
+
+# ── Crash recovery: queue + sweep ────────────────────────────────────────────
+
+def test_killed_mid_order_record_is_swept_next_run(env):
+    orders_state.put("B9", "attempted", plan={"booking_id": "B9", "parts": []})
+
+    assert agent.run() == 1
+
+    assert orders_state.get("B9")["status"] == "failed"
+    swept = [t for t in env["sent"] if "B9" in t]
+    assert swept == ["Delbeställning för B9 avbröts mitt i körningen: "
+                     "kontrollera pro.meca.se, ordern kan ha lagts."]
+    assert env["logged"]["orders_failed"] == 1
+
+
+def test_queued_but_never_processed_record_is_swept(env):
+    orders_state.queue("B9")
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 1
+
+    assert orders_state.get("B9")["status"] == "failed"
+    assert "Delbeställning för B9 kördes aldrig (jobbet avbröts). Beställ för hand." in env["sent"]
+    assert env["logged"]["orders_failed"] == 1
+    assert env["logged"]["orders_staged"] == 1
+
+
+def test_sweep_message_undeliverable_still_marks_failed(env):
+    orders_state.queue("B9")
+    env["send_ok"] = False
+
+    assert agent.run() == 1
+
+    assert orders_state.get("B9")["status"] == "failed"
+    assert env["logged"]["orders_failed"] == 1
+
+
+def test_normal_run_queues_before_staging_and_sweep_skips_own_records(env, monkeypatch):
+    seen_at_stage = {}
+
+    def fake_stage(config, booking, portal, rules, picker):
+        bid = booking["id"]
+        seen_at_stage[bid] = orders_state.get(bid)
+        assert orders_state.begin(bid) is True
+        orders_state.put(bid, "pending", plan={"booking_id": bid})
+        return "pending"
+
+    monkeypatch.setattr(agent, "plan_and_stage", fake_stage)
+    env["bookings"] = [_booking("B1"), _booking("B2")]
+
+    assert agent.run() == 0
+
+    assert seen_at_stage["B1"]["plan"] == {"queued": True}
+    assert seen_at_stage["B2"]["status"] == "attempted"
+    assert orders_state.get("B1")["status"] == "pending"
+    assert not any("Delbeställning för" in t for t in env["sent"])
+
+
+def test_queue_happens_even_if_hanterad_raises(env, monkeypatch):
+    def boom(config, url):
+        raise RuntimeError("browser crashed")
+
+    monkeypatch.setattr(agent, "mark_booking_handled", boom)
+    seen = []
+    monkeypatch.setattr(agent, "plan_and_stage",
+                        lambda c, b, p, r, k: seen.append(orders_state.get(b["id"])) or "pending")
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+    assert seen[0]["plan"] == {"queued": True}
+
+
+def test_ordered_but_unnotified_makes_exit_code_1(env, monkeypatch):
+    def fake_stage(config, booking, portal, rules, picker):
+        orders_state.put(booking["id"], "ordered",
+                         plan={"confirmation": "ORD-1", "notify_failed": True})
+        return "ordered"
+
+    monkeypatch.setattr(agent, "plan_and_stage", fake_stage)
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 1
+    assert env["logged"]["orders_failed"] == 1

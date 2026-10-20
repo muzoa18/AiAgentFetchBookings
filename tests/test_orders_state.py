@@ -186,3 +186,55 @@ def test_booking_ids_are_case_sensitive():
     assert orders_state.claim("B1") is True
     assert orders_state.claim("b1") is True
     assert orders_state.claim("B1") is False
+
+
+# ── queue / begin / by_status (crash recovery for the ordering step) ─────────
+
+def test_queue_only_when_no_record():
+    assert orders_state.queue("B1") is True
+    rec = orders_state.get("B1")
+    assert rec["status"] == "attempted"
+    assert rec["plan"] == {"queued": True}
+    assert orders_state.queue("B1") is False
+    orders_state.put("B2", "pending", plan={"x": 1})
+    assert orders_state.queue("B2") is False
+    assert orders_state.get("B2")["status"] == "pending"
+
+
+def test_begin_converts_queued_record_exactly_once():
+    orders_state.queue("B1")
+    assert orders_state.begin("B1") is True
+    rec = orders_state.get("B1")
+    assert rec["status"] == "attempted"
+    assert rec["plan"] is None
+    assert orders_state.begin("B1") is False
+
+
+def test_begin_without_record_claims():
+    assert orders_state.begin("B1") is True
+    assert orders_state.get("B1")["status"] == "attempted"
+    assert orders_state.begin("B1") is False
+
+
+@pytest.mark.parametrize("status", ["pending", "ordered", "blocked", "failed"])
+def test_begin_refuses_other_records(status):
+    orders_state.put("B1", status, plan={"queued": True})
+    assert orders_state.begin("B1") is False
+    assert orders_state.get("B1")["status"] == status
+
+
+def test_begin_and_queue_check_ids():
+    with pytest.raises(TypeError):
+        orders_state.queue(1)
+    with pytest.raises(ValueError):
+        orders_state.begin(" ")
+
+
+def test_by_status_sorted_and_validated():
+    orders_state.put("B2", "attempted")
+    orders_state.put("B1", "attempted")
+    orders_state.put("B3", "pending")
+    assert [bid for bid, _ in orders_state.by_status("attempted")] == ["B1", "B2"]
+    assert orders_state.by_status("ordered") == []
+    with pytest.raises(ValueError):
+        orders_state.by_status("bogus")
