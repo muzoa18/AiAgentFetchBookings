@@ -30,8 +30,10 @@ PORTAL_LOGIN_URL = PORTAL_BASE + "/"
 LOGIN_SELECTORS = {
     "username": ["#userName", "input[name='UserName']", "input[type='email']"],
     "password": ["#password", "input[name='Password']", "input[type='password']"],
-    "submit":   ["button[type='submit']", "input[type='submit']",
-                 "button:has-text('Logga in')", "button:has-text('Login')"],
+    # The login page has language buttons (DA/EN/NO/SV) that are ALSO type=submit and
+    # come first in the DOM: never click a bare "button[type='submit']" here.
+    "submit":   ["#btnLogin", "button:has-text('Login')", "button:has-text('Logga in')",
+                 "input[type='submit']"],
 }
 
 

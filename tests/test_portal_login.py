@@ -98,7 +98,7 @@ class FakePage:
 
 
 PASSWORD_FIELD = {"input[type='password']": [FakeElement()], "#userName": [FakeElement()],
-                  "#password": [FakeElement()], "button[type='submit']": [FakeElement("LOGIN")]}
+                  "#password": [FakeElement()], "#btnLogin": [FakeElement("LOGIN")]}
 LOGIN_BODY = "DA EN NO SV | Login | User name | Password | LOGIN | RESET PASSWORD | CONTACT SUPPORT"
 LOGIN_PAGE = (LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY)
 
@@ -293,3 +293,33 @@ def test_mark_booking_handled_returns_false_when_detail_page_shows_login(fake_pw
     assert portal_scraper.mark_booking_handled(CONFIG, detail) is False
     assert ("goto", detail) in page.actions
     assert not any(a[0] == "locator" for a in page.actions)   # never looked for Hanterad
+
+
+# ── submit button (regression: language buttons are type=submit and come first) ──
+
+def test_submit_selectors_never_use_the_bare_submit_button():
+    # The real login page has DA/EN/NO/SV buttons that are type=submit BEFORE the
+    # LOGIN button; a bare button[type='submit'] clicks the Danish language switch.
+    assert "button[type='submit']" not in portal_scraper.LOGIN_SELECTORS["submit"]
+    assert portal_scraper.LOGIN_SELECTORS["submit"][0] == "#btnLogin"
+
+
+def test_fill_login_clicks_the_login_button_not_a_language_button():
+    page = FakePage(elements={
+        "#userName": [FakeElement()], "#password": [FakeElement()],
+        "button[type='submit']": [FakeElement("DA"), FakeElement("EN"), FakeElement("LOGIN")],
+        "#btnLogin": [FakeElement("LOGIN")],
+    })
+    assert portal_scraper._fill_login(page, "u", "p") is True
+    clicks = [a[1] for a in page.actions if a[0] == "click"]
+    assert clicks == ["#btnLogin"]
+
+
+def test_fill_login_without_a_known_button_presses_enter_instead_of_a_language_button():
+    page = FakePage(elements={
+        "#userName": [FakeElement()], "#password": [FakeElement()],
+        "button[type='submit']": [FakeElement("DA"), FakeElement("EN")],
+    })
+    assert portal_scraper._fill_login(page, "u", "p") is True
+    assert [a for a in page.actions if a[0] == "click"] == []
+    assert ("press", "Enter") in page.actions
