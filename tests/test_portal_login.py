@@ -124,15 +124,14 @@ def test_no_password_field_off_login_url_is_logged_in():
     assert _logged_in(FakePage(BOOKING_URL, {})) is True
 
 
-def test_login_url_without_password_field_but_booking_marker_is_logged_in():
-    page = FakePage(LOGIN_URL, {"a[href*='Booking']": [FakeElement("Bokningar")]})
-    assert _logged_in(page) is True
+def test_login_url_without_password_field_is_logged_in():
+    # The real landing page may stay on the bare site root with no known markers.
+    assert _logged_in(FakePage(LOGIN_URL, {}, "Start")) is True
+    assert _logged_in(FakePage(LOGIN_URL.rstrip("/") + "?ReturnUrl=%2F", {})) is True
 
 
-def test_login_url_without_password_field_or_marker_is_not_logged_in():
-    # e.g. a captcha / verification step on the site root
-    assert _logged_in(FakePage(LOGIN_URL, {})) is False
-    assert _logged_in(FakePage(LOGIN_URL.rstrip("/") + "?ReturnUrl=%2F", {})) is False
+def test_login_url_with_password_field_is_not_logged_in():
+    assert _logged_in(FakePage(*LOGIN_PAGE)) is False
 
 
 # ── _login_error_text ────────────────────────────────────────────────────────
@@ -242,8 +241,9 @@ def test_fetch_bookings_raises_when_login_form_still_showing(fake_pw, tmp_path, 
 
 
 def test_fetch_bookings_raises_when_booking_list_shows_login_again(fake_pw):
-    # Login seems to work (password field gone), but the list redirects to the form.
-    page = _login_page((LOGIN_URL, {"a[href*='Booking']": [FakeElement("Bokningar")]}, "Start"))
+    # Stage 1 passes provisionally (root, no password field, no markers),
+    # but the booking list redirects to the login form: the definitive failure.
+    page = _login_page((LOGIN_URL, {}, "Start"))
     page.routes[BOOKING_URL] = LOGIN_PAGE
     fake_pw(page)
 

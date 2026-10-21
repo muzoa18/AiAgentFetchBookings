@@ -2,7 +2,9 @@
 portal_scraper.py
 -----------------
 Workflow:
-  1. Log in — portal lands directly on Booking/Index with Nya tab active
+  1. Log in — portal lands directly on Booking/Index with Nya tab active.
+     A visible login form after login, or on the booking list, raises
+     PortalLoginError (never "no bookings"); the booking-list check is definitive.
   2. Dismiss cookie popup if present
   3. Collect all BookingInfo links visible on the page
   4. Open each detail page, extract all info
@@ -33,12 +35,6 @@ LOGIN_SELECTORS = {
 }
 
 
-# Present only once logged in: links into the booking area, or a logout link.
-LOGGED_IN_MARKERS = [
-    "a[href*='Booking']", "a[href*='booking']",
-    "a[href*='Logout']", "a[href*='LogOut']", "a[href*='LogOff']", "a[href*='logout']",
-]
-
 LOGIN_ERROR_SELECTORS = [
     ".validation-summary-errors", ".field-validation-error", ".alert", ".error", "[role=alert]",
 ]
@@ -61,20 +57,15 @@ def _visible(page, selector: str) -> bool:
 
 def _logged_in(page) -> bool:
     """
-    True only if the page is past the login form.
+    False while the login form is showing (a visible password input), else True.
 
-    A visible password input means the login form is (still) showing. The URL
-    alone proves nothing: the login URL is the site root, which is also where
-    a rejected login lands. On that URL some logged-in marker must be present
-    too, so an unknown interstitial (captcha, verification) counts as failure.
+    The URL is deliberately not used: the login URL is the site root, which is
+    both where a rejected login lands and where a good login may stay. Right
+    after login this is only a provisional check; the definitive one is made
+    on the booking list, where a session the portal did not accept shows the
+    login form again.
     """
-    password_selectors = ["input[type='password']"] + LOGIN_SELECTORS["password"]
-    if any(_visible(page, sel) for sel in password_selectors):
-        return False
-    url = (page.url or "").split("#")[0].split("?")[0].rstrip("/")
-    if url == PORTAL_LOGIN_URL.rstrip("/"):
-        return any(_visible(page, sel) for sel in LOGGED_IN_MARKERS)
-    return True
+    return not any(_visible(page, sel) for sel in LOGIN_SELECTORS["password"])
 
 
 def _login_error_text(page, username: str = "", password: str = "") -> str:
@@ -164,9 +155,11 @@ def fetch_bookings(config: dict) -> list[dict]:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
-            # Never retried: repeated bad attempts can lock the account.
+            # Provisional: only a still-visible login form fails here. The
+            # definitive check is on the booking list below. Never retried:
+            # repeated bad attempts can lock the account.
             _require_login(page, username, password, "after login")
-            log.info("Logged in (verified). URL: %s", page.url)
+            log.info("Login form gone. URL: %s", page.url)
 
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
@@ -175,7 +168,9 @@ def fetch_bookings(config: dict) -> list[dict]:
                 page.wait_for_load_state("networkidle")
             else:
                 log.info("Already on booking list.")
+            # Definitive: the login form on the booking list means the session was not accepted.
             _require_login(page, username, password, "booking list")
+            log.info("Logged in (verified on booking list).")
 
             # ── Step 3: Dismiss cookie popup ──────────────────────────────────
             _dismiss_cookies(page)
