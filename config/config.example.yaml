@@ -36,6 +36,13 @@ sms:
   twilio_auth_token: ""                # env: TWILIO_AUTH_TOKEN
   twilio_from_number: ""               # env: TWILIO_FROM_NUMBER
 
+# -- Telegram bot (notifications + order approval) ---------------------------
+# Create the bot with @BotFather, send it a message, then fill in both values.
+# chat_id must be YOUR PRIVATE chat id (a positive number); never use a group.
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"   # env: TELEGRAM_BOT_TOKEN
+  chat_id: "YOUR_TELEGRAM_CHAT_ID"       # env: TELEGRAM_CHAT_ID
+
 # ── Booking trigger ──────────────────────────
 trigger:
   # "email"  → only scrape the portal when a MECA "booking made" email

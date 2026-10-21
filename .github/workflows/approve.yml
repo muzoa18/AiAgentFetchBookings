@@ -1,14 +1,16 @@
 name: MECA Approval Poller
 
 # Reads the owner's Telegram Approve/Cancel taps on staged parts orders
-# (approve.py). Every 20 minutes, 05-19 UTC (07-21 Swedish summer time,
-# 06-20 winter time), Mon-Sat, to stay inside the GitHub Actions free-minutes
-# quota (polling around the clock would exceed it and stop ALL workflows).
-# Approval can lag by up to ~20 minutes; taps outside the window are handled
-# the next morning (the 48 h expiry still applies). Owner may adjust.
+# (approve.py). Once a day at 06:00 UTC (08:00 Swedish summer time, 07:00
+# winter time), every day of the week: the owner taps in the evening after the
+# daily booking run and the order is placed the next morning. Every day (incl.
+# Sunday) because Telegram only keeps unread button taps for 24 hours. Tap
+# within ~36 h of the staging message: approvals older than 48 h expire, and
+# expiry is checked at poll time. Run it by hand from the Actions tab
+# ("Run workflow") to process a tap immediately.
 on:
   schedule:
-    - cron: "*/20 5-19 * * 1-6"
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 # Same group as bookings.yml: the two jobs must never overlap (shared

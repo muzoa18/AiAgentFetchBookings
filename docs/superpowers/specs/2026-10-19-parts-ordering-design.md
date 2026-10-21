@@ -64,13 +64,14 @@ is a mechanic, not a developer: it must be safe by default and adjustable withou
 ## Approval mechanics (my calls, not owner-decided)
 - **Pending state:** the daily run stores a plan per booking (matched parts, prices, cart total)
   with status `pending`, committed to the repo like the other state.
-- **Polling workflow:** a second, light GitHub Actions workflow runs every 20 minutes within working
-  hours (05–19 UTC, Mon–Sat) and first checks the state file; if nothing is pending it exits
-  immediately. Otherwise it reads Telegram updates. Approval can therefore lag by up to about
-  20 minutes inside the window.
-- **Ruling (final review):** the poll interval is 20 min within working hours to stay inside the
-  GitHub Actions free-minutes quota (adjustable by the owner); approvals tapped outside the window
-  are processed the next morning, and the 48 h expiry still applies.
+- **Polling workflow:** a second, light GitHub Actions workflow runs ONCE A DAY at 06:00 UTC
+  (every day of the week) and first checks the state file; if nothing is pending it exits
+  immediately. Otherwise it reads Telegram updates. The owner taps in the evening after the daily
+  booking run and the order is placed the next morning.
+- **Owner decision (2026-10-21):** one poll per day is enough (no 15/20-minute polling); it also keeps
+  GitHub Actions usage minimal. It runs on Sundays too because Telegram keeps unread button taps for
+  only 24 h. The 48 h expiry is checked at poll time, so tap within ~36 h of the staging message; a
+  manual "Run workflow" from the Actions tab processes a tap immediately.
 - **On Approve:** a fresh browser session logs in to pro.meca.se, verifies the cart still matches the
   stored plan and the total is within the ceiling, then checks out. Any mismatch fails closed and
   notifies the owner.
@@ -117,5 +118,5 @@ is a mechanic, not a developer: it must be safe by default and adjustable withou
   confidence threshold are the builder's call, as long as ambiguity fails closed).
 - Mapping from a booking's service/part lines to search terms.
 - Module layout, test strategy, state schema details, and how the rules file is wired.
-- Exact polling interval (decided: 20 min within working hours, see Approval mechanics).
+- Exact polling time (decided by the owner: once a day at 06:00 UTC, see Approval mechanics).
 - What to do about `improve.py` stale file lists and model ID (small cleanup, in scope).

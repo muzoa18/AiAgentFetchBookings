@@ -624,8 +624,8 @@ def _steps(wf):
 def test_approve_workflow_shape():
     wf = _workflow("approve.yml")
     on = wf.get("on", wf.get(True))  # PyYAML reads a bare `on` key as True
-    # Every 20 min, 05-19 UTC, Mon-Sat: stays inside the Actions free-minutes quota.
-    assert on["schedule"] == [{"cron": "*/20 5-19 * * 1-6"}]
+    # Once a day at 06:00 UTC, every day (Telegram keeps updates only 24 h).
+    assert on["schedule"] == [{"cron": "0 6 * * *"}]
     assert "workflow_dispatch" in on
     (job,) = wf["jobs"].values()
     assert job["timeout-minutes"] == 10
@@ -659,11 +659,12 @@ def test_persist_step_rebases_and_retries(name):
     assert "git rebase --abort 2>/dev/null || true" in persist["run"]
 
 
-def test_daily_run_is_off_the_poll_ticks():
+def test_daily_run_is_clear_of_the_approval_poll():
     wf = _workflow("bookings.yml")
     on = wf.get("on", wf.get(True))
-    assert on["schedule"] == [{"cron": "7 15 * * 1-6"}]
-    minute = int(on["schedule"][0]["cron"].split()[0])
-    assert minute % 20 != 0  # never on a :00/:20/:40 poll tick (shared concurrency group)
+    assert on["schedule"] == [{"cron": "0 15 * * 1-6"}]
+    approve_on = _workflow("approve.yml")
+    approve_on = approve_on.get("on", approve_on.get(True))
+    assert approve_on["schedule"] == [{"cron": "0 6 * * *"}]  # 9 h away from the daily run
     text = (REPO / ".github" / "workflows" / "bookings.yml").read_text(encoding="utf-8")
-    assert "15:07 UTC" in text and "17:07" in text and "16:07" in text
+    assert "15:00 UTC" in text and "17:00" in text and "16:00" in text
