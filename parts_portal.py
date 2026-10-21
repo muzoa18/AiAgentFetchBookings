@@ -30,7 +30,8 @@ from urllib.parse import unquote
 from parts_portal_parse import (PartsPortalError, PartsPortalPartialAdd, current_plate, extract_order_reference,
                                 is_cart_page, is_login_page, search_echo, linked_tab_id, order_tokens, page_markers, parse_cart,
                                 parse_checkout, parse_qty_text, parse_search_results, parse_sek,
-                                same_lines)
+                                same_lines, first_order_row, has_order_tabs, parse_sent_orders,
+                                sent_orders_ready)
 
 __all__ = ["PartsPortal", "PartsPortalError", "PartsPortalPartialAdd", "parse_sek", "parse_search_results", "parse_cart",
            "parse_checkout", "extract_order_reference"]
@@ -59,6 +60,9 @@ SEL_GO_ON = "form#bookingForm button.button--primary:has-text('Gå vidare')"
 SEL_SHIPPING_CHECKED = "input[name='CheckoutForm_ShippingMethod']:checked"
 SEL_PLACE_ORDER = "button.checkout-page-place-order__button:has-text('Skicka beställning')"
 # Never clicked: "Avbryt beställning" (button.checkout-page-cancel-productOrder__button).
+# Order overview tab "Skickade Beställningar" (the only element list_sent_orders clicks).
+SEL_SENT_TAB = "li.order-tabs__item[data-filter='sent']"
+SENT_TAB_TEXT = re.compile(r"^\s*Skickade Beställningar\s*$")
 
 NAV_TIMEOUT = 45_000
 IDLE_TIMEOUT = 30_000
@@ -414,6 +418,45 @@ class PartsPortal:
         if self._cart()["lines"]:
             raise PartsPortalError(f"cart for {self._reg} is not empty after "
                                    f"{MAX_CLEAR_ATTEMPTS} attempts")
+
+    # ── Sent orders (order checker; read-only) ───────────────────────────────
+
+    def list_sent_orders(self) -> list[dict]:
+        """Rows of Orderöversikt -> "Skickade Beställningar" (parse_sent_orders). Read-only.
+
+        Logs in, opens the order overview and clicks ONLY the "Skickade Beställningar" tab
+        (not even that when it is already the active tab), then polls (RESULTS_WAIT_S) until
+        the sent-orders view is shown: that tab active, the order table with its headers,
+        order rows linking to view=sent, and a first row that differs from the table shown
+        before the click. No vehicle needs to be loaded. Raises PartsPortalError:
+        "login", "search_timeout" (the page or table did not appear), "parse"."""
+        self.login()
+        html = self._goto(ORDER_OVERVIEW_URL, ready=lambda h, u: has_order_tabs(h))
+        if not has_order_tabs(html):
+            raise PartsPortalError("the order overview did not load", "search_timeout")
+        if not sent_orders_ready(html):
+            before = first_order_row(html)
+            self._sent_tab().click()
+
+            def ready(page_html: str, url: str) -> bool:
+                return sent_orders_ready(page_html) and (
+                    before is None or first_order_row(page_html) != before)
+
+            html = self._poll(ready)
+            if html is None:
+                raise PartsPortalError("the sent orders table did not appear", "search_timeout")
+        rows = parse_sent_orders(html)
+        log.info("Sent orders: %d row(s) read.", len(rows))
+        return rows
+
+    def _sent_tab(self):
+        tab = self.page.locator(SEL_SENT_TAB)
+        if tab.count() == 1:
+            return tab.first
+        tab = self.page.locator("a, li, span, button").filter(has_text=SENT_TAB_TEXT)
+        if tab.count() < 1:
+            raise PartsPortalError("'Skickade Beställningar' tab not found", "parse")
+        return tab.first
 
     # ── Checkout (spends money) ──────────────────────────────────────────────
 

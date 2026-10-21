@@ -12,6 +12,7 @@ Fail-closed rules:
 """
 
 import re
+import unicodedata
 from collections import Counter
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlparse
@@ -28,7 +29,8 @@ class PartsPortalError(Exception):
     """pro.meca.se did not behave as expected; nothing beyond the failing step was done.
 
     `code` names the kind of failure for callers (never shown raw to the owner):
-    not_linked, in_cart, cart_update, vehicle_lost, login, config; None = other."""
+    not_linked, in_cart, cart_update, vehicle_lost, login, config, search_timeout,
+    parse (a page without the expected structure); None = other."""
 
     def __init__(self, message: str = "", code: str | None = None):
         super().__init__(message)
@@ -423,3 +425,117 @@ def is_cart_page(html: str) -> bool:
 def current_plate(html: str) -> str | None:
     node = parse_html(html).find(cls="js-current-license-plate-number")
     return (node.text().strip().upper() or None) if node is not None else None
+
+
+# ── Order overview: "Skickade Beställningar" (order checker, read-only) ──────
+
+# Header texts (zero-width marks stripped, casefolded) -> row keys. "Ordernummer" appears
+# twice: the first is the supplier (MECA/ERP) number, the second the portal order numbers.
+SENT_COLUMNS = {"status": "status", "datum": "date", "bilmodell": "model",
+                "beställningsstatus": "order_status", "registreringsnummer": "reg_nr"}
+SENT_REQUIRED = ("supplier_no", "order_numbers", "status", "date", "model", "order_status")
+
+
+def _clean_cell(text: str) -> str:
+    """Cell text without zero-width/format characters (pro.meca.se adds U+200E marks)."""
+    return " ".join("".join(c for c in text or "" if unicodedata.category(c) != "Cf").split())
+
+
+def _direct(node: Node, tag: str) -> list[Node]:
+    return [c for c in node.children if isinstance(c, Node) and c.tag == tag]
+
+
+def _sent_columns(table: Node) -> dict | None:
+    """{row key: column index} from the table's header cells, or None if one is missing."""
+    head = table.find("thead") or table
+    header_row = head.find("tr")
+    if header_row is None:
+        return None
+    columns = {}
+    for i, th in enumerate(_direct(header_row, "th")):
+        label = _clean_cell(th.text()).casefold()
+        if label == "ordernummer":
+            columns.setdefault("supplier_no" if "supplier_no" not in columns
+                               else "order_numbers", i)
+        elif label in SENT_COLUMNS:
+            columns.setdefault(SENT_COLUMNS[label], i)
+    return columns if all(k in columns for k in SENT_REQUIRED) else None
+
+
+def _sent_table(root: Node) -> tuple[Node, dict] | tuple[None, None]:
+    for table in root.find_all("table"):
+        columns = _sent_columns(table)
+        if columns is not None:
+            return table, columns
+    return None, None
+
+
+def _body_rows(table: Node) -> list[Node]:
+    """The table's own rows (never rows of a table nested in an order's detail row)."""
+    rows = []
+    for part in _direct(table, "tbody") or [table]:
+        rows.extend(_direct(part, "tr"))
+    return [r for r in rows if not _direct(r, "th")]
+
+
+def parse_sent_orders(html: str) -> list[dict]:
+    """Rows of the "Skickade Beställningar" table, positions taken from its headers:
+    {"supplier_no", "status", "date", "reg_nr", "model", "order_numbers", "order_status"}.
+    A model shown as "-" (not filled in yet) is "". reg_nr is "" without that column.
+    Detail rows (one wide cell) are skipped. Raises PartsPortalError(code "parse") when
+    the table or one of its required headers is missing."""
+    table, columns = _sent_table(parse_html(html))
+    if table is None:
+        raise PartsPortalError("sent orders table not found", "parse")
+    width = max(columns.values()) + 1
+    out = []
+    for tr in _body_rows(table):
+        cells = _direct(tr, "td")
+        if len(cells) < width:
+            continue
+        row = {key: _clean_cell(cells[i].text()) for key, i in columns.items()}
+        row.setdefault("reg_nr", "")
+        if row["model"] == "-":
+            row["model"] = ""
+        out.append(row)
+    return out
+
+
+def _sent_tab_active(root: Node) -> bool:
+    tabs = root.find_all("li", cls="order-tabs__item")
+    sent = [t for t in tabs if t.get("data-filter") == "sent" or t.has_class("sent")]
+    others = [t for t in tabs if t not in sent]
+    return (len(sent) == 1 and sent[0].has_class("active")
+            and not any(t.has_class("active") for t in others))
+
+
+def sent_orders_ready(html: str) -> bool:
+    """True when the page shows the sent-orders view: the "Skickade Beställningar" tab is
+    the active one, the order table has its headers, and every order row links to the
+    sent view (view=sent; the open carts link view=open)."""
+    root = parse_html(html)
+    if not _sent_tab_active(root):
+        return False
+    table, _ = _sent_table(root)
+    if table is None:
+        return False
+    for tr in _body_rows(table):
+        link = tr.get("data-url")
+        if link is not None and "view=sent" not in link:
+            return False
+    return True
+
+
+def has_order_tabs(html: str) -> bool:
+    """The order overview has loaded far enough to show its tabs."""
+    return parse_html(html).find("li", cls="order-tabs__item") is not None
+
+
+def first_order_row(html: str) -> str | None:
+    """Text of the first order row of the overview's order table (None without rows), to
+    tell a switched table from the one shown before the tab click."""
+    table, _ = _sent_table(parse_html(html))
+    for tr in _body_rows(table) if table is not None else []:
+        if len(_direct(tr, "td")) > 1:
+            return _clean_cell(tr.text())
+    return None

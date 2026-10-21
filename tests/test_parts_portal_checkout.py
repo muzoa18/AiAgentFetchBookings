@@ -1086,3 +1086,159 @@ def test_add_to_cart_quick_form_read_tolerates_a_navigation_error(add_page):
     page.content = flaky
     portal.add_to_cart(cand, 1)
     assert page.qty == {"p1": 1}
+
+
+# ── list_sent_orders (order checker, read-only) ──────────────────────────────
+
+SENT = (FIXTURES / "meca_sent_orders.html").read_text(encoding="utf-8")
+OPEN_CARTS = (SENT.replace("sent active js-orderhistory-view", "sent js-orderhistory-view")
+              .replace("open  js-orderhistory-view", "open active js-orderhistory-view")
+              .replace("view=sent", "view=open").replace("<td>90000001</td>", "<td>80000001</td>"))
+
+
+class SentPage:
+    """The order overview: goto() shows `start`; a click on the sent tab queues `after`
+    (an exception instance is raised by content() at that read; the last page sticks)."""
+
+    def __init__(self, start=OPEN_CARTS, after=(SENT,), tab_count=1, text_tab_count=1):
+        self.start, self.pages, self.after = start, [start], list(after)
+        self.tab_count, self.text_tab_count = tab_count, text_tab_count
+        self.url, self.clicks, self.gotos, self.reads = "about:blank", [], [], 0
+
+    def goto(self, url, **_):
+        self.gotos.append(url)
+        self.url = url
+        if url == parts_portal.START_URL:
+            self.pages = [LOGGED_IN]
+        elif url == parts_portal.ORDER_OVERVIEW_URL:
+            self.pages = [self.start]
+        else:
+            raise AssertionError(f"unexpected goto {url}")
+
+    def content(self):
+        self.reads += 1
+        page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        if isinstance(page, BaseException):
+            raise page
+        return page
+
+    def wait_for_load_state(self, *_, **__):
+        pass
+
+    def wait_for_timeout(self, *_):
+        pass
+
+    def locator(self, selector):
+        return SentLocator(self, selector)
+
+    def click(self, what):
+        self.clicks.append(what)
+        self.pages = list(self.after)
+
+
+class SentLocator:
+    def __init__(self, page, selector, text=None):
+        self.page, self.selector, self.text = page, selector, text
+
+    @property
+    def first(self):
+        return self
+
+    def filter(self, has_text=None, **_):
+        return SentLocator(self.page, self.selector, has_text)
+
+    def count(self):
+        if self.selector == parts_portal.SEL_SENT_TAB:
+            return self.page.tab_count
+        if self.text is not None and self.text.search("Skickade Beställningar"):
+            return self.page.text_tab_count
+        if self.selector in (parts_portal.SEL_LOGIN_USER,):
+            return 0
+        if self.selector == parts_portal.SEL_LOGOUT:
+            return 1
+        return 0
+
+    def click(self, **_):
+        assert self.count() >= 1, f"click on a missing element {self.selector}"
+        self.page.click(self.selector if self.text is None else ("text", self.text.pattern))
+
+
+def sent_portal(page):
+    portal = portal_with(page)
+    portal._reg = None              # the vehicle need not be loaded
+    return portal
+
+
+def make_sent_page(**kw):
+    return SentPage(**kw)
+
+
+def test_list_sent_orders_clicks_only_the_sent_tab_and_parses_rows():
+    page = make_sent_page()
+    rows = sent_portal(page).list_sent_orders()
+    assert [r["supplier_no"] for r in rows][:2] == ["90000001", "90000002"]
+    assert rows[1]["model"] == "KIA, Rio Kombi-sedan (III), 12-16"
+    assert page.clicks == [parts_portal.SEL_SENT_TAB]
+    assert parts_portal.ORDER_OVERVIEW_URL in page.gotos
+    assert all(g in (parts_portal.START_URL, parts_portal.ORDER_OVERVIEW_URL) for g in page.gotos)
+
+
+def test_list_sent_orders_logs_in_first():
+    page = make_sent_page()
+    portal = sent_portal(page)
+    portal._logged_in = False
+    portal.list_sent_orders()
+    assert page.gotos[0] == parts_portal.START_URL
+
+
+def test_list_sent_orders_waits_for_the_sent_table_through_navigation():
+    page = make_sent_page(after=(OPEN_CARTS, NAVIGATING, OPEN_CARTS, SENT))
+    portal = sent_portal(page)
+    rows = portal.list_sent_orders()
+    assert len(rows) == 7 and page.clicks == [parts_portal.SEL_SENT_TAB]
+    assert portal.clock.sleeps                  # it polled
+
+
+def test_list_sent_orders_already_on_the_sent_tab_needs_no_click():
+    page = make_sent_page(start=SENT)
+    assert len(sent_portal(page).list_sent_orders()) == 7
+    assert page.clicks == []
+
+
+def test_list_sent_orders_times_out_when_the_table_never_switches():
+    page = make_sent_page(after=(OPEN_CARTS,))
+    portal = sent_portal(page)
+    with pytest.raises(PartsPortalError) as e:
+        portal.list_sent_orders()
+    assert e.value.code == "search_timeout"
+    assert portal.clock.now <= parts_portal.RESULTS_WAIT_S + 1
+    assert page.clicks == [parts_portal.SEL_SENT_TAB]
+
+
+def test_list_sent_orders_falls_back_to_the_tab_text():
+    page = make_sent_page(tab_count=0)
+    assert len(sent_portal(page).list_sent_orders()) == 7
+    assert len(page.clicks) == 1 and page.clicks[0][0] == "text"
+
+
+def test_list_sent_orders_without_the_tab_is_a_parse_error_and_clicks_nothing():
+    page = make_sent_page(tab_count=0, text_tab_count=0)
+    with pytest.raises(PartsPortalError) as e:
+        sent_portal(page).list_sent_orders()
+    assert e.value.code == "parse"
+    assert page.clicks == []
+
+
+def test_list_sent_orders_login_page_is_a_login_error():
+    page = make_sent_page(after=(LOGIN_FORM,))
+    with pytest.raises(PartsPortalError) as e:
+        sent_portal(page).list_sent_orders()
+    assert e.value.code == "login"
+
+
+def test_list_sent_orders_overview_that_never_loads_is_a_timeout():
+    page = make_sent_page(start="<html><body>laddar…</body></html>")
+    with pytest.raises(PartsPortalError) as e:
+        sent_portal(page).list_sent_orders()
+    assert e.value.code == "search_timeout"
+    assert page.clicks == []

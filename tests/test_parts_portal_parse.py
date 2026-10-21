@@ -243,3 +243,87 @@ def test_extract_order_reference_never_from_cart_or_checkout_page():
     checkout = fixture("meca_checkout.html").replace("</main>", "<p>Ordernummer 123456789</p></main>")
     assert extract_order_reference(cart, "https://x/ViewOrder-Done", REG) is None
     assert extract_order_reference(checkout, "https://x/ViewOrder-Done", REG) is None
+
+
+# ── Skickade Beställningar (order checker) ───────────────────────────────────
+
+from parts_portal_parse import parse_sent_orders, sent_orders_ready  # noqa: E402
+
+SENT = fixture("meca_sent_orders.html")
+
+
+def test_parse_sent_orders_reads_every_order_row_by_header_position():
+    rows = parse_sent_orders(SENT)
+    assert [r["supplier_no"] for r in rows] == [f"9000000{i}" for i in range(1, 8)]
+    assert rows[1] == {"supplier_no": "90000002", "status": "", "date": "2026-10-21",
+                       "reg_nr": "TST001", "model": "KIA, Rio Kombi-sedan (III), 12-16",
+                       "order_numbers": "01000011/01000012", "order_status": "Bekräftad"}
+    assert rows[2]["status"] == "Följesedel utskriven"
+    assert rows[2]["model"] == "VOLKSWAGEN, Passat Variant (B7) (365), 10-15"
+
+
+def test_parse_sent_orders_model_dash_or_empty_is_empty():
+    rows = parse_sent_orders(SENT)
+    assert rows[0]["model"] == "" and rows[0]["order_numbers"] == ""
+    assert rows[0]["order_status"] == "-"
+    assert rows[6]["model"] == ""
+
+
+def test_parse_sent_orders_strips_zero_width_marks_from_cells():
+    html = SENT.replace("<td>KIA, Rio", "<td>&#8206;KIA, Rio").replace(
+        "<td>90000002</td>", "<td>​90000002‎</td>")
+    row = parse_sent_orders(html)[1]
+    assert row["supplier_no"] == "90000002" and row["model"].startswith("KIA, Rio")
+
+
+def test_parse_sent_orders_follows_the_header_order():
+    # Swap the Datum and Status columns (headers and cells): positions come from the headers.
+    html = SENT.replace(">Status</a>", ">TMP</a>").replace(">Datum</a>", ">Status</a>") \
+        .replace(">TMP</a>", ">Datum</a>")
+    html = html.replace("<td></td>\n<td>2026-10-21</td><td>TST001</td>",
+                        "<td>2026-10-21</td>\n<td></td><td>TST001</td>")
+    row = parse_sent_orders(html)[1]
+    assert row["date"] == "2026-10-21" and row["status"] == ""
+
+
+def test_parse_sent_orders_without_a_registration_column():
+    html = SENT.replace("&#8206;Registreringsnummer", "&#8206;Servicetyp")
+    row = parse_sent_orders(html)[1]
+    assert row["reg_nr"] == "" and row["model"].startswith("KIA, Rio")
+
+
+def test_parse_sent_orders_empty_table_is_empty_list():
+    start, end = SENT.index("<tbody>"), SENT.index("</tbody>")
+    assert parse_sent_orders(SENT[:start] + "<tbody>" + SENT[end:]) == []
+
+
+@pytest.mark.parametrize("html", [
+    "<html><body><p>Inga ordrar</p></body></html>",
+    SENT.replace("&#8206;Bilmodell", "&#8206;Fordon"),
+    SENT.replace("&#8206;Beställningsstatus", "&#8206;Läge"),
+    SENT.replace("&#8206;Ordernummer", "&#8206;Nummer"),     # only one Ordernummer left
+    SENT.replace(">Datum</a>", ">Dag</a>"),
+    "",
+])
+def test_parse_sent_orders_without_the_table_or_headers_is_a_parse_error(html):
+    with pytest.raises(PartsPortalError) as e:
+        parse_sent_orders(html)
+    assert e.value.code == "parse"
+
+
+def test_parse_sent_orders_fixture_has_no_customer_data():
+    import re
+    assert "@" not in SENT and "+46" not in SENT and "customerid" not in SENT.casefold()
+    assert not re.search(r"\b07\d{8}\b", SENT)                       # no phone numbers
+    plates = set(re.findall(r"\b[A-Z]{3}\d{2}[A-Z0-9]\b", SENT))
+    assert plates <= {"TST001", "TST002", "TST003", "TST004"}       # invented plates only
+
+
+def test_sent_orders_ready_only_for_the_active_sent_tab_with_sent_rows():
+    assert sent_orders_ready(SENT)
+    open_tab = SENT.replace("sent active js-orderhistory-view", "sent js-orderhistory-view") \
+        .replace("open  js-orderhistory-view", "open active js-orderhistory-view")
+    assert not sent_orders_ready(open_tab)
+    assert not sent_orders_ready(SENT.replace("90000001&amp;view=sent", "90000001&amp;view=open"))
+    assert not sent_orders_ready(SENT.replace("&#8206;Bilmodell", "&#8206;Fordon"))
+    assert not sent_orders_ready("<html><body>laddar…</body></html>")
