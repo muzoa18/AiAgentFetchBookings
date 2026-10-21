@@ -373,6 +373,9 @@ class AddEl:
         return self.selector.split("data-sku='")[1].split("'")[0]
 
     def input_value(self):
+        self.page.input_reads += 1
+        if self.page.input_reads == self.page.input_fails_on_read:
+            raise RuntimeError("SECRET-PAGE-TEXT element is not attached to the DOM")
         return f"{self.page.qty.get(self._sku(), 0)} st"
 
     def click(self, **_):
@@ -425,6 +428,7 @@ class AddPage:
         self.clicks_made, self.last_ok = 0, True
         self.click_fails_at = self.bad_response_at = self.stuck_at = None
         self.close_tab_on_search = False
+        self.input_reads, self.input_fails_on_read = 0, None
 
     def fill(self, selector, value):
         assert selector == parts_portal.SEL_SEARCH
@@ -559,7 +563,7 @@ def test_already_in_cart_has_a_code(add_page):
     assert err.code == "in_cart" and not isinstance(err, PartsPortalPartialAdd)
 
 
-def test_click_failing_at_step_2_of_2_reports_one_step_done(add_page):
+def test_click_failing_at_step_2_of_2_counts_the_step_on_the_safe_side(add_page):
     page, portal = add_page({"Tändstift": ["t1"]})
     (cand,) = portal.search("Tändstift")
     page.click_fails_at = 2
@@ -567,7 +571,8 @@ def test_click_failing_at_step_2_of_2_reports_one_step_done(add_page):
     err = _err(portal, cand, 2)
 
     assert isinstance(err, PartsPortalPartialAdd)
-    assert (err.code, err.steps_done) == ("cart_update", 1)
+    # The press may have been dispatched: the failing step counts (never under-report).
+    assert (err.code, err.steps_done) == ("cart_update", 2)
     assert page.qty == {"t1": 1}
 
 
@@ -582,14 +587,15 @@ def test_bad_response_at_step_1_after_the_click_reports_one_step_done(add_page):
     assert (err.code, err.steps_done) == ("cart_update", 1)
 
 
-def test_click_failing_before_any_step_reports_zero_steps(add_page):
+def test_first_click_failing_counts_one_step_on_the_safe_side(add_page):
     page, portal = add_page({"Tändstift": ["t1"]})
     (cand,) = portal.search("Tändstift")
     page.click_fails_at = 1
 
     err = _err(portal, cand, 2)
 
-    assert err.code == "cart_update" and err.steps_done == 0
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert err.code == "cart_update" and err.steps_done == 1
 
 
 def test_quantity_not_reached_reports_the_steps_clicked(add_page, monkeypatch):
@@ -633,3 +639,124 @@ def test_login_failure_has_the_login_code():
 
 def test_plain_portal_error_has_no_code():
     assert PartsPortalError("x").code is None
+
+
+
+# ── Re-review: ANY failure after the first click is a possibly partial add ──
+
+def test_quantity_read_failing_after_click_1_of_2_is_a_partial_add(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.input_fails_on_read = 2      # read 1: the already-in-cart check; read 2: after click 1
+
+    err = _err(portal, cand, 2)
+
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert (err.code, err.steps_done) == ("cart_update", 1)
+    assert "kan ha lagts till" in str(err)
+    assert isinstance(err.__cause__, RuntimeError)
+    assert page.qty == {"t1": 1}
+
+
+def test_final_quantity_read_failing_is_a_partial_add_of_the_full_quantity(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.input_fails_on_read = 4      # check, after click 1, after click 2, final read
+
+    err = _err(portal, cand, 2)
+
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert err.steps_done == 2
+
+
+def test_failure_before_any_click_stays_a_plain_error(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.input_fails_on_read = 1      # the already-in-cart check, before any click
+
+    with pytest.raises(RuntimeError, match="not attached") as info:
+        portal.add_to_cart(cand, 2)
+    assert not isinstance(info.value, PartsPortalError)
+    assert page.clicks_made == 0
+
+
+def test_keyboard_interrupt_is_never_wrapped(add_page, monkeypatch):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    calls = {"n": 0}
+    real = AddEl.input_value
+
+    def interrupted(self):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        return real(self)
+
+    monkeypatch.setattr(AddEl, "input_value", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        portal.add_to_cart(cand, 2)
+
+
+class _StagePortal:
+    """The real PartsPortal.search/add_to_cart on the fake page, inside parts_order._stage."""
+
+    def __init__(self, portal):
+        self.portal, self.cleared = portal, []
+
+    def login(self):
+        pass
+
+    def load_vehicle(self, reg_nr):
+        pass
+
+    def read_cart(self):
+        return {"lines": [], "total_sek": 0.0}
+
+    def search(self, term):
+        return self.portal.search(term)
+
+    def add_to_cart(self, candidate, qty):
+        return self.portal.add_to_cart(candidate, qty)
+
+    def clear_cart(self, reg_nr=None):
+        self.cleared.append(reg_nr)
+        raise AssertionError("the cart must never be cleared")
+
+
+class _AnyTerm(dict):
+    def get(self, key, default=None):
+        return ["t1"]
+
+
+def test_stage_lists_a_read_failure_after_a_click_as_maybe_in_the_cart(add_page, monkeypatch,
+                                                                     tmp_path):
+    import notifier
+    import orders_state
+    import parts_order
+    from rules import Rules
+
+    monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
+    sent = []
+    monkeypatch.setattr(notifier, "send_message", lambda config, text: sent.append(text) or True)
+    monkeypatch.setattr(notifier, "send_with_buttons",
+                        lambda config, text, buttons: sent.append(text) or 901)
+    monkeypatch.setattr(notifier, "clear_buttons", lambda config, mid: None)
+    page, portal = add_page(_AnyTerm())
+    monkeypatch.setattr(parts_portal, "parse_search_results", lambda html: [
+        {"title": "Bosch Tändstift FR7", "brand": "Bosch", "price_sek": 50.0, "url_or_id": "t1"}])
+    page.input_fails_on_read = 2
+    stage_portal = _StagePortal(portal)
+    booking = {"id": "B1", "booking_nr": "OLRD-1", "reg_nr": "ABC123",
+               "parts": [{"name": "Tändstift", "qty": "2"}], "fluids": []}
+
+    status = parts_order.plan_and_stage(
+        {"telegram": {}}, booking, stage_portal,
+        Rules(("Bosch",), ("ProMeister",), 10000, "approve"), lambda line, ranked: (0, 0.95))
+
+    assert status == "blocked"
+    assert stage_portal.cleared == []
+    (text,) = sent
+    assert ("Kan ligga delvis i varukorgen – kontrollera antalet: Tändstift "
+            "(lade 1 av 2, varukorgen uppdaterades inte).") in text
+    assert "Kunde inte läggas till" not in text
+    assert "SECRET-PAGE-TEXT" not in text

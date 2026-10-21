@@ -76,6 +76,22 @@ LOGIN_FAILED_TEXT = ("MECA-inloggningen misslyckades – inga bokningar hämtade
                      "eller GitHub-secrets PORTAL_USERNAME/PORTAL_PASSWORD. Orsak: ")
 
 
+# The only login reasons forwarded to the owner: the fixed Swedish texts of
+# portal_scraper._auth_reason. Anything else (page error text) is logged only.
+_FIXED_LOGIN_REASONS = ("Lösenordet har gått ut – byt lösenord i portalen",
+                        "Kontot är tillfälligt avstängt", "Portalen avvisade inloggningen")
+
+
+def _owner_login_reason(reason: str) -> str:
+    import re
+
+    import portal_scraper
+    if reason in portal_scraper.AUTH_REASONS.values() or reason in _FIXED_LOGIN_REASONS \
+            or re.fullmatch(r"Portalen avvisade inloggningen \([A-Za-z0-9]{1,40}\)", reason):
+        return reason
+    return "okänd orsak"
+
+
 SPEC_INCOMPLETE_TEXT = ("Bokning {nr}: specifikationen kunde inte läsas fullständigt – jag har "
                         "inte markerat den som Hanterad. Kontrollera delarna i portalen.")
 NO_BUTTON_TEXT = ("Bokning {nr} verkar sakna Hanterad-knapp (typen är osäker) – "
@@ -119,7 +135,7 @@ def run() -> int:
     except PortalLoginError as e:
         reason = str(e) or "okänd"
         log.error("MECA login failed — no bookings fetched. Reason: %s", reason)
-        if not send_message(config, LOGIN_FAILED_TEXT + reason):
+        if not send_message(config, LOGIN_FAILED_TEXT + _owner_login_reason(reason)):
             log.error("Login-failure message was not delivered.")
         _log_summary(0, counts, 0, swept_failed, login_failed=True)
         return 1

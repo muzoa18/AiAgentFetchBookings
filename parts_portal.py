@@ -254,33 +254,44 @@ class PartsPortal:
         if parse_qty_text(qty_input.input_value()) != 0:
             raise PartsPortalError(f"part {sku} is already in the cart ({qty_input.input_value()!r})",
                                    "in_cart")
-        clicks = 0  # "+" clicks made: the cart may already hold that many (PartsPortalPartialAdd)
-        for n in range(1, qty + 1):
-            # The site debounces "+" (~0.5 s) and then POSTs ViewCart-ChangeProductQuantity; the
-            # input changes client-side at once, so only that response proves the server update.
-            try:
-                with self.page.expect_response(_is_qty_update,
-                                               timeout=QTY_TIMEOUT_S * 1000) as update:
-                    form.locator("a.qty-wrapper__increase").click()
-                    clicks = n
-                ok = update.value.ok
-            except Exception as e:
-                raise PartsPortalPartialAdd(f"no cart update seen for {sku} (step {n}): {e}",
-                                            steps_done=clicks) from e
-            if not ok:
-                raise PartsPortalPartialAdd(f"cart update for {sku} failed (step {n})",
-                                            steps_done=clicks)
-            deadline = time.monotonic() + QTY_TIMEOUT_S
-            while parse_qty_text(qty_input.input_value()) != n:
-                if time.monotonic() > deadline:
-                    raise PartsPortalPartialAdd(f"quantity of {sku} did not reach {n}",
+        clicks = 0  # "+" presses attempted: the cart may already hold that many
+        try:
+            for n in range(1, qty + 1):
+                # The site debounces "+" (~0.5 s) and then POSTs ViewCart-ChangeProductQuantity;
+                # the input changes client-side at once, so only that response proves the update.
+                try:
+                    with self.page.expect_response(_is_qty_update,
+                                                   timeout=QTY_TIMEOUT_S * 1000) as update:
+                        clicks = n  # safe side: a press that raised may still have been sent
+                        form.locator("a.qty-wrapper__increase").click()
+                    ok = update.value.ok
+                except Exception as e:
+                    raise PartsPortalPartialAdd(f"no cart update seen for {sku} (step {n}): {e}",
+                                                steps_done=clicks) from e
+                if not ok:
+                    raise PartsPortalPartialAdd(f"cart update for {sku} failed (step {n})",
                                                 steps_done=clicks)
-                self.page.wait_for_timeout(250)
-            self._settle()
-        final = parse_qty_text(qty_input.input_value())
-        if final != qty:
-            raise PartsPortalPartialAdd(f"quantity of {sku} is {final!r}, expected {qty}",
-                                        steps_done=clicks)
+                deadline = time.monotonic() + QTY_TIMEOUT_S
+                while parse_qty_text(qty_input.input_value()) != n:
+                    if time.monotonic() > deadline:
+                        raise PartsPortalPartialAdd(f"quantity of {sku} did not reach {n}",
+                                                    steps_done=clicks)
+                    self.page.wait_for_timeout(250)
+                self._settle()
+            final = parse_qty_text(qty_input.input_value())
+            if final != qty:
+                raise PartsPortalPartialAdd(f"quantity of {sku} is {final!r}, expected {qty}",
+                                            steps_done=clicks)
+        except PartsPortalPartialAdd:
+            raise
+        except Exception as e:
+            # Anything else after the first press (detached element, re-render timeout, ...)
+            # may leave 1..clicks units in the cart.
+            if clicks >= 1:
+                raise PartsPortalPartialAdd(
+                    f"part {sku} kan ha lagts till ({clicks} of {qty} step(s)): "
+                    f"{type(e).__name__}: {e}", steps_done=clicks) from e
+            raise
         log.info("Added %s x%d to the cart for %s.", sku, qty, self._reg)
 
     def _cart(self) -> dict:

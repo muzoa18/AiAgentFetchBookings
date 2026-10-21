@@ -356,7 +356,8 @@ def test_ordered_but_unnotified_makes_exit_code_1(env, monkeypatch):
 
 # ── Failed MECA portal login ─────────────────────────────────────────────────
 
-def _login_fails(env, monkeypatch, reason="Invalid user name or password."):
+def _login_fails(env, monkeypatch,
+                 reason="Fel användarnamn eller lösenord (portalen avvisade inloggningen)"):
     from portal_scraper import PortalLoginError
 
     def fake_fetch(config):
@@ -374,7 +375,8 @@ def test_failed_login_alerts_once_and_exits_1(env, monkeypatch):
     alerts = [t for t in env["sent"] if "MECA-inloggningen misslyckades" in t]
     assert len(alerts) == 1 and len(env["sent"]) == 1
     assert "PORTAL_USERNAME/PORTAL_PASSWORD" in alerts[0]
-    assert "Orsak: Invalid user name or password." in alerts[0]
+    assert alerts[0].endswith(
+        "Orsak: Fel användarnamn eller lösenord (portalen avvisade inloggningen)")
     assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
                              "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
                              "login_failed": True}
@@ -386,7 +388,7 @@ def test_failed_login_without_reason_says_okand(env, monkeypatch):
     _login_fails(env, monkeypatch, reason="")
 
     assert agent.run() == 1
-    assert env["sent"][0].endswith("Orsak: okänd")
+    assert env["sent"][0].endswith("Orsak: okänd orsak")
 
 
 def test_failed_login_undeliverable_alert_still_exits_1(env, monkeypatch):
@@ -1002,3 +1004,38 @@ def test_missing_settings_keep_their_fixed_swedish_reason(env, monkeypatch):
     (failure,) = [t for t in env["sent"] if "misslyckades" in t]
     assert "kunde inte starta beställningen (inställning saknas: anthropic.api_key)" in failure
     assert "RuntimeError" not in failure
+
+
+
+# ── Re-review: the login alert forwards only the fixed Swedish reasons ───────
+
+@pytest.mark.parametrize("reason", [
+    "SECRET-PAGE-TEXT Invalid user name or password.",
+    "Portalen avvisade inloggningen (SECRET-PAGE-TEXT)",
+    "login form not found",
+    "okänd orsak",
+])
+def test_login_alert_never_forwards_page_text(env, monkeypatch, caplog, reason):
+    _login_fails(env, monkeypatch, reason=reason)
+
+    assert agent.run() == 1
+
+    (alert,) = env["sent"]
+    assert alert.endswith("Orsak: okänd orsak")
+    assert "SECRET-PAGE-TEXT" not in alert
+    assert reason in caplog.text                       # the raw reason is logged
+
+
+@pytest.mark.parametrize("reason", [
+    "Fel användarnamn eller lösenord (portalen avvisade inloggningen)",
+    "För många inloggningsförsök i rad – vänta en stund och försök igen",
+    "Lösenordet har gått ut – byt lösenord i portalen",
+    "Kontot är tillfälligt avstängt",
+    "Portalen avvisade inloggningen",
+    "Portalen avvisade inloggningen (AccountLocked)",
+])
+def test_login_alert_forwards_the_fixed_auth_reasons(env, monkeypatch, reason):
+    _login_fails(env, monkeypatch, reason=reason)
+
+    assert agent.run() == 1
+    assert env["sent"][0].endswith(f"Orsak: {reason}")
