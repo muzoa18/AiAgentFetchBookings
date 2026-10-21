@@ -22,9 +22,9 @@ export const STATE_FILES = {
 export const WORKFLOWS = { approve: 'approve.yml', bookings: 'bookings.yml' };
 export const RUN_COOLDOWN_MS = 30_000;
 export const LOGIN_LIMIT = { attempts: 5, windowMs: 10 * 60_000 };
-// Per instance: after `failures` failed logins in the window, each further WRONG password waits
-// `delayMs` before its 401, at most `maxWaiting` at once; the rest get 429 immediately.
-// A correct password is never delayed.
+// Per instance: after `failures` failed logins in the window, a password is only evaluated
+// after `delayMs`, for at most `maxWaiting` requests at once; the rest get 429 immediately
+// without evaluation.
 export const BRAKE = { failures: 100, windowMs: 10 * 60_000, delayMs: 2000, maxWaiting: 2 };
 const TOO_MANY = 'För många försök. Vänta en stund och försök igen.';
 export const ORDER_OVERVIEW_URL = 'https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrderOverview-Start';
@@ -56,7 +56,8 @@ function githubMessage(err) {
  * }
  */
 export function createHandlers({ env, source, now = Date.now, log, demo = false, trustProxy = false,
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), bodyTimeoutMs = BODY_TIMEOUT_MS }) {
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), bodyTimeoutMs = BODY_TIMEOUT_MS,
+  checkPasswordImpl = checkPassword }) {
   log ??= (m) => console.error(m);
   const loginLimiter = createLimiter({ limit: LOGIN_LIMIT.attempts, windowMs: LOGIN_LIMIT.windowMs, clock: now });
   const brake = createBrake({ threshold: BRAKE.failures, windowMs: BRAKE.windowMs, clock: now });
@@ -94,36 +95,43 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false,
     return sendError(res, status, message);
   }
 
+  // A correct password resets only this client's counter; a wrong one counts towards the brake.
+  function evaluate(res, password, ip) {
+    if (typeof password === 'string' && checkPasswordImpl(password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
+      loginLimiter.reset(ip);
+      const token = signSession(env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
+      return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, cookieOpts) });
+    }
+    brake.record();
+    return sendError(res, 401, LOGIN_FAILED);
+  }
+
   async function login(req, res) {
     if (!configured(res)) return;
     try {
       assertDashboardPost(req, postOpts);
       const body = await readJsonBody(req, undefined, { timeoutMs: bodyTimeoutMs });
       assertKeys(body, ['password']);
-      // Per-client limit before the password is looked at; limited requests are answered at once.
+      // Per-client limit first; a limited request is answered at once, password not evaluated.
       const ip = rateLimitKey(clientIp(req, { trustProxy }));
       const limit = loginLimiter.hit(ip);
       if (!limit.allowed) return sendError(res, 429, TOO_MANY, { 'Retry-After': String(limit.retryAfterS) });
-      if (typeof body.password === 'string' && checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
-        // A correct password never waits behind the brake.
-        loginLimiter.reset(ip); // this client's failures only
-        const token = signSession(env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
-        return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, cookieOpts) });
+      if (!brake.tripped()) return evaluate(res, body.password, ip);
+      // Brake tripped (many failures across all clients): the password is evaluated for at most
+      // BRAKE.maxWaiting requests at a time, each only after BRAKE.delayMs. Everyone else gets
+      // the same 429 at once WITHOUT evaluation, so a 429 reveals nothing about the password
+      // and guesses per second stay bounded. Trade-off, by design: during an active flood a
+      // fresh owner login may get 429 for a while too. Existing sessions (12 h) keep working,
+      // /api/status and /api/run are unaffected; retry later, or enable Vercel Deployment
+      // Protection / rotate the password.
+      if (waiting >= BRAKE.maxWaiting) return sendError(res, 429, TOO_MANY, { 'Retry-After': '2' });
+      waiting += 1;
+      try {
+        await sleep(BRAKE.delayMs);
+        return evaluate(res, body.password, ip);
+      } finally {
+        waiting -= 1;
       }
-      // After many failures across all clients (counted before this one), wrong guesses are
-      // slowed down, at most two at a time; the rest are turned away immediately.
-      const braking = brake.tripped();
-      brake.record();
-      if (braking) {
-        if (waiting >= BRAKE.maxWaiting) return sendError(res, 429, TOO_MANY, { 'Retry-After': '2' });
-        waiting += 1;
-        try {
-          await sleep(BRAKE.delayMs);
-        } finally {
-          waiting -= 1;
-        }
-      }
-      return sendError(res, 401, LOGIN_FAILED);
     } catch (err) {
       return fail(res, err);
     }

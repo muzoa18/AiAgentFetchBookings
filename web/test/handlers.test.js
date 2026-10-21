@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHandlers, WORKFLOWS } from '../lib/handlers.js';
 import { GitHubError } from '../lib/github.js';
-import { signSession } from '../lib/auth.js';
+import { checkPassword, signSession } from '../lib/auth.js';
 import { buildHandlers } from '../lib/runtime.js';
 
 const PW = 'fake-horse-lamp-river-test';
@@ -32,11 +32,13 @@ function fakeSource(overrides = {}) {
 function setup({ source = fakeSource(), envOverride = env, sleep = async () => {} } = {}) {
   const logs = [];
   const sleeps = [];
+  const checks = []; // passwords actually evaluated
   const h = createHandlers({
     env: envOverride, source: () => source, now: () => NOW, log: (m) => logs.push(m),
     trustProxy: true, sleep: async (ms) => { sleeps.push(ms); await sleep(ms); },
+    checkPasswordImpl: (...a) => { checks.push(a[0]); return checkPassword(...a); },
   });
-  return { h, source, logs, sleeps };
+  return { h, source, logs, sleeps, checks };
 }
 
 function req({ method = 'POST', body, headers = {}, url = '/api/x', ip = '10.0.0.1' } = {}) {
@@ -302,50 +304,91 @@ async function tripBrake(h) {
 
 const flush = () => new Promise((r) => setImmediate(r));
 
-test('after the brake trips, at most 2 wrong guesses wait; a parallel flood gets 429 at once', async () => {
+test('brake: a flood of 200 gets at most 2 evaluations and 198 immediate 429s', async () => {
   const pending = [];
-  const { h, sleeps } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
+  const { h, sleeps, checks } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
   await tripBrake(h);
+  checks.length = 0;
   const results = Array.from({ length: 200 }, () => res());
-  const calls = results.map((r, i) => h.login(req({ body: { password: 'nope' }, ip: `172.16.${i >> 8}.${i & 255}` }), r));
+  const calls = results.map((r, i) => h.login(req({ body: { password: `guess-${i}` }, ip: `172.16.${i >> 8}.${i & 255}` }), r));
   await flush();
+  assert.equal(sleeps.length, 2, 'at most two requests hold a slot');
+  assert.equal(checks.length, 0, 'nothing is evaluated before the delay');
   const answered = results.filter((r) => r.statusCode !== 0);
-  assert.equal(sleeps.length, 2, 'only two wrong guesses are waiting');
-  assert.equal(answered.length, 198, 'everyone else is answered without waiting');
+  assert.equal(answered.length, 198);
   for (const r of answered) {
     assert.equal(r.statusCode, 429);
     assert.equal(r.headers['retry-after'], '2');
-    assert.deepEqual(Object.keys(r.json), ['error']);
   }
-
-  // During the flood, with both slots busy, the owner's correct password logs in at once.
-  const owner = res();
-  await h.login(req({ body: { password: PW }, ip: '192.0.2.10' }), owner);
-  assert.equal(owner.statusCode, 200);
-  assert.equal(sleeps.length, 2, 'the correct password never sleeps');
-
   pending.forEach((resolve) => resolve());
   await Promise.all(calls);
-  assert.equal(results.filter((r) => r.statusCode === 401).length, 2, 'the two waiting guesses get the generic 401');
+  assert.equal(checks.length, 2, 'exactly the two slot holders were evaluated');
+  assert.equal(results.filter((r) => r.statusCode === 401).length, 2);
 });
 
-test('during the brake a correct password is never delayed', async () => {
-  const { h, sleeps } = setup();
+test('brake: 429s look identical for correct and wrong passwords (no oracle)', async () => {
+  const pending = [];
+  const { h, checks } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
   await tripBrake(h);
-  assert.equal(sleeps.length, 0, 'no delay before the threshold');
+  const holders = [res(), res()];
+  const held = holders.map((r, i) => h.login(req({ body: { password: 'x' }, ip: `172.20.0.${i}` }), r));
+  await flush();
+  checks.length = 0;
+  const right = res();
+  const wrong = res();
+  await h.login(req({ body: { password: PW }, ip: '192.0.2.10' }), right);
+  await h.login(req({ body: { password: 'wrong-guess' }, ip: '192.0.2.11' }), wrong);
+  assert.equal(right.statusCode, 429, 'documented trade-off: a fresh owner login may be refused during a flood');
+  assert.equal(right.body, wrong.body);
+  assert.equal(right.statusCode, wrong.statusCode);
+  assert.deepEqual(right.headers, wrong.headers);
+  assert.equal(checks.length, 0, 'neither password was evaluated');
+  pending.forEach((resolve) => resolve());
+  await Promise.all(held);
+});
+
+test('brake: a correct password succeeds after the delay when a slot is free', async () => {
+  const { h, sleeps, checks } = setup();
+  await tripBrake(h);
+  checks.length = 0;
   const owner = res();
   await h.login(req({ body: { password: PW }, ip: '192.0.2.50' }), owner);
+  assert.equal(owner.statusCode, 200);
+  assert.deepEqual(sleeps, [2000], 'evaluated only after the delay');
+  assert.equal(checks.length, 1);
+});
+
+test('without the brake a correct password logs in at once', async () => {
+  const { h, sleeps } = setup();
+  const owner = res();
+  await h.login(req({ body: { password: PW } }), owner);
   assert.equal(owner.statusCode, 200);
   assert.deepEqual(sleeps, []);
 });
 
-test('during the brake a wrong password from a normal client gets 401 after the delay', async () => {
+test('brake: a wrong password from a normal client gets 401 after the delay', async () => {
   const { h, sleeps } = setup();
   await tripBrake(h);
   const r = res();
   await h.login(req({ body: { password: 'typo' }, ip: '192.0.2.51' }), r);
   assert.equal(r.statusCode, 401);
   assert.deepEqual(sleeps, [2000]);
+});
+
+test('brake: an existing session keeps working during a flood', async () => {
+  const pending = [];
+  const { h } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
+  await tripBrake(h);
+  const flood = Array.from({ length: 20 }, (_, i) => h.login(req({ body: { password: 'x' }, ip: `172.30.0.${i}` }), res()));
+  await flush();
+  const s = res();
+  await h.status(authed({ method: 'GET' }), s);
+  assert.equal(s.statusCode, 200);
+  const run = res();
+  await h.run(authed({ body: { workflow: 'bookings' } }), run);
+  assert.equal(run.statusCode, 202);
+  pending.forEach((resolve) => resolve());
+  await Promise.all(flood);
 });
 
 test('the per-client limit is checked before the password', async () => {
@@ -376,14 +419,16 @@ test('a stalled login body times out', async () => {
 });
 
 test('rate-limited requests are answered at once, even while the brake is on', async () => {
-  const { h, sleeps } = setup();
+  const { h, sleeps, checks } = setup();
   await tripBrake(h);
   for (let i = 0; i < 5; i++) await h.login(req({ body: { password: 'nope' }, ip: '198.51.100.200' }), res());
   const before = sleeps.length;
+  const evaluated = checks.length;
   const r = res();
-  await h.login(req({ body: { password: 'nope' }, ip: '198.51.100.200' }), r);
+  await h.login(req({ body: { password: PW }, ip: '198.51.100.200' }), r);
   assert.equal(r.statusCode, 429);
   assert.equal(sleeps.length, before, 'no sleep for a rate-limited request');
+  assert.equal(checks.length, evaluated, 'the password of a rate-limited request is not evaluated');
 });
 
 test('the api entry path ignores DEMO; demo needs the explicit option', async () => {

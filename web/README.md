@@ -148,13 +148,22 @@ start `approve.yml` or `bookings.yml`.
   client IP comes from the platform's `x-vercel-forwarded-for` / `x-real-ip`
   headers. Locally these headers are ignored and the socket address is used.
   The per-client limit is checked before the password, so a limited request
-  is answered with 429 at once. After 100 failed logins in 10 minutes across
-  all clients, each further **wrong** password waits about 2 s before its
-  401. Only 2 wrong guesses at a time may wait; every other wrong guess gets
-  `429` with `Retry-After: 2` straight away. A **correct** password is never
-  delayed and never waits for a slot, so the owner logs in normally even
-  during an attack. A login body that has not arrived within 5 s is dropped
-  (408).
+  is answered with 429 at once and its password is never looked at. After
+  100 failed logins in 10 minutes across all clients, the brake trips:
+  - Passwords are then checked for at most 2 login requests at a time, each
+    only after a 2 s wait.
+  - Every other login request gets the same `429` with `Retry-After: 2` at
+    once, and its password is **not checked at all**.
+  - Because of that, a 429 says nothing about whether a guess was right, and
+    guesses per second stay bounded.
+  - **Trade-off:** during an active guessing flood, a fresh login by the owner
+    may also get 429 ("För många försök") for a while. A session that is
+    already logged in (valid for 12 h) is not affected, and the status page
+    and "Kör nu" keep working.
+  - If you are locked out of a fresh login, retry a minute later. If the
+    flood continues, temporarily turn on Vercel Deployment Protection or
+    change `DASHBOARD_PASSWORD`.
+  A login body that has not arrived within 5 s is dropped (408).
   **Be honest about the limits:** on Vercel, each function instance keeps
   its own counters in memory. They are not shared between instances and are
   reset on every cold start, so an attacker spread across many instances gets
