@@ -147,12 +147,14 @@ start `approve.yml` or `bookings.yml`.
   client. IPv4 is counted per address and IPv6 per /64 network. On Vercel the
   client IP comes from the platform's `x-vercel-forwarded-for` / `x-real-ip`
   headers. Locally these headers are ignored and the socket address is used.
-  The per-client limit is checked first, so a limited request is answered
-  with 429 at once. After 100 failed logins in 10 minutes across all
-  clients, only 2 login attempts at a time may wait about 2 s each. Every
-  other attempt gets `429` with `Retry-After: 2` straight away. The owner can
-  still log in during an attack, just slowly; retry if you see "För många
-  försök".
+  The per-client limit is checked before the password, so a limited request
+  is answered with 429 at once. After 100 failed logins in 10 minutes across
+  all clients, each further **wrong** password waits about 2 s before its
+  401. Only 2 wrong guesses at a time may wait; every other wrong guess gets
+  `429` with `Retry-After: 2` straight away. A **correct** password is never
+  delayed and never waits for a slot, so the owner logs in normally even
+  during an attack. A login body that has not arrived within 5 s is dropped
+  (408).
   **Be honest about the limits:** on Vercel, each function instance keeps
   its own counters in memory. They are not shared between instances and are
   reset on every cold start, so an attacker spread across many instances gets

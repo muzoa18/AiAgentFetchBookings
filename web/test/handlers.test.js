@@ -302,7 +302,7 @@ async function tripBrake(h) {
 
 const flush = () => new Promise((r) => setImmediate(r));
 
-test('after the brake trips, at most 2 logins wait; a parallel flood gets 429 at once', async () => {
+test('after the brake trips, at most 2 wrong guesses wait; a parallel flood gets 429 at once', async () => {
   const pending = [];
   const { h, sleeps } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
   await tripBrake(h);
@@ -310,34 +310,69 @@ test('after the brake trips, at most 2 logins wait; a parallel flood gets 429 at
   const calls = results.map((r, i) => h.login(req({ body: { password: 'nope' }, ip: `172.16.${i >> 8}.${i & 255}` }), r));
   await flush();
   const answered = results.filter((r) => r.statusCode !== 0);
-  assert.equal(sleeps.length, 2, 'only two requests are waiting');
+  assert.equal(sleeps.length, 2, 'only two wrong guesses are waiting');
   assert.equal(answered.length, 198, 'everyone else is answered without waiting');
   for (const r of answered) {
     assert.equal(r.statusCode, 429);
     assert.equal(r.headers['retry-after'], '2');
     assert.deepEqual(Object.keys(r.json), ['error']);
   }
+
+  // During the flood, with both slots busy, the owner's correct password logs in at once.
+  const owner = res();
+  await h.login(req({ body: { password: PW }, ip: '192.0.2.10' }), owner);
+  assert.equal(owner.statusCode, 200);
+  assert.equal(sleeps.length, 2, 'the correct password never sleeps');
+
   pending.forEach((resolve) => resolve());
   await Promise.all(calls);
-  assert.deepEqual(results.filter((r) => r.statusCode === 401).length, 2);
-  // Slots are released: the next login can wait again.
-  const after = res();
-  const p = h.login(req({ body: { password: PW }, ip: '192.0.2.77' }), after);
-  await flush();
-  assert.equal(sleeps.length, 3);
-  pending.at(-1)();
-  await p;
-  assert.equal(after.statusCode, 200);
+  assert.equal(results.filter((r) => r.statusCode === 401).length, 2, 'the two waiting guesses get the generic 401');
 });
 
-test('during the brake the owner still logs in, just slowly', async () => {
+test('during the brake a correct password is never delayed', async () => {
   const { h, sleeps } = setup();
   await tripBrake(h);
   assert.equal(sleeps.length, 0, 'no delay before the threshold');
   const owner = res();
   await h.login(req({ body: { password: PW }, ip: '192.0.2.50' }), owner);
   assert.equal(owner.statusCode, 200);
+  assert.deepEqual(sleeps, []);
+});
+
+test('during the brake a wrong password from a normal client gets 401 after the delay', async () => {
+  const { h, sleeps } = setup();
+  await tripBrake(h);
+  const r = res();
+  await h.login(req({ body: { password: 'typo' }, ip: '192.0.2.51' }), r);
+  assert.equal(r.statusCode, 401);
   assert.deepEqual(sleeps, [2000]);
+});
+
+test('the per-client limit is checked before the password', async () => {
+  const { h } = setup();
+  for (let i = 0; i < 5; i++) await h.login(req({ body: { password: 'nope' }, ip: '198.51.100.201' }), res());
+  const r = res();
+  await h.login(req({ body: { password: PW }, ip: '198.51.100.201' }), r);
+  assert.equal(r.statusCode, 429, 'even the right password is refused once this client is limited');
+  const other = res();
+  await h.login(req({ body: { password: PW }, ip: '198.51.100.202' }), other);
+  assert.equal(other.statusCode, 200);
+  const still = res();
+  await h.login(req({ body: { password: PW }, ip: '198.51.100.201' }), still);
+  assert.equal(still.statusCode, 429, "another client's success does not reset this client's counter");
+});
+
+test('a stalled login body times out', async () => {
+  const h = createHandlers({ env, source: () => fakeSource(), now: () => NOW, log: () => {}, trustProxy: true, bodyTimeoutMs: 20 });
+  const stalled = req({ headers: {} });
+  delete stalled.body;
+  let destroyed = false;
+  stalled.on = () => {}; // never emits data or end
+  stalled.destroy = () => { destroyed = true; };
+  const r = res();
+  await h.login(stalled, r);
+  assert.equal(r.statusCode, 408);
+  assert.ok(destroyed);
 });
 
 test('rate-limited requests are answered at once, even while the brake is on', async () => {

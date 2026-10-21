@@ -15,6 +15,7 @@ export const SECURITY_HEADERS = {
 };
 
 export const MAX_BODY_BYTES = 4096;
+export const BODY_TIMEOUT_MS = 5000;
 const BAD_REQUEST = 'Ogiltig begäran';
 const DENIED = 'Förfrågan nekades';
 
@@ -102,7 +103,7 @@ export function assertDashboardPost(req, { trustProxy = false } = {}) {
  * lazy getter that throws on invalid JSON) or reads the stream (node:http).
  * Rejects anything but a small plain object.
  */
-export async function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
+export async function readJsonBody(req, maxBytes = MAX_BODY_BYTES, { timeoutMs = BODY_TIMEOUT_MS } = {}) {
   let pre;
   try {
     pre = req.body;
@@ -128,6 +129,14 @@ export async function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
     raw = await new Promise((resolve, reject) => {
       const chunks = [];
       let size = 0;
+      // A client that never finishes its body must not hold the function open.
+      const timer = setTimeout(() => {
+        reject(new RequestError(408, 'Förfrågan tog för lång tid'));
+        req.destroy?.();
+      }, timeoutMs);
+      const done = (fn) => (arg) => { clearTimeout(timer); fn(arg); };
+      resolve = done(resolve);
+      reject = done(reject);
       req.on('data', (c) => {
         size += c.length;
         if (size > maxBytes) {

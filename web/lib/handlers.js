@@ -9,6 +9,7 @@ import { GitHubError } from './github.js';
 import { summarize } from './summarize.js';
 import {
   sendJson, sendError, RequestError, assertDashboardPost, readJsonBody, assertKeys, clientIp, rateLimitKey,
+  BODY_TIMEOUT_MS,
 } from './http.js';
 
 export const STATE_FILES = {
@@ -21,8 +22,9 @@ export const STATE_FILES = {
 export const WORKFLOWS = { approve: 'approve.yml', bookings: 'bookings.yml' };
 export const RUN_COOLDOWN_MS = 30_000;
 export const LOGIN_LIMIT = { attempts: 5, windowMs: 10 * 60_000 };
-// Per instance: after `failures` failed logins in the window, every login waits `delayMs`, and at
-// most `maxWaiting` logins may wait at once; the rest get 429 immediately.
+// Per instance: after `failures` failed logins in the window, each further WRONG password waits
+// `delayMs` before its 401, at most `maxWaiting` at once; the rest get 429 immediately.
+// A correct password is never delayed.
 export const BRAKE = { failures: 100, windowMs: 10 * 60_000, delayMs: 2000, maxWaiting: 2 };
 const TOO_MANY = 'För många försök. Vänta en stund och försök igen.';
 export const ORDER_OVERVIEW_URL = 'https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrderOverview-Start';
@@ -54,7 +56,7 @@ function githubMessage(err) {
  * }
  */
 export function createHandlers({ env, source, now = Date.now, log, demo = false, trustProxy = false,
-  sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), bodyTimeoutMs = BODY_TIMEOUT_MS }) {
   log ??= (m) => console.error(m);
   const loginLimiter = createLimiter({ limit: LOGIN_LIMIT.attempts, windowMs: LOGIN_LIMIT.windowMs, clock: now });
   const brake = createBrake({ threshold: BRAKE.failures, windowMs: BRAKE.windowMs, clock: now });
@@ -96,37 +98,32 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false,
     if (!configured(res)) return;
     try {
       assertDashboardPost(req, postOpts);
-      // Per-client limit first, so rejected requests are answered at once and cost no waiting.
+      const body = await readJsonBody(req, undefined, { timeoutMs: bodyTimeoutMs });
+      assertKeys(body, ['password']);
+      // Per-client limit before the password is looked at; limited requests are answered at once.
       const ip = rateLimitKey(clientIp(req, { trustProxy }));
       const limit = loginLimiter.hit(ip);
       if (!limit.allowed) return sendError(res, 429, TOO_MANY, { 'Retry-After': String(limit.retryAfterS) });
-      // Many failures across all clients: only a couple of slow attempts at a time, the rest
-      // are turned away immediately. The owner still gets in, just slowly.
-      if (!brake.tripped()) return await checkLogin(req, res, ip);
-      if (waiting >= BRAKE.maxWaiting) return sendError(res, 429, TOO_MANY, { 'Retry-After': '2' });
-      waiting += 1;
-      try {
-        await sleep(BRAKE.delayMs);
-        return await checkLogin(req, res, ip);
-      } finally {
-        waiting -= 1;
+      if (typeof body.password === 'string' && checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
+        // A correct password never waits behind the brake.
+        loginLimiter.reset(ip); // this client's failures only
+        const token = signSession(env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
+        return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, cookieOpts) });
       }
-    } catch (err) {
-      return fail(res, err);
-    }
-  }
-
-  async function checkLogin(req, res, ip) {
-    try {
-      const body = await readJsonBody(req);
-      assertKeys(body, ['password']);
-      if (typeof body.password !== 'string' || !checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
-        brake.record();
-        return sendError(res, 401, LOGIN_FAILED);
+      // After many failures across all clients (counted before this one), wrong guesses are
+      // slowed down, at most two at a time; the rest are turned away immediately.
+      const braking = brake.tripped();
+      brake.record();
+      if (braking) {
+        if (waiting >= BRAKE.maxWaiting) return sendError(res, 429, TOO_MANY, { 'Retry-After': '2' });
+        waiting += 1;
+        try {
+          await sleep(BRAKE.delayMs);
+        } finally {
+          waiting -= 1;
+        }
       }
-      loginLimiter.reset(ip); // only failed attempts accumulate
-      const token = signSession(env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
-      return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, cookieOpts) });
+      return sendError(res, 401, LOGIN_FAILED);
     } catch (err) {
       return fail(res, err);
     }
