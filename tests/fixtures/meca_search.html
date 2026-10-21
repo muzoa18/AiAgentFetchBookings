@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<!-- Hand-written, sanitised fixture modelled on a pro.meca.se search result page (ViewParametricSearch-SimpleOfferSearch).
+     No real customer, vehicle or session data. Reg number ABC123 and tokens are placeholders. -->
+<html lang="sv"><head><meta charset="utf-8"><title>Sök </title></head>
+<body>
+<header class="car-header">
+  <span class="badge car-header__badge js-cart-notification">0</span>
+  <h3>FORDONSUPPGIFTER ABC123</h3>
+  <span style="display:none;" class="js-current-license-plate-number">ABC123</span>
+</header>
+<main>
+<header class="search-page-header"><h1 class="search-page-header__title">Sökresultat</h1>
+  <form method="post" action="https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewParametricSearch-SimpleOfferSearch" role="search" id="page-search">
+    <input type="hidden" name="SynchronizerToken" value="TOKEN_PLACEHOLDER">
+    <input type="text" name="SearchTerm" id="searchTerm_SearchPage" value="oljefilter">
+  </form>
+</header>
+<section class="tab-section search-page__tabs js-tab-section" data-first-tab-id="SpareParts">
+
+<div class="tab-section__item js-search-result-tab js-search-result-tab__SpareParts " data-tab-id="SpareParts">
+<a href="#" class="tab-section__btn js-search-result-tab-trigger tab-section__btn--open" title="Kopplade reservdelar (5)">Kopplade reservdelar (5)<i class="icon icon-arrow-down"></i> </a>
+<article class="tab-section__content tab-section__content--space" style="display: block;">
+<div class="additional-information additional-information--error additional-information--discontinued"><h3>Utgångna varor!</h3><p>Varor som inte längre tillverkas och inte längre finns i lager har tagits bort från produktlistan.</p></div>
+<ul class="category-list stock-data-container">
+<li class="category-list__sorting-selection"><form name="sortByForm"><input type="hidden" name="SynchronizerToken" value="TOKEN_PLACEHOLDER"></form></li>
+
+<!-- 1: normal linked part, in stock locally; carries a related-articles block with a replaced alternative -->
+<li class="category-list-item" data-sku="10000001" data-mek-product-id="P1025-L1075" data-genarts="[05200]" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Purflux Oljefilter, Filterinsats</h2><p class="category-list-item__article-nr">Art. Nr 1025-L1075</p></div></article>
+ <div class="category-list-item__attributes"><div class="attrhl__column attrhl--highlighted" title="Filtertyp: Filterinsats"><div class="attrhl__title">Filtertyp:</div><div class="attrhl__value"> Filterinsats&nbsp; </div></div></div>
+ <fieldset class="category-list-item__buy-area">
+  <div class="category-list-item__buy-area--price"><p class="category-list-item__price">377:50</p><p class="category-list-item__price-discount"></p><p class="category-list-item__price-tax">302:- &nbsp;listpris (exkl. moms)</p></div>
+  <div class="category-list-item__buy-area--action"><form style="display:none;"></form>
+   <form method="post" action="https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewCart-AddStandardItemToCart" data-sku="10000001" data-productname="Oljefilter" class="product-form bv-form form-horizontal product-form-quick" id="productDetailForm_10000001"><input type="hidden" name="SynchronizerToken" value="TOKEN_PLACEHOLDER">
+    <div class="qty-wrapper js-qty-wrapper-quick" data-unit=" st"><a href="#" class="qty-wrapper__decrease">-</a><input type="text" class="Quantity js-change-quantity js-change-quantity-quick" value="0 st" data-old-value="0 st"><a href="#" class="qty-wrapper__increase">+</a></div>
+   </form></div>
+  <div class="category-list-item__buy-area--stocklevel"><div class="js-stocklevel js-pli-stocklevel" data-item-id="10000001"><address class="workshop"><span class="address__span--in-stock"><span class="stock-list__value stock-list__value--available">3</span></span><span>MECA Butik</span></address><address class="workshop bcp"><span class="address__span--in-stock"><span class="stock-list__value stock-list__value--available">50+</span></span><span>Centrallager SE</span></address></div></div>
+ </fieldset>
+ <div class="related-articles"><ul class="related-articles__container">
+  <li class="related-article__item pli-information__related-toggle">
+   <div class="related-article__title"><h3 data-sku="10000099">Mahle Oljefilter, Filterinsats</h3><p class="category-list-item__article-nr">Art. Nr 1025-OX0000</p></div>
+   <div class="attrhl__column attrhl--highlighted" title="Ersätts av: 1025-OX0001"><div class="attrhl__title">Ersätts av:</div><div class="attrhl__value">1025-OX0001</div></div>
+   <div class="related-article__price"><p class="related-product-item__price">361:25</p></div>
+   <form method="post" data-sku="10000099" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form>
+  </li>
+ </ul></div>
+</li>
+
+<!-- 2: linked Bosch part, out of stock locally, price with a thousands separator -->
+<li class="category-list-item" data-sku="10000002" data-mek-product-id="P1025-F026407026" data-genarts="" data-placements="fram">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Bosch Oljefilter, Filterinsats</h2><p class="category-list-item__article-nr">Art. Nr 1025-F026407026</p></div></article>
+ <fieldset class="category-list-item__buy-area">
+  <div class="category-list-item__buy-area--price"><p class="category-list-item__price">1&nbsp;208:75</p><p class="category-list-item__price-tax">967:- &nbsp;listpris (exkl. moms)</p></div>
+  <div class="category-list-item__buy-area--action">
+   <form method="post" data-sku="10000002" data-productname="Oljefilter" class="product-form product-form-quick"><input type="hidden" name="SynchronizerToken" value="TOKEN_PLACEHOLDER">
+    <div class="qty-wrapper js-qty-wrapper-quick"><a href="#" class="qty-wrapper__decrease">-</a><input type="text" class="Quantity js-change-quantity js-change-quantity-quick" value="0 st"><a href="#" class="qty-wrapper__increase">+</a></div>
+   </form></div>
+  <div class="category-list-item__buy-area--stocklevel"><div class="js-stocklevel js-pli-stocklevel" data-item-id="10000002"><address class="workshop"><span class="address__span--in-stock"><span class="stock-list__value stock-list__value--empty">0</span></span><span>0 (Kontakta butik)</span></address><address class="workshop bcp"><span class="address__span--in-stock"><span class="stock-list__value stock-list__value--low">2</span></span><span>Centrallager SE</span></address></div></div>
+ </fieldset>
+</li>
+
+<!-- 3: replaced item (class + "Ersätts av") -->
+<li class="category-list-item category-list-item__replaced category-list-item__replaced-not-instock" data-sku="10000003" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Oljefilter Mahle</h2><p class="category-list-item__article-nr">Art. Nr 1025-OC0003</p></div></article>
+ <div class="category-list-item__attributes"><a href="#" class="js-get-content js-open-lightbox"><div class="attrhl__column attrhl--highlighted" title="Ersätts av: 1025-OC0004"><div class="attrhl__title"><i class="icon icon-alert"></i> Ersätts av:</div><div class="attrhl__value">1025-OC0004&nbsp; </div></div></a></div>
+ <fieldset class="category-list-item__buy-area">
+  <div class="category-list-item__buy-area--price"><p class="category-list-item__price">199:-</p></div>
+  <div class="category-list-item__buy-area--action"><form method="post" data-sku="10000003" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form></div>
+ </fieldset>
+</li>
+
+<!-- 4: discontinued item (text only, no replaced class) -->
+<li class="category-list-item" data-sku="10000004" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Bosch Oljefilter, Skruvfilter</h2><p class="category-list-item__article-nr">Art. Nr 1025-0451103170</p></div></article>
+ <div class="category-list-item__attributes"><div class="attrhl__column attrhl--highlighted" title="Produkten har utgått!"><div class="attrhl__title"><i class="icon icon-alert"></i> Produkten har utgått!</div><div class="attrhl__value">&nbsp; </div></div></div>
+ <fieldset class="category-list-item__buy-area">
+  <div class="category-list-item__buy-area--price"><p class="category-list-item__price">150:-</p></div>
+  <div class="category-list-item__buy-area--action"><form method="post" data-sku="10000004" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form></div>
+ </fieldset>
+</li>
+
+<!-- 5: "Ersätts av" text only, no replaced class -->
+<li class="category-list-item" data-sku="10000005" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Oljefilter Hengst</h2><p class="category-list-item__article-nr">Art. Nr 1025-E0005</p></div></article>
+ <div class="category-list-item__attributes"><div class="attrhl__column" title="Ersätts av - MECA: 1025-E0006"><div class="attrhl__title">Ersätts av - MECA:</div><div class="attrhl__value"> 1025-E0006&nbsp; </div></div></div>
+ <fieldset class="category-list-item__buy-area">
+  <div class="category-list-item__buy-area--price"><p class="category-list-item__price">120:-</p></div>
+  <div class="category-list-item__buy-area--action"><form method="post" data-sku="10000005" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form></div>
+ </fieldset>
+</li>
+</ul></article></div>
+
+<div class="tab-section__item js-search-result-tab js-search-result-tab__Accessories " data-tab-id="Accessories">
+<a href="#" class="tab-section__btn js-search-result-tab-trigger" title="Tillbehör/Övrigt (1)">Tillbehör/Övrigt (1)<i class="icon icon-arrow-down"></i> </a>
+<article class="tab-section__content tab-section__content--space" style="display: none;"><ul class="category-list stock-data-container">
+<li class="category-list-item" data-sku="20000001" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Bosch Oljefilternyckel</h2><p class="category-list-item__article-nr">Art. Nr 1555-2000001</p></div></article>
+ <fieldset class="category-list-item__buy-area"><div class="category-list-item__buy-area--price"><p class="category-list-item__price">89:-</p></div>
+  <div class="category-list-item__buy-area--action"><form method="post" data-sku="20000001" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form></div></fieldset>
+</li>
+</ul></article></div>
+
+<div class="tab-section__item js-search-result-tab js-search-result-tab__NotInCarContext " data-tab-id="NotInCarContext">
+<a href="#" class="tab-section__btn js-search-result-tab-trigger" title="Ej kopplade reservdelar (1)">Ej kopplade reservdelar (1)<i class="icon icon-arrow-down"></i> </a>
+<article class="tab-section__content tab-section__content--space" style="display: none;"><ul class="category-list stock-data-container">
+<li class="category-list-item" data-sku="30000001" data-placements="">
+ <article class="category-list-item__product-info"><div class="category-list-item__text-container"><h2>Bosch Oljefilter, Filterinsats</h2><p class="category-list-item__article-nr">Art. Nr 1025-F026407999</p></div></article>
+ <fieldset class="category-list-item__buy-area"><div class="category-list-item__buy-area--price"><p class="category-list-item__price">99:-</p></div>
+  <div class="category-list-item__buy-area--action"><form method="post" data-sku="30000001" class="product-form product-form-quick"><input type="text" class="Quantity js-change-quantity-quick" value="0 st"></form></div></fieldset>
+</li>
+</ul></article></div>
+
+</section>
+</main>
+</body></html>

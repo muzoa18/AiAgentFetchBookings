@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!-- Hand-written, sanitised fixture modelled on the pro.meca.se cart page (ViewCart-View) with one line.
+     Placeholder data only (ABC123, TOKEN_PLACEHOLDER, LINEITEM_PLACEHOLDER). -->
+<html lang="sv"><head><meta charset="utf-8"><title>Översikt kundvagn</title></head>
+<body>
+<header class="car-header">
+  <a href="https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewCart-View" class="car-header__nav-action js-toggle-cart-side-menu"><span class="badge car-header__badge js-cart-notification">1</span><span>Varukorg</span></a>
+  <span style="display:none;" class="js-current-license-plate-number">ABC123</span>
+</header>
+<aside class="cart-side-menu">
+  <h2><div style="flex-grow: 1;">Varukorg<span>(1)</span> </div></h2>
+  <ul><li><p>Bosch Oljefilter, Filterinsats</p><p class="cart-side-menu__price">248:75</p><p>1<span class="cart-side-menu__unit">st</span></p></li></ul>
+  <p class="cart-side-menu__total">Totalt:<span>248:75</span></p>
+</aside>
+<main>
+<header class="cart-overview-header"><h1>Översikt kundvagn<span>ABC123</span> </h1></header>
+<section class="cart-overview-article-table stock-data-container">
+<div class="cart-overview-article-table__wrapper">
+<table id="sparePartsTable" class="product-table js-product-category" data-product-category="sparePartsTable">
+<thead><tr><th colspan="3"><h2>Reservdelar</h2></th><th colspan="2">Lagersaldo</th><th>Antal</th><th>Pris per enhet</th><th>exkl. avgifter</th><th>Prisförslag</th></tr></thead>
+<tbody class="js-sortable-table ui-sortable">
+<tr class="js-sort ui-sortable-handle" data-article-nr="10000002" data-step-value="1" data-product-id="LINEITEM_PLACEHOLDER"><td><span class="icon icon-close js-remove-product-item"></span></td>
+ <td class="cart-overview-article-table__image"><figure><img src="/fallback-image.svg" alt="PrimaryProductImage"></figure></td>
+ <td class="article-name"><div class="category-list-item__text-container"><div class="article-name__art-name"><span>Bosch Oljefilter, Filterinsats</span></div></div>
+  <p class="article-name__art-nr">Artikelnummer 1025-F026407026 &nbsp;<span class="icon icon-add-comment js-add-to-claim" title="Lägg till artikel i reklamation"></span></p></td>
+ <td class="stock-status"><div class="js-stocklevel" data-item-id="10000002"><address>MECA Butik<span class="address__span--in-stock"><span class="stock-list__value stock-list__value--empty">0 (Kontakta butik)</span></span></address><address>Centrallager SE<span class="address__span--in-stock"><span class="stock-list__value stock-list__value--low">2 i lager</span></span></address></div></td>
+ <td class="product-table__handle-bar"></td>
+ <td><div class="qty-wrapper"><a href="#" class="qty-wrapper__decrease js-decrease-product-qty">-</a> <input type="text" class="js-product-quantity js-product-quantity-cart" value="1 st" id="qty"> <a href="#" class="qty-wrapper__increase js-increase-product-qty">+</a></div></td>
+ <td><span>Pris per enhet</span><p>248:75</p><p class="price-per-unit-list">199:- &nbsp;listpris (exkl. moms)</p><div class="js-workshopprice"><p class="product-details__price-alt js-show-hide__item-basket"><span class="basket-workshop-price-value">...</span></p></div></td>
+ <td><span>exkl. avgifter</span><p><span class="js-item-total">248:75</span></p></td>
+ <td class="checkbox"><input type="checkbox" class="includeInQuotation checkbox__input" checked="checked"></td>
+</tr></tbody>
+<tfoot><tr class="product-table__footer-item"><td colspan="9"><p class="product-table__singel-row">Antal artiklar<strong> <span class="js-category-total-sum">248:75</span></strong></p></td></tr></tfoot>
+</table>
+<table id="additionalServicesTable" class="product-table js-product-category" data-product-category="additionalServicesTable">
+<thead><tr><th colspan="4"><h2>Tilläggstjänster</h2></th><th>Antal</th><th>Pris per enhet</th><th>exkl. avgifter</th><th>Prisförslag</th></tr></thead>
+<tbody class="js-sortable-table ui-sortable"></tbody>
+<tfoot><tr class="product-table__footer-item"><td colspan="8"><p class="product-table__singel-row">Totalt tilläggstjänster<strong> <span class="js-category-total-sum">-</span></strong></p></td></tr></tfoot>
+</table>
+</div>
+</section>
+<aside class="cart-overview-side">
+<section id="summaryTable" class="cart-overview-summary"><h2>Summering</h2><ul><li><ul class="summary-list">
+ <li>Reservdelar<span class="js-article-tot-sum">248:75</span></li>
+ <li class="summary-list__line">Tilläggstjänster<span class="js-additional-service-tot-sum">-</span></li>
+ <li class="summary-list__line">Moms<span> <span class="js-tax-tot-sum">49:75</span></span></li>
+ <li class="summary-list__total-title">exkl. avgifter<span class="summary-list__total-value"><span class="js-total-tot-sum">248:75</span></span></li>
+</ul></li>
+<li><span class="js-booking-form"><form method="post" action="https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrder-CreateBooking" id="bookingForm"><input type="hidden" name="SynchronizerToken" value="TOKEN_PLACEHOLDER"><button type="submit" class="button button--primary button--block">Gå vidare</button></form></span></li>
+</ul></section>
+</aside>
+</main>
+</body></html>

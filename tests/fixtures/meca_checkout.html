@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!-- Hand-written, sanitised fixture modelled on the pro.meca.se checkout page (ViewCheckout-Start), reached via "Gå vidare".
+     Placeholder data only: Testverkstad AB / Testgatan 1 / ABC123 / TOKEN_PLACEHOLDER. -->
+<html lang="sv"><head><meta charset="utf-8"><title>Beställning ABC123</title></head>
+<body>
+<header class="car-header"><span style="display:none;" class="js-current-license-plate-number">ABC123</span></header>
+<main>
+<header class="checkout-page-header"><h1>Beställning <span>ABC123</span></h1></header>
+<form action="https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewCheckout-SubmitOrder">
+<section class="checkout-page-top">
+ <div class="checkout-page-top__top-block"><h2>Fakturering</h2><strong>Faktura</strong><p>Testverkstad AB</p><p>Testgatan 1</p><p>123 45 Teststad</p></div>
+ <div class="checkout-page-top__top-block" id="checkout-shipping-block"><h2>Frakt</h2>
+  <div class="radio-button"><input type="radio" id="ship-to" class="radio-button__input" name="CheckoutForm_ShippingMethod" value="delivery" checked="checked"> <label for="ship-to" class="radio-button__label">Leverans/Upphämtning enligt lokalt avtal</label></div></div>
+ <div class="checkout-page-top__top-block"><h2>Leveransdatum</h2><input id="delivery-date" class="input-field" name="CheckoutForm_DeliveryDate" type="text" readonly="readonly" value="2026-01-01">
+  <p class="checkout-page-top__error js-desired-deliverydate-required" style="display:none;">Var snäll och välj önskat leveransdatum!</p>
+  <h2>Warehouse</h2><div id="warehouse-select"><p data-warehouse-id="MECA:SE:STORE:XXX">MECA Butik</p></div></div>
+ <div class="checkout-page-top__top-block"><h2>Notering</h2>
+  <input name="CheckoutForm_NoteWorkshop" class="input-field" id="workshop-comment" type="text" value="">
+  <input name="CheckoutForm_NoteStore" class="input-field" id="store-comment" type="text" value="">
+  <input name="CheckoutForm_CustomerOrderNumber" class="input-field" id="customer-order-number" type="text" value="ABC123"></div>
+</section>
+<section class="order-confirmation-page-article stock-data-container">
+<div class="checkout-page-article"><table class="product-table js-product-category" data-product-category="sparePartsTable">
+<thead><tr><th><h2>Artikel</h2></th><th></th><th></th><th>Lagersaldo</th><th>Antal</th><th>Pris/enhet</th><th>Totalt</th></tr></thead>
+<tbody>
+<tr data-step-value="1" data-article-nr="10000002" data-product-id="LINEITEM_PLACEHOLDER">
+ <td><span class="icon icon-close js-remove-product-item-checkout"></span></td><td></td>
+ <td><p class="article-name__art-name">Bosch Oljefilter, Filterinsats</p><p class="article-name__art-nr">Art.nr 1025-F026407026 </p></td>
+ <td class="stock-status"></td>
+ <td><div class="qty-wrapper"><a href="" class="qty-wrapper__decrease js-decrease-checkout-product-qty">-</a><input type="text" class="js-product-quantity js-product-quantity-checkout" value="1 st" id="qty"><a href="" class="qty-wrapper__increase js-increase-checkout-product-qty">+</a></div></td>
+ <td class="js-line-item-price"><p>171:64</p></td><td class="js-line-item-price"><p><span class="js-item-total">171:64</span></p></td>
+</tr></tbody></table></div>
+</section>
+<aside class="checkout-page-place-order__wrapper">
+<section id="summaryTable" class="checkout-page-place-order js-sticky cart-overview-summary"><h2>Summering</h2><ul><li>
+ <dl class="checkout-page-place-order__amounts"><dt>Netto</dt><dd><span class="js-article-tot-sum">137:31</span></dd><dt>Moms</dt><dd><span class="js-tax-tot-sum">34:33</span></dd></dl>
+ <p><span title="Rabatterat pris">Totalt&nbsp;<i class="icon icon-workshop-contact-information"></i></span><strong><span class="js-total-tot-sum">171:64</span></strong></p>
+ <button class="checkout-page-place-order__button checkout-page-place-order__button--place-order-button button button-primary js-submit-order-btn">Skicka beställning</button>
+ <button class="checkout-page-cancel-productOrder__button checkout-page-place-order__cancel-order button button--secondary js-open-lightbox" data-target="cancel-productcart-lightbox">Avbryt beställning</button>
+</li></ul></section>
+</aside>
+</form>
+</main>
+</body></html>
