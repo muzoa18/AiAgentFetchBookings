@@ -109,11 +109,15 @@ def prepare_section(fluids: list[dict]) -> list[str]:
 
 
 def order_body(parts: list[dict], total, fluids: list[dict]) -> list[str]:
-    """The chosen parts (title, brand, qty, unit price), the cart total, fluids to prepare."""
+    """Per chosen part: the booking's line name -> title (brand) qty unit price, plus a stock
+    note when the catalogue says 0 in stock; then the cart total and fluids to prepare."""
     lines = ["Delar:"]
     for p in parts:
-        lines.append(f"- {p.get('title')} ({p.get('brand') or '–'}) x{p.get('qty')} "
-                     f"à {sek(p.get('price_sek'))}")
+        name = str(p.get("name") or "").strip()
+        head = f"{name} -> {p.get('title')}" if name else str(p.get("title"))
+        stock = " – OBS: 0 i lager" if p.get("in_stock") is False else ""
+        lines.append(f"- {head} ({p.get('brand') or '–'}) x{p.get('qty')} "
+                     f"à {sek(p.get('price_sek'))}{stock}")
     lines.append(f"Totalt: {sek(total)}")
     return lines + prepare_section(fluids)
 

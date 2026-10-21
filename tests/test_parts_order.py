@@ -3,7 +3,7 @@ import pytest
 import notifier
 import orders_state
 import parts_order
-from parts_order_helpers import build_summary, cart_problem, parse_qty
+from parts_order_helpers import build_summary, cart_problem, order_body, parse_qty
 from rules import Rules
 
 CONFIG = {"telegram": {"bot_token": "123:ABC", "chat_id": "42"}}
@@ -726,3 +726,47 @@ def test_execute_order_other_mismatch_keeps_old_text(tg):
     (text,) = tg["sent"]
     assert text.startswith("Beställning stoppad för OLRD-3630: varukorgen stämmer inte")
     assert text.endswith("Inget beställdes – beställ för hand.")
+
+
+# ── Final review M3: line names and stock in approval / ordered messages ─────
+
+def test_order_body_shows_line_name_and_stock_note():
+    parts = [{"name": "Bromsskiva fram", "title": "Bosch Bromsskiva, 300mm", "brand": "",
+              "qty": 2, "price_sek": 500.0, "in_stock": False},
+             {"name": "Oljefilter", "title": "Bosch Oljefilter P7001", "brand": "Bosch",
+              "qty": 1, "price_sek": 120.0, "in_stock": True},
+             {"name": "Luftfilter", "title": "Bosch Luftfilter S0123", "brand": "Bosch",
+              "qty": 1, "price_sek": 250.0}]
+    lines = order_body(parts, 1370.0, [])
+    assert lines[1] == "- Bromsskiva fram -> Bosch Bromsskiva, 300mm (–) x2 à 500.00 SEK – OBS: 0 i lager"
+    assert lines[2] == "- Oljefilter -> Bosch Oljefilter P7001 (Bosch) x1 à 120.00 SEK"
+    assert lines[3] == "- Luftfilter -> Bosch Luftfilter S0123 (Bosch) x1 à 250.00 SEK"  # unknown stock
+
+
+def test_approval_and_ordered_messages_show_line_names_and_stock(tg, orders_file):
+    catalogue = {"Oljefilter": [{**CATALOGUE["Oljefilter"][0], "in_stock": False}],
+                 "Luftfilter": [{**CATALOGUE["Luftfilter"][0], "in_stock": True}]}
+    portal = FakePortal(catalogue=catalogue)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+
+    text, _ = tg["buttons"][0]
+    assert "- Oljefilter -> Bosch Oljefilter P7001 (Bosch) x2" in text
+    oil_line = next(line for line in text.splitlines() if line.startswith("- Oljefilter"))
+    assert oil_line.endswith("OBS: 0 i lager")
+    assert text.count("OBS: 0 i lager") == 1
+    assert "- Luftfilter -> Bosch Luftfilter S0123" in text
+    plan = orders_state.get("B1")["plan"]
+    assert [p["in_stock"] for p in plan["parts"]] == [False, True]
+    assert plan["expected_lines"] == [
+        {"title": "Bosch Oljefilter P7001", "qty": 2, "url_or_id": "p1"},
+        {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2"}]
+    _assert_no_pii(orders_file)
+
+    tg["sent"].clear()
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+    (done,) = tg["sent"]
+    assert "- Oljefilter -> Bosch Oljefilter P7001 (Bosch) x2" in done
+    assert "OBS: 0 i lager" in done
+    assert len(text) < 4096 and len(done) < 4096
+    _assert_no_pii(orders_file)

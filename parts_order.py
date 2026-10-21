@@ -195,7 +195,8 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
         return _block(config, booking, problem, fluids, cart_touched=True)
 
     parts = [{"name": name, "title": c.get("title"), "brand": c.get("brand"),
-              "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id")}
+              "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id"),
+              "in_stock": c.get("in_stock")}
              for name, c, qty in matched]
     plan = {
         "booking_id": booking_id,
