@@ -510,6 +510,49 @@ SPEC_COLUMNS = {"oem no": "oem_no", "artikel-id": "article_id", "antal": "qty"}
 DEFAULT_SPEC_COLUMNS = {"qty": 3}  # no recognised header row: the historical Antal position
 
 
+# The specification component of the booking page: the Tjänster / Delar / Vätskor tables and
+# the totals table, but NOT the Händelselogg (event log, with staff names) that follows it.
+# Tried in this order, one at a time (a comma list would return the first match in DOM order,
+# i.e. the outermost, over-broad ancestor).
+SPEC_CONTAINER_SELECTORS = (
+    "mk-specification-detail",
+    "section:has(h2:has-text('Specifikation')), "
+    "div:has(h2:has-text('Specifikation')), "
+    "div:has(h3:has-text('Specifikation')), "
+    "*:has(> h2:has-text('Specifikation'))",
+)
+# Boundaries, also enforced row by row in case the container is too broad or missing:
+# no items after "Totalt exklusive moms" (only the total is still read); stop completely at
+# the event log (its heading text, or a header row with the HÄNDELSE and DATUM columns).
+SPEC_END_TEXT = "totalt exklusive moms"
+LOG_HEADER_WORDS = {"händelse", "datum"}
+TOTAL_PATTERNS = ("att betala", "totalt", "total", "summa")
+_NUMERIC_QTY = re.compile(r"\d+(?:[.,]\d+)?")
+_DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
+_EVENT_NAME = re.compile(r"(?:händelse|ny bokning|notifiering|användare|datum|anteckningar)\b")
+
+
+def _is_log_header(header_texts) -> bool:
+    words = {" ".join(str(t or "").split()).rstrip(":").casefold() for t in header_texts}
+    return LOG_HEADER_WORDS <= words
+
+
+def _row_total(cells) -> str:
+    for cell in reversed(cells):
+        t = cell.inner_text().strip()
+        if re.search(r"\d", t) and "%" not in t and "moms" not in t.lower():
+            return t
+    return ""
+
+
+def _spec_container(page):
+    for selector in SPEC_CONTAINER_SELECTORS:
+        container = page.query_selector(selector)
+        if container:
+            return container
+    return None
+
+
 def _spec_columns(header_texts) -> dict:
     """{key: cell index} from one header row's texts; defaults when nothing is recognised."""
     columns = dict(DEFAULT_SPEC_COLUMNS)
@@ -555,12 +598,7 @@ def _extract_specification(page) -> tuple:
 
     try:
         # Find the Specifikation section container
-        spec_container = page.query_selector(
-            "section:has(h2:has-text('Specifikation')), "
-            "div:has(h2:has-text('Specifikation')), "
-            "div:has(h3:has-text('Specifikation')), "
-            "*:has(> h2:has-text('Specifikation'))"
-        )
+        spec_container = _spec_container(page)
 
         if spec_container:
             log.info("Found Specifikation container — reading only that section.")
@@ -572,6 +610,7 @@ def _extract_specification(page) -> tuple:
 
         category = "service"
         in_handelselogg = False
+        after_items = False  # past "Totalt exklusive moms": only the total may still be read
         columns = dict(DEFAULT_SPEC_COLUMNS)
 
         for row in rows:
@@ -586,6 +625,16 @@ def _extract_specification(page) -> tuple:
                 continue
 
             cells = row.query_selector_all("td")
+            headers = row.query_selector_all("th")
+            if headers and _is_log_header([h.inner_text() for h in headers]):
+                log.info("Reached the event-log table — stopping spec parsing.")
+                break
+            if SPEC_END_TEXT in row_lower:
+                after_items = True
+            if after_items:
+                if cells and any(p in row_lower for p in TOTAL_PATTERNS):
+                    total = _row_total(cells) or total
+                continue
 
             # Category header rows (few or no cells, bold text)
             if not cells or len(cells) <= 2:
@@ -595,22 +644,17 @@ def _extract_specification(page) -> tuple:
                     category = "fluids"
                 elif row_lower.startswith("service") and "kontroll" not in row_lower:
                     category = "service"
-                headers = row.query_selector_all("th")
                 if headers:
                     columns = _spec_columns([h.inner_text() for h in headers])
                 continue
 
             # Skip header rows (th elements)
-            if row.query_selector("th"):
+            if headers:
                 continue
 
             # Total row - check multiple patterns
-            if any(pattern in row_lower for pattern in ["att betala", "totalt", "total", "summa"]):
-                for cell in reversed(cells):
-                    t = cell.inner_text().strip()
-                    if re.search(r"\d", t) and "%" not in t and "moms" not in t.lower():
-                        total = t
-                        break
+            if any(pattern in row_lower for pattern in TOTAL_PATTERNS):
+                total = _row_total(cells) or total
                 continue
 
             # Skip moms/tax rows
@@ -630,8 +674,10 @@ def _extract_specification(page) -> tuple:
             if skip:
                 continue
 
-            # Skip if name looks like a date (from event log)
-            if re.match(r"\d{4}-\d{2}-\d{2}", name):
+            # Never an item: a date/timestamp or an event-log event name (privacy: the log
+            # carries staff names and must never reach SMS/Telegram/orders.json).
+            if _DATE_TEXT.search(name) or _EVENT_NAME.match(name.casefold()):
+                log.warning("Spec row dropped (looks like an event-log row).")
                 continue
 
             price = ""
@@ -648,6 +694,10 @@ def _extract_specification(page) -> tuple:
             item = {"name": name, "qty": column("qty"), "price": price}
 
             if category in ("parts", "fluids"):
+                if not _NUMERIC_QTY.fullmatch(item["qty"]):
+                    # no row text in the log: a misread row may hold personal data
+                    log.warning("Spec %s row dropped: quantity is not a number.", category)
+                    continue
                 item["article_id"] = column("article_id")
                 item["oem_no"] = column("oem_no")
             if category == "parts":

@@ -86,5 +86,28 @@
 </mk-specification-detail>
 </div>
 </div></div></div>
+<!-- Event log (Händelselogg): structure of the real Kendo grid, SENTINEL values only.
+     None of these rows may ever become a service, part or fluid. -->
+<div class="card"><div class="card-body">
+<div class="col-md-5 p-0"><h3 class="third-title">Händelselogg</h3></div>
+<div class="p-0 pt-3"><mk-kendo-grid mk-id="bookingAuditKedoGridElement">
+<div class="k-grid k-widget k-display-block k-editable" id="bookingAuditKedoGridElement" data-role="grid">
+<table role="grid">
+<colgroup><col style="width:20%"><col style="width:20%"><col style="width:30%"><col style="width:30%"></colgroup>
+<thead class="k-grid-header" role="rowgroup"><tr role="row">
+<th scope="col" role="columnheader" data-field="Event" data-title="Händelse" class="k-header"><a class="k-link" href="#">HÄNDELSE</a></th>
+<th scope="col" role="columnheader" data-field="Date" data-title="Datum" class="k-header"><a class="k-link" href="#">DATUM</a></th>
+<th scope="col" role="columnheader" data-field="Note" data-title="Anteckningar" class="k-header"><a class="k-link" href="#">ANTECKNINGAR</a></th>
+<th scope="col" role="columnheader" data-field="User" data-title="Användare" class="k-header"><a class="k-link" href="#">ANVÄNDARE</a></th>
+</tr></thead>
+<tbody role="rowgroup">
+<tr role="row"><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Händelse:</span><span class="span">Ny bokning</span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Datum:</span><span class="span">2026-10-18 13:26:30</span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Anteckningar:</span><span class="span"></span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Användare:</span><span class="span">Sentinel Staff Name</span></td></tr>
+<tr role="row"><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Händelse:</span><span class="span">Notifiering</span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Datum:</span><span class="span">2026-10-18 13:26:31</span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Anteckningar:</span><span class="span">Email sent to workshop</span></td><td role="gridcell"><span class="d-block d-sm-none kgrid-label-mobile label">Användare:</span><span class="span"></span></td></tr>
+<tr role="row"><td role="gridcell"><span class="span">Notifiering</span></td><td role="gridcell"><span class="span">2026-10-18 13:26:32</span></td><td role="gridcell"><span class="span">Email sent to workshop</span></td><td role="gridcell"><span class="span">Sentinel Staff Name</span></td></tr>
+</tbody>
+</table>
+</div>
+</mk-kendo-grid></div>
+</div></div>
 </body>
 </html>

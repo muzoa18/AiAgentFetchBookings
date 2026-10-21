@@ -175,7 +175,7 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     matched = []
     for line, name, qty in wanted:  # match everything before adding anything
         candidate = None
-        for term in search_terms(name):  # normalised term first, the original name last
+        for term in search_terms(name):  # synonyms first, then the normalised term, the original last
             candidate = choose(line, portal.search(term), rules, picker)
             if candidate is not None:
                 break
