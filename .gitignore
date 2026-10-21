@@ -1,6 +1,7 @@
 # ── Secrets — NEVER commit these ────────────────────────────────
 # Real credentials live in GitHub Secrets (CI) or locally only.
 config/config.yaml
+# Retired Gmail trigger: the files may still exist locally — keep them ignored.
 config/gmail_credentials.json
 config/gmail_token.json
 config/browser_context_parts/

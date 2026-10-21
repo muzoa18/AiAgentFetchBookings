@@ -1,63 +1,84 @@
 # MECA Booking Agent
 
-Automatically notifies the workshop owner of new MECA ProMeister bookings, and
-self-improves once a week.
+Notifies the workshop owner of new MECA ProMeister bookings on **Telegram**, marks bookings
+without spare parts as `Hanterad`, prepares the spare-parts order on **pro.meca.se** for every
+booking that needs parts and places it after the owner taps **Approve**, and self-improves once
+a week through a reviewed Pull Request.
 
-When a customer books, MECA emails the workshop *"a booking was made"* — but with
-no details. This agent fills that gap: it's triggered by that email, logs into
-the portal, scrapes the real booking (type, customer, vehicle, services, price),
-**sends an SMS** with everything, and marks confirmed `Bokning` bookings as
-`Hanterad`.
+MECA's own notification email only says *"a booking was made"*. This agent logs into the portal,
+reads the real booking (type, customer, vehicle, services, parts, fluids, price) and acts on it.
 
-It runs entirely on **GitHub Actions** (no local machine needed) on a schedule.
+It runs entirely on **GitHub Actions** (no local machine needed). The full description of the
+rules is in [`SKILL.md`](SKILL.md).
 
 ---
 
 ## How it works
 
 ```
-GitHub Actions (every 30 min, business hours)
+bookings.yml — daily 15:00 UTC, Mon–Sat                       (python agent.py)
         │
         ▼
-  Trigger gate ── mode "email": new MECA booking email in Gmail? ──no──▶ exit (cheap)
-        │ yes (or mode "always")
+  Log in to meca.promeisterportal.com (Playwright / headless Chromium)
         ▼
-  Log in to meca.promeisterportal.com  (Playwright / headless Chromium)
+  Nya tab → every listed booking: open detail page, extract info
         ▼
-  Open Nya tab → for each NEW booking, open detail page, extract info
+  Telegram message to the owner — ONCE per booking (config/seen_ids.txt)
         ▼
-  Send SMS to workshop owner(s) via 46elks
+  ┌──────────────────────────────┬──────────────────────────────────┬────────────────────┐
+  │ Bokning, no spare parts      │ Bokning with spare parts         │ Offert / Förfrågan │
+  │ Hanterad → Bekräfta now      │ pro.meca.se: load vehicle,       │ message only       │
+  │ (retried every run)          │ match parts, fill cart, ceiling  │ (no Hanterad)      │
+  │                              │ check → Telegram Approve/Cancel  │                    │
+  └──────────────────────────────┴──────────────────────────────────┴────────────────────┘
         ▼
-  Bokning → click Hanterad → Bekräfta   │   Förfrågan/Offert → SMS only
+  Commit state back to the repo (seen_ids, orders.json, run history)
+
+approve.yml — daily 06:00 UTC, every day                      (python approve.py)
+        │
         ▼
-  Commit booking state back to the repo (so it survives between runs)
+  approve.py --check: anything pending? ──no──▶ exit (cheap, no browser)
+        │ yes
+        ▼
+  Read the owner's Telegram taps (owner's private chat, booking's own message only)
+        ├─ Approve → re-check cart vs plan and ceiling → place order → result message + Klar
+        ├─ Cancel  → clear the vehicle's cart → message + Klar
+        ├─ Klar    → Hanterad → Bekräfta in the MECA portal
+        └─ approvals older than 48 h expire
+        ▼
+  Commit config/orders.json back
+
+weekly-improve.yml — Mondays 06:00 UTC                        (python improve.py --apply-all)
+        │
+        ▼
+  Claude (claude-opus-5-5) reviews code + SKILL.md + logs → proposals
+        ▼
+  Apply (allowlisted files only), syntax-check, revert anything broken
+        ▼
+  Pull Request → you review & merge
 ```
 
-```
-GitHub Actions (weekly, Mondays)
-        │
-        ▼
-  improve.py reviews code + run history with Claude (claude-opus-4-8)
-        ▼
-  Applies proposals to a branch, syntax-checks, reverts anything broken
-        ▼
-  Opens a Pull Request → you review & merge
-```
+Parts rules (owner-editable in [`parts_rules.yaml`](parts_rules.yaml), no code change needed):
+Bosch preferred, then another brand; never ProMeister; never fluids or oils; only parts linked to
+the vehicle ("Kopplade reservdelar"); ceiling **10,000 SEK** per booking; `mode: approve` (ask the
+owner first).
 
 ---
 
 ## Architecture choices (why it's built this way)
 
-- **GitHub Actions, not Vercel.** The core is a real browser driving a JS portal
-  across many pages — that doesn't fit Vercel's serverless model (Chromium size,
-  function timeouts, read-only FS). Actions gives a full Linux VM, native
-  Chromium, cron, free secrets, and the weekly agent can commit back via a PR.
-- **Email-gated trigger.** Scraping is the fragile part, so we only do it when a
-  booking actually happened (per the MECA email). Set `BOOKING_TRIGGER_MODE` to
-  `always` to scrape every run regardless (works without Gmail).
-- **Improve agent opens PRs.** Self-modifying code that runs unattended against a
-  live portal must be reviewed — the weekly agent never pushes to `main` directly.
-- **No secrets in git.** Real credentials live only in GitHub Secrets / a local
+- **GitHub Actions, not Vercel.** The core is a real browser driving two JS portals — that
+  doesn't fit Vercel's serverless model (Chromium size, function timeouts, read-only FS).
+- **The portal is the truth.** A `Bokning` still on the Nya tab is not handled; local files only
+  remember who was notified and the order status, so nothing is notified or ordered twice.
+- **Telegram instead of SMS.** Free, and inline buttons give one-tap approval. The approval
+  poller runs once a day; Telegram keeps unread taps for 24 h, so it runs every day.
+- **Fail closed.** Real money is spent unattended: any doubt (no confident match, unreadable
+  total, cart mismatch, wrong chat) means no order and a message saying why.
+- **Improve agent opens PRs** and may only write an allowlist (scrapers, parsers, notifier,
+  state, run logger, tests) — enforced in code; workflows, config, rules and the safety modules
+  are never touched.
+- **No secrets in git.** Credentials live only in GitHub Secrets / a local
   `config/config.yaml` (gitignored). See [`config/config.example.yaml`](config/config.example.yaml).
 
 ---
@@ -68,102 +89,105 @@ GitHub Actions (weekly, Mondays)
 
 Repo → **Settings → Secrets and variables → Actions → New repository secret**.
 
-**Required:**
+| Secret | What it is | Used by |
+|---|---|---|
+| `PORTAL_USERNAME` | MECA ProMeister login | bookings, approve (Klar) |
+| `PORTAL_PASSWORD` | MECA ProMeister password | bookings, approve (Klar) |
+| `PARTS_PORTAL_USERNAME` | pro.meca.se login | bookings, approve |
+| `PARTS_PORTAL_PASSWORD` | pro.meca.se password | bookings, approve |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather | bookings, approve |
+| `TELEGRAM_CHAT_ID` | The owner's **private** chat id with the bot (never a group) | bookings, approve |
+| `ANTHROPIC_API_KEY` | Claude API key (part matching + weekly improve) | all three |
 
-| Secret | What it is |
-|---|---|
-| `PORTAL_USERNAME` | MECA ProMeister login |
-| `PORTAL_PASSWORD` | MECA ProMeister password |
-| `SMS_RECIPIENT_NUMBER` | Number(s) to SMS, e.g. `+46700000000,+46711111111` |
-| `SMS_API_USER` | 46elks API username |
-| `SMS_API_PASSWORD` | 46elks API password |
-| `ANTHROPIC_API_KEY` | Claude API key (used by the weekly improve agent) |
+No repository variables are needed.
 
-**Optional:**
-
-| Secret | Default |
-|---|---|
-| `SMS_PROVIDER` | `46elks` (or `twilio`) |
-| `SMS_SENDER_NAME` | `MECA` |
-| `GMAIL_TOKEN_JSON` | (none) — paste the full contents of `config/gmail_token.json` to enable email-gated mode |
-| `GMAIL_CREDENTIALS_JSON` | (none) — full contents of `config/gmail_credentials.json` |
-
-### 2. Add Variables (non-secret)
-
-Same page → **Variables** tab:
-
-| Variable | Value |
-|---|---|
-| `BOOKING_TRIGGER_MODE` | `email` (gate on the MECA email) or `always` |
-| `BOOKING_EMAIL_QUERY` | Gmail search matching the MECA notification, e.g. `newer_than:1d (subject:bokning)` |
-
-### 3. Enable Actions → PR creation
+### 2. Enable Actions → PR creation
 
 Repo → **Settings → Actions → General → Workflow permissions** →
 ✅ *Allow GitHub Actions to create and approve pull requests*
 (needed for the weekly improve PR).
 
-### 4. Done
+### 3. Workflows
 
-- `Actions` tab → **MECA Booking Agent** → *Run workflow* to test immediately.
-- Edit the cron in [`.github/workflows/bookings.yml`](.github/workflows/bookings.yml)
-  to change frequency/hours (it's in **UTC** — Sweden is UTC+1/+2).
+| Workflow | Schedule (UTC) | What |
+|---|---|---|
+| [`bookings.yml`](.github/workflows/bookings.yml) | `0 15 * * 1-6` (17:00 summer / 16:00 winter, Mon–Sat) | booking run, stages parts orders |
+| [`approve.yml`](.github/workflows/approve.yml) | `0 6 * * *` (every day) | Approve / Cancel / Klar taps, expiry |
+| [`weekly-improve.yml`](.github/workflows/weekly-improve.yml) | `0 6 * * 1` (Mondays) | self-improve PR |
+
+`Actions` tab → pick a workflow → *Run workflow* to run it now (e.g. approve.yml to process a tap
+immediately). bookings and approve share one concurrency group and never overlap.
+
+### 4. First live order
+
+Before the first real order, follow the checklist in
+[`docs/superpowers/plans/2026-10-21-parts-ordering-handoff.md`](docs/superpowers/plans/2026-10-21-parts-ordering-handoff.md)
+("Before the first supervised live order"): disable the old local scheduler, set the secrets,
+push, then run the first order as a supervised test with `mode: approve`.
 
 ---
 
 ## Local development
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
 python -m playwright install chromium
 
+python -m pytest           # offline test suite — run before every commit
+
 cp config/config.example.yaml config/config.yaml   # fill in your real values
-python agent.py            # run the booking agent once
+python agent.py            # one booking run (real portal, real Telegram messages)
+python approve.py --check  # prints has_pending=true|false (no browser, no network)
+python approve.py          # process Approve / Cancel / Klar taps now (can place a real order)
 python improve.py          # interactive self-improve (review each proposal)
+python inspect_portal.py   # dev helper: look at the portal's HTML when selectors break
 ```
 
-Any env var overrides the matching `config.yaml` field, so you can test the
-exact CI behaviour locally by exporting the secrets instead.
+Any env var overrides the matching `config.yaml` field, so you can test the exact CI behaviour
+locally by exporting the secrets instead. Set `portal.debug: true` for a visible browser.
 
----
-
-## Setting up the Gmail trigger (optional but recommended)
-
-Email-gated mode needs read access to the Gmail account that receives MECA
-booking notifications. Follow [`GMAIL_SETUP.md`](GMAIL_SETUP.md) once on your
-machine to produce `config/gmail_token.json` and `config/gmail_credentials.json`,
-then paste their contents into the `GMAIL_TOKEN_JSON` / `GMAIL_CREDENTIALS_JSON`
-secrets and set `BOOKING_TRIGGER_MODE=email`.
-
-If Gmail isn't configured, the trigger **fails open** — the agent simply scrapes
-on every scheduled run.
+**Do not run the agent locally and on GitHub Actions at the same time:** each copy keeps its own
+`config/seen_ids.txt` / `config/orders.json`, so a local run can click Hanterad or fill a cart
+that the GitHub runs never see.
 
 ---
 
 ## Project structure
 
 ```
-agent.py            # Main entry point — trigger gate, scrape, SMS, Hanterad
-email_trigger.py    # Gmail check: was a MECA booking email received?
-portal_scraper.py   # Playwright login, Nya tab, detail extraction, Hanterad
-sms_sender.py       # 46elks / Twilio SMS (multiple recipients)
-state.py            # seen_ids.txt — avoids duplicate SMS
-run_logger.py       # logs/run_history.jsonl — structured run history
-config_loader.py    # env-first config (GitHub Secrets) + config.yaml fallback
-improve.py          # Weekly self-improve — opens a PR with proposed fixes
+agent.py               # Daily booking run: scrape, notify once, Hanterad or stage order
+approve.py             # Daily poller: Approve / Cancel / Klar taps, expiry
+notifier.py            # Telegram Bot API client
+portal_scraper.py      # MECA portal: login, Nya tab, detail extraction, Hanterad
+parts_order.py         # Plan, stage and execute a pro.meca.se order
+parts_order_helpers.py # Quantities, cart/total checks, message text
+parts_matcher.py       # Part matching: brand, ProMeister/fluid/placement rules, Claude picker
+parts_portal.py        # pro.meca.se: login, vehicle, search, cart, checkout
+parts_portal_parse.py  # pro.meca.se HTML parsers
+orders_state.py        # config/orders.json — one status per booking, never order twice
+rules.py               # Loads parts_rules.yaml
+parts_rules.yaml       # Owner-editable parts rules (brands, ceiling, mode)
+state.py               # config/seen_ids.txt — notified once
+run_logger.py          # logs/run_history.jsonl — structured run history
+config_loader.py       # env-first config (GitHub Secrets) + config.yaml fallback
+improve.py             # Weekly self-improve — opens a PR with proposed fixes
+inspect_portal.py      # Dev helper for selector work
+tests/                 # Offline pytest suite
 .github/workflows/
-  bookings.yml         # Frequent, email-gated booking run
+  bookings.yml         # Daily booking run
+  approve.yml          # Daily approval poller
   weekly-improve.yml   # Weekly improve → Pull Request
 config/
   config.example.yaml  # Template (copy to config.yaml locally)
-SETUP_LOG.md        # Full log of the changes made to host this on GitHub
+SETUP_LOG.md           # History: the original (SMS/Gmail) move to GitHub Actions
 ```
 
 ---
 
 ## Security notes
 
-- `config/config.yaml`, Gmail tokens, and the browser context are **gitignored** —
-  never commit them.
-- The credentials previously stored in a local `config.yaml` should be **rotated**
-  (MECA password, 46elks keys, Anthropic key) and re-added only as GitHub Secrets.
+- `config/config.yaml` and the browser context are **gitignored** — never commit them.
+- `config/orders.json` is committed and never holds customer data; `logs/agent.log` (a 14-day
+  workflow artifact) can hold full booking details.
+- Rotate the MECA password and any key that was ever stored in a local file, and keep them only
+  in GitHub Secrets.

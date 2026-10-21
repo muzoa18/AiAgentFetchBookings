@@ -1,60 +1,80 @@
 # MECA Booking Agent — Skill File
 
-Context file read by `improve.py` on every weekly review. Keep it in sync with the code;
-anything described here that does not exist in the repo will mislead the improve agent.
+Context file read by `improve.py` on every weekly review, and the project's agent context.
+Keep it in sync with the code; anything described here that does not exist in the repo will
+mislead the improve agent.
 
-## What this agent does
-Notifies the owner of MD Bilreparationer (MECA workshop, Eskilstuna) of new bookings from the
-MECA ProMeister portal. MECA's own notification email says only "a booking was made", with no
-details. The agent logs into the portal, scrapes the real booking, sends an SMS with everything,
-and marks confirmed bookings as handled.
+## What the system does
+MD Bilreparationer (a MECA workshop in Eskilstuna) receives digital bookings through the MECA
+ProMeister portal (meca.promeisterportal.com). The system, end to end:
 
-Runs entirely on **GitHub Actions** (no local machine, no Task Scheduler).
+1. **Daily booking run** (`agent.py`): logs into the portal, reads every booking listed on the
+   **Nya** tab, and sends the owner **one Telegram message** per booking with all the details.
+2. A `Bokning` **without spare parts** is marked **Hanterad → Bekräfta** right away.
+3. A `Bokning` **with spare parts** gets a parts order **staged** on pro.meca.se (the MECA parts
+   shop): each part is matched in the vehicle's linked parts and put in the cart, and the owner
+   gets a Telegram message with the parts, prices, cart total and fluids to prepare, plus
+   **Approve** / **Cancel** buttons.
+4. **Daily approval run** (`approve.py`): reads the owner's taps. Approve → re-check the cart and
+   check out; Cancel → clear the cart. Every resolution message carries a **Klar** button; a Klar
+   tap marks the booking Hanterad in the MECA portal.
+5. **Weekly self-improve** (`improve.py`): Claude reviews code + logs and opens a Pull Request.
 
-### Booking run (`.github/workflows/bookings.yml`, every 30 min, Mon–Sat, 05–16 UTC)
-1. **Trigger gate** (`email_trigger.py`). In `email` mode, check Gmail for a not-yet-seen MECA
-   booking email and exit cheaply if there is none. In `always` mode, skip the gate.
-   Any Gmail error **fails open** (scrape anyway) so a real booking is never missed.
-2. Log in to https://meca.promeisterportal.com (Playwright, headless Chromium).
-3. Open `/Booking/Index` → click the **Nya** tab.
-4. For each booking not in `config/seen_ids.txt`, open the BookingInfo detail page and extract:
-   customer, phone, email, vehicle reg + model, workshop date, message, services, parts,
-   fluids, total price.
-5. Send an SMS via 46elks (Twilio supported) to every number in `recipient_number`.
-6. `Bokning` → click **Hanterad** → **Bekräfta**. `Förfrågan` / `Offert` → SMS only; there is
-   no Hanterad button, so they stay pending in the portal and are logged as `PENDING`.
-7. Commit `config/seen_ids.txt`, `config/seen_email_ids.txt` and `logs/run_history.jsonl` back
-   to `main` (state must survive between ephemeral CI runs).
+Everything runs on **GitHub Actions** (no local machine, no Task Scheduler). Every booking with
+parts ends in a message saying ordered, blocked or failed: nothing fails silently.
 
-### Weekly self-improve (`.github/workflows/weekly-improve.yml`, Mondays 06:00 UTC)
-`python improve.py --apply-all` sends source + SKILL.md + recent logs to Claude, applies the
-proposals on a branch, runs `py_compile` on each changed `.py`, reverts any file that does not
-compile, writes `improve_reports/latest.md`, and opens a **Pull Request**. It never pushes to
-`main`; a human reviews and merges.
-
-## File structure
+## File map
 ```
-agent.py            Orchestrator: gate → scrape → SMS → Hanterad → state/log
-email_trigger.py    Gmail gate (should_run); tracks config/seen_email_ids.txt
-portal_scraper.py   Playwright login, Nya tab, detail extraction, Hanterad click
-sms_sender.py       46elks / Twilio, comma-separated recipients
-state.py            seen_ids.txt load/save (dedupe so one booking = one SMS)
-run_logger.py       Appends structured runs to logs/run_history.jsonl
-config_loader.py    Env-first config (GitHub Secrets) with config/config.yaml fallback
-improve.py          Weekly self-improve → PR
-extractor.py        LEGACY AI text extraction, superseded by direct table parsing
-inspect_portal.py   Dev helper for inspecting portal HTML when selectors break
+agent.py                 Daily booking run: scrape → notify once → Hanterad (no parts) or stage order
+approve.py               Daily poller: Approve / Cancel / Klar taps, 48 h expiry, Klar withdrawal
+notifier.py              Telegram Bot API client (stdlib): messages, inline buttons, getUpdates
+portal_scraper.py        MECA portal (Playwright): login, Nya tab, detail page, Hanterad → Bekräfta
+parts_order.py           Plan, stage (cart), approval message, execute_order (checkout)
+parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text
+parts_matcher.py         Pure matching: brand rank, ProMeister/fluid/placement filters, Claude picker
+parts_portal.py          pro.meca.se (Playwright): login, load vehicle, search, cart, checkout
+parts_portal_parse.py    Pure HTML parsers for pro.meca.se pages (fixture-tested)
+orders_state.py          config/orders.json: one status per booking, never order twice
+rules.py                 Loads + validates parts_rules.yaml (fails closed)
+parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling_sek, mode
+config_loader.py         Env-first config (GitHub Secrets) with config/config.yaml fallback
+state.py                 config/seen_ids.txt (notified once) + no-Hanterad-button bookkeeping
+run_logger.py            Appends one structured line per run to logs/run_history.jsonl
+improve.py               Weekly self-improve → PR (write allowlist enforced in code)
+inspect_portal.py        Dev helper: inspect the portal's HTML when selectors break
 config/config.example.yaml   Template; env var name for each field is in its comments
+tests/                   Offline pytest suite (fixtures for both portals' HTML)
 ```
-Not present any more: `parts_agent.py`, `email_agent.py`, Windows Task Scheduler jobs. The old
-Förfrågan quote-email flow and the Gmail draft-reply agent were removed.
+Not present any more: `sms_sender.py` (46elks SMS), `email_trigger.py` (Gmail gate),
+`extractor.py`, `parts_agent.py`, `email_agent.py`, Windows Task Scheduler jobs. Do not
+reference or recreate them.
 
-## Booking types
-- **Bokning**: confirmed booking. SMS, then Hanterad → Bekräfta.
-- **Förfrågan**: price request. SMS only; needs manual action in the portal.
-- **Offert**: quote already sent. SMS only.
+## Booking loop rules (agent.py)
+- **The portal is the truth for a `Bokning`.** Listed on the Nya tab = not handled. Local files
+  never decide "handled"; `config/seen_ids.txt` only means "the owner was notified" (log text
+  "Already notified").
+- **Notify once.** Every run works on every listed `Bokning`, quietly: no new message unless the
+  outcome changes. A failed Telegram send leaves the booking unseen (retried next run) and makes
+  the run exit 1.
+- **No spare parts** (no non-fluid part lines; fluids are only listed): message once, then
+  Hanterad → Bekräfta immediately, retried every run until it succeeds. A failed Hanterad is
+  reported and the run exits 1.
+- **With spare parts:** Hanterad is NOT pressed by agent.py. The order flow runs (staging, then
+  approval in approve.py); only the owner's **Klar** tap marks it Hanterad.
+- A `blocked` order whose cart was never touched (e.g. "ingen säker träff") is re-staged
+  automatically each run, at most 10 tries, with a message only when the outcome changes.
+  Blocked-after-cart-touched, failed, cancelled, expired, pending, attempted and ordered bookings
+  are never retried automatically.
+- Specification not read completely (`spec_fallback` / `spec_dropped`): Hanterad is not pressed;
+  the owner is told to check the booking.
+- **Offert / Förfrågan** (no Hanterad button): local storage handles them — notified once, then
+  only a PENDING line in the log while still listed. A booking whose type was only guessed and
+  that shows no Hanterad button on two runs in a row gets one notice and is then handled like
+  Offert/Förfrågan (`config/no_button_seen_once.txt` → `config/no_button_ids.txt`).
+- Crash recovery: a booking is queued in `config/orders.json` right after its notification;
+  any record still `attempted` at the start of the next run is reported and marked `failed`.
 
-## SMS format
+### Telegram message (booking notification)
 ```
 Ny Bokning - OLRD-3630
 Kund: Mamadou Sowe
@@ -73,41 +93,126 @@ Totalt: 3 709 SEK
 ```
 Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are omitted when empty.
 
-## Scraper selectors and gotchas
-- Cookie popup must be dismissed before any click works.
-- Nya tab: JS evaluation matching element text that starts with "Nya".
-- Booking links: `a[href*='BookingInfo']`, deduplicated by BookingID param.
-- Hanterad: JS exact text match `=== 'Hanterad'`, then wait for the Bekräfta dialog; Bekräfta is
-  also an exact text match.
-- Specification table scraping stops at **Händelselogg** so event-log rows are not parsed.
-- SMS failure still adds the ID to `seen_ids` and skips Hanterad (avoids SMS spam on retry, but
-  the booking then needs manual follow-up; failures show as `sms_failed` in run history).
+## Approval and Klar (approve.py)
+- An order is placed only if the tap comes from the owner (`telegram.chat_id`, a **private** chat,
+  never a group), on that booking's own approval message (stored message id), the booking is
+  still `pending`, and the approval is not older than **48 h** (checked at poll time).
+- `execute_order` re-checks the live cart against the stored plan and the ceiling, records
+  `attempted` before checkout, then places the order and reports the result.
+- Cancel clears the vehicle's cart (best effort). An expired approval leaves the cart for the
+  owner to clear.
+- **Klar** is accepted with the same owner checks, only once the order is resolved (never while
+  `pending` or `attempted`). A failed Hanterad keeps the button; a missing Hanterad button counts
+  as already handled by hand. Klar buttons older than 14 days are withdrawn once with a notice.
+- `python approve.py --check` (stdlib only) prints `has_pending=true|false`; the workflow skips
+  installing Playwright when nothing is pending.
 
-## Config (env var overrides config.yaml)
-Required: `PORTAL_USERNAME`, `PORTAL_PASSWORD`, `SMS_RECIPIENT_NUMBER`, `SMS_API_USER`,
-`SMS_API_PASSWORD`, `ANTHROPIC_API_KEY` (improve only).
-Optional: `SMS_PROVIDER`, `SMS_SENDER_NAME`, `GMAIL_TOKEN_JSON`, `GMAIL_CREDENTIALS_JSON`.
-Repo variables: `BOOKING_TRIGGER_MODE` (`email`|`always`), `BOOKING_EMAIL_QUERY`.
-Secrets live only in GitHub Secrets or the gitignored `config/config.yaml`.
-
-## Improvement priorities (for improve.py)
-1. Reliability: scraping failures, timeouts, selector drift after portal changes.
-2. Never missing a booking: gate must fail open; no silent SMS failures.
-3. SMS content quality: wrong or missing fields.
-4. Hanterad confirmation: cases where it fails silently.
-5. Performance: reduce browser open time and CI minutes.
-
-## Rules for proposed changes
-- Do not add dependencies or touch workflows/secrets handling without a clear reason.
-- Do not reference or recreate files listed under "Not present any more".
-- Keep changes small and syntax-checkable; every changed `.py` must compile.
-
-## Logs monitored by improve.py
-- `logs/run_history.jsonl`: structured per-run summary (the main signal, tracked in git).
-- `logs/agent.log`: only exists inside a CI run (gitignored), so it is usually absent.
+## Parts rules
+- Only parts under **"Kopplade reservdelar"** (linked to the loaded vehicle) are candidates.
+  Discontinued ("Produkten har utgått") and replaced ("Ersätts av") items are excluded.
+- **Bosch preferred**, then another linked brand. **Never ProMeister** (hard-coded in
+  `parts_matcher.py`, also in `brand_forbid`).
+- **Never fluids or oils** (any kind). Fluid-looking lines are listed under "Förbered", never
+  searched. Some real parts are over-blocked (e.g. "Fettnippel", "Oil pump"): order those by hand.
+- **Placement:** when the booking line names an axle (fram/bak) or side (vä/hö), the candidate
+  must match it; unknown placement is dropped. **Axle-specific parts** (belägg, bromsskiva,
+  stötdämpare, …) need an axle in the booking line, otherwise the booking is blocked, not guessed.
+- Candidate titles/brands with non-Latin letters are dropped; the Claude picker (`claude-sonnet-5-5`)
+  must be confident (≥ 0.8) or nothing is ordered. Only the first 15 linked results are considered.
+- **Ceiling 10,000 SEK** per booking order, compared against the higher of the cart total and the
+  checkout-page total, at staging, at approval and inside `checkout()` before the final click.
+  A missing or unreadable total means no order.
+- The pro.meca.se cart is **per vehicle**; staging requires that vehicle's cart to be empty.
+- `parts_rules.yaml` `mode: approve` (ask the owner first) is the current setting; `auto` would
+  order directly under the same limits and is not to be switched on before the checks listed in
+  the handoff doc are done.
 
 ## Parts vocabulary and lookup rules (owner-confirmed 2026-10-21)
 - **Pollenfilter = Kupéfilter.** Searching "pollenfilter" on pro.meca.se returns NOTHING; "kupéfilter" returns the linked parts. Treat both words (and "kupefilter") as the same part and search "kupéfilter".
 - **Artikel-ID.** On the booking page the "Delar" table has the columns name, OEM No, Artikel-ID, Antal, Beställda, Pris, Rabatt, Totalt (e.g. `Pollenfilter | 1025-PC40293 | 1025-PC40293 | 1`). The Artikel-ID is the pro.meca.se "Art. Nr" (searching it finds exactly that article, in the extra "Artikelnummer" tab and in "Kopplade reservdelar" when it fits the car). Fluids/oils ("Vätskor / Oljor") have no Artikel-ID.
 - The Artikel-ID is **usually a ProMeister part**: ProMeister is never ordered, so use it as the REFERENCE (its title and "Produktinformation" such as filter type and dimensions) and find a similar linked part from another brand (Bosch preferred). It is not always ProMeister (the oil filter on the same booking was a Bosch `1025-F026407142`).
 - Searches are only trusted from the "Kopplade reservdelar" tab (parts linked to the vehicle).
+
+## Workflows and schedules (cron is UTC; Sweden is UTC+1 winter / UTC+2 summer)
+| Workflow | Schedule | Runs |
+|---|---|---|
+| `.github/workflows/bookings.yml` | daily 15:00 UTC, Mon–Sat (`0 15 * * 1-6`) | `python agent.py`, commits `config/seen_ids.txt`, `config/orders.json`, `logs/run_history.jsonl`, `config/no_button_*.txt` |
+| `.github/workflows/approve.yml` | daily 06:00 UTC, every day (`0 6 * * *`) | `python approve.py --check`, then `python approve.py` if anything is pending; commits `config/orders.json` |
+| `.github/workflows/weekly-improve.yml` | Mondays 06:00 UTC | `python improve.py --apply-all`, opens a PR |
+
+bookings.yml and approve.yml share the concurrency group `meca-bookings`, so they never overlap
+(single writer of `orders.json`, one cart per vehicle). Run approve.yml by hand from the Actions
+tab to process a tap immediately. Telegram keeps unread taps for 24 h only, so the poller runs
+every day; tap within ~36 h of the staging message.
+
+### Weekly self-improve
+`python improve.py --apply-all` sends source + SKILL.md + recent logs to Claude
+(`claude-opus-5-5`), applies the proposals in the working tree, runs `py_compile` on each changed
+`.py`, reverts any file that does not compile, writes `improve_reports/latest.md`, and the
+workflow opens a **Pull Request**. It never pushes to `main`; a human reviews and merges.
+
+**Write allowlist** (`ALLOWED_FILES` / `allowed_path` in `improve.py`, enforced in code at write
+time, not only in the prompt): a proposal may write ONLY `portal_scraper.py`, `parts_portal.py`,
+`parts_portal_parse.py`, `notifier.py`, `state.py`, `run_logger.py`, or a `.py` file directly
+under `tests/`. Everything else — `.git/`, `.github/`, `.claude/`, `config/`, `parts_rules.yaml`,
+`rules.py`, `approve.py` (approval authorisation), `parts_matcher.py`, `parts_order*.py` (ceiling,
+ProMeister, fluid, placement safety), `orders_state.py`, `agent.py`, `config_loader.py`,
+`improve.py`, docs, new modules — is never written and is listed in the report as
+"skipped (not on the allowlist)". Dot-components, `..`, absolute paths, backslashes and symlinks
+are always refused. The workflow checks out with `persist-credentials: false`. Welcome: selector
+fixes and parsing robustness, logging, error handling, tests.
+
+## Secrets (GitHub Secrets; env var overrides config.yaml)
+`PORTAL_USERNAME`, `PORTAL_PASSWORD` (MECA portal), `PARTS_PORTAL_USERNAME`,
+`PARTS_PORTAL_PASSWORD` (pro.meca.se), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (the owner's
+private chat id), `ANTHROPIC_API_KEY` (part picker + weekly improve). Optional env:
+`PORTAL_BOOKINGS_PATH`, `PORTAL_DEBUG`. Secrets live only in GitHub Secrets or the gitignored
+`config/config.yaml`. Required by `config_loader`: portal username/password and telegram
+bot_token/chat_id; ordering additionally needs the parts portal login and the Anthropic key.
+
+## Scraper selectors and gotchas
+- Cookie popups on both portals must be dismissed before any click works.
+- MECA portal: the Authenticate JSON response decides login success; a failed login is never
+  retried (bad attempts can lock the account) and is reported to the owner.
+- Booking links: `a[href*='BookingInfo']`, deduplicated by BookingID param.
+- Hanterad: exact text match, then wait for the Bekräfta dialog; Bekräfta is also exact text.
+- Specification scraping stops at **Händelselogg** so event-log rows are not parsed.
+- pro.meca.se login: TWO email fields — use `#ShopLoginForm_Login` / `#ShopLoginForm_Password`.
+- pro.meca.se checkout: cart → "Gå vidare" → "Beställning <REG>" → "Skicka beställning" (the only
+  click that places an order). The confirmation page has not been seen yet; it is handled
+  defensively (an order without a readable reference is reported as `UNVERIFIED-…`).
+
+## Safety invariants (never break these)
+- A booking is never ordered twice (`orders_state`; `attempted` is written before checkout and a
+  crashed attempt is never re-ordered automatically).
+- Nothing is ordered above the ceiling, from ProMeister, for fluids/oils, or outside "Kopplade
+  reservdelar"; ambiguity means no order.
+- Only the owner's private chat can approve, cancel or Klar, on the booking's own message.
+- Every booking with parts ends in a message (ordered, blocked or failed); a message that cannot
+  be delivered turns the run red.
+- Owner messages are Swedish and never carry raw exception text; customer data is never written
+  to `config/orders.json` (it is committed to git).
+- No secrets in git. The improve agent only opens PRs and only writes allowlisted files.
+
+## Known limitations
+- The order confirmation page, quantity semantics ("x4" pieces vs sets), the real format of
+  `data-placements`, and the 0-stock policy are unverified until the first supervised live order
+  (see `docs/superpowers/plans/2026-10-21-parts-ordering-handoff.md`).
+- The axle-specific part list is incomplete (bromsbackar, bromsslang, English lines); title-only
+  matching is used when the portal gives no ids; brand preference is enforced within one search
+  term only.
+- An approve run killed mid-checkout is only reported by the next daily booking run's sweep.
+- `approve.py` repeats the "invalid rules" warning every poll; a missing secret turns every poll red.
+- Cancel clears the whole vehicle cart, including anything the owner added by hand.
+- `logs/agent.log` (a 14-day workflow artifact) can contain full booking details.
+
+## Logs monitored by improve.py
+- `logs/run_history.jsonl`: structured per-run summary (the main signal, tracked in git).
+- `logs/agent.log`: only exists inside a CI run or a local run (gitignored), so usually absent.
+- `logs/improve_auto.log`: written by `improve.py --auto` (local only).
+
+## Rules for proposed changes
+- Do not add dependencies or touch workflows/secrets handling without a clear reason.
+- Do not reference or recreate files listed under "Not present any more".
+- Keep changes small and syntax-checkable; every changed `.py` must compile and the offline test
+  suite (`python -m pytest`) must stay green.

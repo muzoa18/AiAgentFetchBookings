@@ -1,3 +1,5 @@
+> History only: this describes the original (SMS/46elks + Gmail trigger) hosting and is superseded by [README.md](README.md).
+
 # Setup Log — Hosting the MECA Agent on GitHub Actions
 
 Date: 2026-06-16
