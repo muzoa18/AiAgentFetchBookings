@@ -154,7 +154,7 @@ export function createDemoSource(now = Date.now) {
       return null;
     },
     async getLatestCommit() {
-      return { sha: 'd3m0c0ffee1234567', date: iso(now() - 0.5 * HOUR) };
+      return { sha: 'de3a0c0ffee123456', date: iso(now() - 0.5 * HOUR) };
     },
     async dispatch() {},
     actionsUrl() {

@@ -45,7 +45,8 @@ function githubMessage(err) {
  *   now?: () => ms, log?: (msg) => void, demo?: boolean
  * }
  */
-export function createHandlers({ env, source, now = Date.now, log = (m) => console.error(m), demo = false }) {
+export function createHandlers({ env, source, now = Date.now, log, demo = false }) {
+  log ??= (m) => console.error(m);
   const loginLimiter = createLimiter({ limit: 5, windowMs: 10 * 60_000, clock: now });
   const lastRun = new Map(); // workflow -> ms
 
@@ -80,7 +81,8 @@ export function createHandlers({ env, source, now = Date.now, log = (m) => conso
     if (!configured(res)) return;
     try {
       assertDashboardPost(req);
-      const limit = loginLimiter.hit(clientIp(req));
+      const ip = clientIp(req);
+      const limit = loginLimiter.hit(ip);
       if (!limit.allowed) {
         return sendError(res, 429, 'För många försök. Vänta en stund och försök igen.',
           { 'Retry-After': String(limit.retryAfterS) });
@@ -90,6 +92,7 @@ export function createHandlers({ env, source, now = Date.now, log = (m) => conso
       if (typeof body.password !== 'string' || !checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
         return sendError(res, 401, LOGIN_FAILED);
       }
+      loginLimiter.reset(ip); // only failed attempts accumulate
       return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(signSession(env.SESSION_SECRET, now())) });
     } catch (err) {
       return fail(res, err);
@@ -111,7 +114,8 @@ export function createHandlers({ env, source, now = Date.now, log = (m) => conso
   async function status(req, res) {
     if (!configured(res)) return;
     if (req.method !== 'GET') return sendError(res, 405, 'Metoden stöds inte');
-    if (!authed(req)) return sendError(res, 401, 'Inte inloggad');
+    // The demo flag only lets the login page show the demo password hint.
+    if (!authed(req)) return sendJson(res, 401, demo ? { error: 'Inte inloggad', demo: true } : { error: 'Inte inloggad' });
     try {
       const src = source();
       const [ordersText, historyText, seenText, commit] = await Promise.all([

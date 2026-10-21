@@ -103,6 +103,15 @@ test('login is rate limited after 5 attempts per IP', async () => {
   assert.equal(other.statusCode, 200);
 });
 
+test('successful logins do not use up the attempt budget', async () => {
+  const { h } = setup();
+  for (let i = 0; i < 8; i++) {
+    const r = res();
+    await h.login(req({ body: { password: 'test-password' }, ip: '10.7.7.7' }), r);
+    assert.equal(r.statusCode, 200);
+  }
+});
+
 test('a weak secret or missing password refuses to serve', async () => {
   for (const e of [{ ...env, SESSION_SECRET: 'short' }, { ...env, SESSION_SECRET: undefined }, { ...env, DASHBOARD_PASSWORD: '' }]) {
     const { h } = setup({ envOverride: e });
@@ -251,7 +260,7 @@ test('demo mode needs DEMO=1 and is never enabled on Vercel', async () => {
   assert.ok(s.json.history.some((r) => r.failed));
   const v = s.json.orders.filter((o) => o.status === 'ordered').map((o) => o.verification.state);
   assert.ok(v.includes('verified') && v.includes('unverified'));
-  const prod = buildHandlers({ DEMO: '1', VERCEL: '1' });
+  const prod = buildHandlers({ DEMO: '1', VERCEL: '1' }, { log: () => {} });
   const refused = res();
   await prod.login(req({ body: { password: 'demo' } }), refused);
   assert.equal(refused.statusCode, 500, 'no demo password on Vercel');

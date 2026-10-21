@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  <title>MECA-agenten</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Hoppa till innehållet</a>
+
+  <header class="bar">
+    <div class="bar-inner">
+      <p class="brand"><span class="brand-mark" aria-hidden="true"></span>MECA-agenten</p>
+      <div class="bar-actions" id="bar-actions" hidden>
+        <button type="button" class="btn btn-quiet" id="refresh">Uppdatera</button>
+        <button type="button" class="btn btn-quiet" id="logout">Logga ut</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="login" id="login-view" hidden aria-labelledby="login-title">
+      <form class="login-card" id="login-form" novalidate>
+        <h1 id="login-title">Logga in</h1>
+        <p class="muted">Översikt över bokningar och delbeställningar. Godkännanden görs fortfarande i Telegram.</p>
+        <p class="demo-note" id="demo-note" hidden>Demoläge: lösenordet är <code>demo</code>.</p>
+        <label for="password">Lösenord</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+        <p class="form-error" id="login-error" role="alert"></p>
+        <button type="submit" class="btn btn-primary" id="login-submit">Logga in</button>
+      </form>
+    </section>
+
+    <div class="dash" id="dash-view" hidden>
+      <section class="overview" aria-labelledby="headline">
+        <div id="freshness"></div>
+        <h1 id="headline" class="headline"></h1>
+        <div id="tiles"></div>
+        <p class="sr-only" id="announce" aria-live="polite"></p>
+      </section>
+
+      <div class="columns">
+        <section class="panel orders-panel" aria-labelledby="orders-title">
+          <div class="panel-head">
+            <h2 id="orders-title">Delbeställningar</h2>
+            <span class="muted small" id="orders-count"></span>
+          </div>
+          <div id="orders"></div>
+        </section>
+
+        <aside class="side">
+          <section class="panel" aria-labelledby="lastrun-title">
+            <h2 id="lastrun-title">Senaste körning</h2>
+            <div id="lastrun"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="history-title">
+            <h2 id="history-title">Körhistorik</h2>
+            <div id="history"></div>
+          </section>
+
+          <section class="panel" aria-labelledby="run-title">
+            <h2 id="run-title">Kör nu</h2>
+            <p class="muted small">Startar workflowen på GitHub direkt i stället för att vänta på schemat.</p>
+            <div class="run-buttons">
+              <button type="button" class="btn btn-outline" data-workflow="approve">Kör godkännande nu</button>
+              <button type="button" class="btn btn-outline" data-workflow="bookings">Kör bokningskontroll nu</button>
+            </div>
+            <p class="run-status" id="run-status" aria-live="polite"></p>
+          </section>
+        </aside>
+      </div>
+
+      <p class="foot muted small" id="foot"></p>
+    </div>
+
+    <p class="load-error" id="load-error" role="alert" hidden></p>
+  </main>
+
+  <dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="confirm-actions">
+        <button class="btn btn-quiet" value="cancel">Avbryt</button>
+        <button class="btn btn-primary" value="ok" id="confirm-ok">Starta</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

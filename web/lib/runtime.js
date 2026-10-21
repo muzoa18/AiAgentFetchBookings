@@ -13,12 +13,13 @@ export function isDemo(env = process.env) {
   return env.DEMO === '1' && !env.VERCEL;
 }
 
-export function buildHandlers(env = process.env) {
+export function buildHandlers(env = process.env, { log } = {}) {
   if (isDemo(env)) {
     return createHandlers({
       env: { DASHBOARD_PASSWORD: DEMO_PASSWORD, SESSION_SECRET: DEMO_SECRET },
       source: () => createDemoSource(),
       demo: true,
+      log,
     });
   }
   let github = null;
@@ -30,6 +31,7 @@ export function buildHandlers(env = process.env) {
       });
       return github;
     },
+    log,
   });
 }
 
