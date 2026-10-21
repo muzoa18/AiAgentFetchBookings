@@ -214,6 +214,71 @@ def test_unmatched_part_blocks_whole_booking(tg, orders_file):
     _assert_no_pii(orders_file)
 
 
+# ── Task 6b: search terms tried in order ─────────────────────────────────────
+
+FRONT = {"title": "Bromsskiva Bosch fram", "brand": "", "price_sek": 500.0, "url_or_id": "sku-f",
+         "article_nr": "1025-F1", "in_stock": True, "placement": "fram"}
+REAR = {"title": "Bromsskiva Bosch bak", "brand": "", "price_sek": 450.0, "url_or_id": "sku-r",
+        "article_nr": "1025-R1", "in_stock": True, "placement": "bak"}
+DISC_BOOKING = {**BOOKING, "parts": [{"name": "Bromsskivor fram", "qty": "2"}], "fluids": []}
+
+
+def _searched(portal):
+    return [c[1] for c in portal.calls if c[0] == "search"]
+
+
+def test_second_term_tried_when_first_has_no_candidates(tg, orders_file):
+    portal = FakePortal(catalogue={"bromsskiva": [], "Bromsskivor fram": [FRONT]})
+
+    assert parts_order.plan_and_stage(CONFIG, DISC_BOOKING, portal, APPROVE, confident) == "pending"
+
+    assert _searched(portal) == ["bromsskiva", "Bromsskivor fram"]
+    assert ("add_to_cart", "sku-f", 2) in portal.calls
+    plan = orders_state.get("B1")["plan"]
+    assert plan["parts"][0]["url_or_id"] == "sku-f"
+    assert plan["parts"][0]["name"] == "Bromsskivor fram"
+    assert plan["expected_lines"] == [{"title": "Bromsskiva Bosch fram", "qty": 2, "url_or_id": "sku-f"}]
+
+
+def test_second_term_tried_when_first_candidates_are_rejected(tg):
+    seen = []
+
+    def picker(line, ranked):
+        seen.append([c["url_or_id"] for c in ranked])
+        return 0, 0.95
+
+    portal = FakePortal(catalogue={"bromsskiva": [REAR], "Bromsskivor fram": [REAR, FRONT]})
+
+    assert parts_order.plan_and_stage(CONFIG, DISC_BOOKING, portal, APPROVE, picker) == "pending"
+
+    assert _searched(portal) == ["bromsskiva", "Bromsskivor fram"]
+    assert seen == [["sku-f"]]  # the rear disc never reached the picker
+    assert [c for c in portal.calls if c[0] == "add_to_cart"] == [("add_to_cart", "sku-f", 2)]
+
+
+def test_first_term_match_stops_the_search(tg):
+    portal = FakePortal(catalogue={"bromsskiva": [FRONT], "Bromsskivor fram": [FRONT]})
+
+    assert parts_order.plan_and_stage(CONFIG, DISC_BOOKING, portal, APPROVE, confident) == "pending"
+
+    assert _searched(portal) == ["bromsskiva"]
+
+
+def test_unmatched_after_all_terms_blocks(tg, orders_file):
+    portal = FakePortal(catalogue={"bromsskiva": [REAR], "Bromsskivor fram": [REAR]})
+
+    assert parts_order.plan_and_stage(CONFIG, DISC_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert _searched(portal) == ["bromsskiva", "Bromsskivor fram"]
+    assert "add_to_cart" not in portal.names()
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"
+    assert rec["plan"]["reason"] == "ingen säker träff för 'Bromsskivor fram'"
+    assert len(tg["sent"]) == 1
+    assert "ingen säker träff för 'Bromsskivor fram'" in tg["sent"][0]
+    _assert_no_pii(orders_file)
+
+
 def test_unconfident_pick_blocks(tg):
     portal = FakePortal()
 

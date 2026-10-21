@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 import notifier
 import orders_state
-from parts_matcher import choose, is_fluid
+from parts_matcher import choose, is_fluid, search_terms
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, order_body,
                                  parse_qty, prepare_section, total_problem)
 from rules import Rules
@@ -170,7 +170,11 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
 
     matched = []
     for line, name, qty in wanted:  # match everything before adding anything
-        candidate = choose(line, portal.search(name), rules, picker)
+        candidate = None
+        for term in search_terms(name):  # normalised term first, the original name last
+            candidate = choose(line, portal.search(term), rules, picker)
+            if candidate is not None:
+                break
         if candidate is None:
             return _block(config, booking, f"ingen säker träff för '{name}'", fluids)
         matched.append((name, candidate, qty))

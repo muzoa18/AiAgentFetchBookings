@@ -52,6 +52,91 @@ def _norm(value) -> str:
     return re.sub(r"[\s\-_]+", "", text.lower())
 
 
+def has_non_latin(value) -> bool:
+    """True if any letter is outside the Latin script (homoglyphs such as a Cyrillic "р")."""
+    return any(ch.isalpha() and not unicodedata.name(ch, "").startswith("LATIN")
+               for ch in str(value or ""))
+
+
+# Whole words only (compared per token), so "Bakgrund"/"Höjd" never count as placement.
+AXLE_WORDS = {
+    "fram": "fram", "främre": "fram", "framaxel": "fram", "front": "fram",
+    "bak": "bak", "bakre": "bak", "bakaxel": "bak", "rear": "bak", "back": "bak",
+}
+SIDE_WORDS = {
+    "vä": "vä", "vänster": "vä", "vänstra": "vä", "left": "vä",
+    "hö": "hö", "höger": "hö", "högra": "hö", "right": "hö",
+}
+
+
+def _words(value) -> list[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.findall(r"\w+", text)
+
+
+def placement_of(*texts) -> tuple[set[str], set[str]]:
+    """(axles, sides) stated anywhere in the given texts, e.g. ({"fram"}, {"vä"})."""
+    words = [w for t in texts for w in _words(t)]
+    return ({AXLE_WORDS[w] for w in words if w in AXLE_WORDS},
+            {SIDE_WORDS[w] for w in words if w in SIDE_WORDS})
+
+
+def _placement_filter(line_name: str, ranked: list[dict]) -> list[dict]:
+    """Keep only candidates whose axle/side agrees with the booking line. Fails closed.
+
+    A line naming an axle (or side) keeps only candidates stating exactly that axle (side);
+    candidates stating none or both are dropped. A line naming none keeps everything unless
+    the candidates disagree among themselves, which is ambiguous ([]). A line naming both
+    axles (or both sides) is ambiguous too.
+    """
+    line_axles, line_sides = placement_of(line_name)
+    if len(line_axles) > 1 or len(line_sides) > 1:
+        return []
+    states = [(c, *placement_of(c.get("placement"), c.get("title"))) for c in ranked]
+    for i, wanted in ((1, line_axles), (2, line_sides)):
+        if wanted:
+            states = [s for s in states if s[i] == wanted]
+        elif len(set().union(*(s[i] for s in states))) > 1:
+            return []
+    return [s[0] for s in states]
+
+
+# Explicit plural -> singular for common part words (only mappings known to be right).
+_SINGULAR = {
+    "bromsskivor": "bromsskiva", "kolvringar": "kolvring", "glödlampor": "glödlampa",
+    "drivremmar": "drivrem",
+}
+_PLACEMENT_TERMS = set(AXLE_WORDS) | set(SIDE_WORDS)
+_QTY_TOKEN = re.compile(r"(?:x\d+|\d+x|\d+st)")
+
+
+def search_terms(line_name) -> list[str]:
+    """Search terms for a booking line: [normalised, original], most specific last.
+
+    normalised = lowercase, quantity ("x2", "2 st") and placement words removed, common
+    plurals made singular. A form equal to the original (ignoring case) gives one term.
+    """
+    original = str(line_name or "").strip()
+    if not original:
+        return []
+    tokens = [t.strip(".:()[]") for t in re.split(r"[\s/,;+&]+", original.casefold())]
+    tokens = [t for t in tokens if t]
+    drop = set()
+    for i, tok in enumerate(tokens):
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if tok in _PLACEMENT_TERMS or _QTY_TOKEN.fullmatch(tok):
+            drop.add(i)
+        elif tok in ("och", "and") and nxt in _PLACEMENT_TERMS:
+            drop.add(i)  # "fram och bak"
+        elif (tok == "x" and nxt.isdigit()) or (tok.isdigit() and nxt == "st"):
+            drop.update((i, i + 1))  # "x 2", "2 st"
+    kept = [_SINGULAR.get(t, t) for i, t in enumerate(tokens) if i not in drop]
+    normalised = " ".join(kept)
+    if not normalised or normalised.casefold() == " ".join(original.split()).casefold():
+        return [original]
+    return [normalised, original]
+
+
 def is_forbidden(cand: dict, rules: Rules) -> bool:
     forbidden = {_norm(b) for b in rules.brand_forbid} | set(ALWAYS_FORBIDDEN)
     forbidden.discard("")  # an empty entry would match everything
@@ -60,13 +145,16 @@ def is_forbidden(cand: dict, rules: Rules) -> bool:
 
 
 def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
-    allowed = [c for c in candidates if not is_forbidden(c, rules)]
+    allowed = [c for c in candidates
+               if not is_forbidden(c, rules)
+               and not any(has_non_latin(c.get(k)) for k in ("title", "brand", "placement"))]
     prefer = [_norm(b) for b in rules.brand_prefer]
 
     def rank(cand: dict) -> int:
-        brand = _norm(cand.get("brand"))
+        # pro.meca.se titles carry the brand ("Bosch Oljefilter, ..."); brand is usually "".
+        haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
         for i, p in enumerate(prefer):
-            if p and p in brand:
+            if p and any(p in h for h in haystacks):
                 return i
         return len(prefer)
 
@@ -74,9 +162,10 @@ def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
 
 
 def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | None:
-    if is_fluid(line.get("name", "")):
+    name = line.get("name", "")
+    if is_fluid(name) or has_non_latin(name):
         return None
-    ranked = rank_candidates(candidates, rules)
+    ranked = _placement_filter(name, rank_candidates(candidates, rules))
     if not ranked:
         return None
     try:
