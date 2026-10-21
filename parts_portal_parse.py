@@ -408,6 +408,17 @@ def is_login_page(html: str) -> bool:
     return parse_html(html).find(id="ShopLoginForm_Login") is not None
 
 
+def is_results_page(html: str) -> bool:
+    """True once a search results page has rendered (its result tabs or header are present)."""
+    root = parse_html(html)
+    return (root.find(cls="search-page__tabs") is not None
+            or root.find(cls="search-page-header") is not None)
+
+
+def is_cart_page(html: str) -> bool:
+    return parse_html(html).find("section", cls="cart-overview-article-table") is not None
+
+
 def current_plate(html: str) -> str | None:
     node = parse_html(html).find(cls="js-current-license-plate-number")
     return (node.text().strip().upper() or None) if node is not None else None

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from parts_portal_parse import (PartsPortalError, PartsPortalPartialAdd, current_plate, extract_order_reference,
-                                is_login_page, linked_tab_id, order_tokens, page_markers, parse_cart,
+                                is_cart_page, is_login_page, is_results_page, linked_tab_id, order_tokens, page_markers, parse_cart,
                                 parse_checkout, parse_qty_text, parse_search_results, parse_sek,
                                 same_lines)
 
@@ -61,6 +61,11 @@ SEL_PLACE_ORDER = "button.checkout-page-place-order__button:has-text('Skicka bes
 
 NAV_TIMEOUT = 45_000
 IDLE_TIMEOUT = 30_000
+# pro.meca.se never becomes network-idle reliably (analytics polling): where a concrete page
+# condition can be checked, network idle is only a short hint and the page is polled instead.
+IDLE_HINT_TIMEOUT = 8_000
+RESULTS_WAIT_S = 45
+POLL_S = 0.5
 QTY_TIMEOUT_S = 15
 MAX_CLEAR_ATTEMPTS = 10
 
@@ -82,6 +87,7 @@ class PartsPortal:
         self._logged_in = False
         self._reg = None            # vehicle currently loaded (the cart is keyed by it)
         self._last_search = None
+        self._clock, self._sleep = time.monotonic, time.sleep   # injectable for tests
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -121,19 +127,40 @@ class PartsPortal:
             raise PartsPortalError("portal is not open (use it as a context manager)")
         return self._page
 
-    def _settle(self):
+    def _settle(self, timeout: int = IDLE_TIMEOUT):
         try:
-            self.page.wait_for_load_state("networkidle", timeout=IDLE_TIMEOUT)
+            self.page.wait_for_load_state("networkidle", timeout=timeout)
         except Exception:
-            log.warning("pro.meca.se did not reach network idle; continuing with checks.")
+            log.info("pro.meca.se did not reach network idle; continuing with checks.")
 
-    def _goto(self, url: str) -> str:
+    def _login_lost(self):
+        self._logged_in, self._reg = False, None
+        return PartsPortalError("pro.meca.se session expired (login form shown)", "login")
+
+    def _poll(self, ready) -> str | None:
+        """Page HTML once ready(html) holds (polled every POLL_S, up to RESULTS_WAIT_S);
+        None when the budget ran out. A login page raises a "login" error at once."""
+        self._settle(IDLE_HINT_TIMEOUT)
+        deadline = self._clock() + RESULTS_WAIT_S
+        while True:
+            html = self.page.content()
+            if is_login_page(html):
+                raise self._login_lost()
+            if ready(html):
+                return html
+            if self._clock() >= deadline:
+                return None
+            self._sleep(POLL_S)
+
+    def _goto(self, url: str, ready=None) -> str:
         self.page.goto(url, timeout=NAV_TIMEOUT)
+        if ready is not None:
+            html = self._poll(ready)
+            return html if html is not None else self.page.content()
         self._settle()
         html = self.page.content()
         if is_login_page(html):
-            self._logged_in, self._reg = False, None
-            raise PartsPortalError("pro.meca.se session expired (login form shown)", "login")
+            raise self._login_lost()
         return html
 
     def _count(self, selector: str) -> int:
@@ -180,24 +207,40 @@ class PartsPortal:
         self.page.fill(SEL_REG_INPUT, reg)
         # Enter, not the submit button: that button is display:none once a vehicle is loaded.
         self.page.press(SEL_REG_INPUT, "Enter")
-        self._settle()
-        url = unquote(self.page.url)
-        shown = current_plate(self.page.content())
-        if "ViewCarOverview-Start" not in url or f"registrationNumber={reg}" not in url \
-                or shown != reg:
+
+        def loaded(html: str) -> bool:
+            url = unquote(self.page.url)
+            return ("ViewCarOverview-Start" in url and f"registrationNumber={reg}" in url
+                    and current_plate(html) == reg)
+
+        if self._poll(loaded) is None:
             raise PartsPortalError(f"vehicle {reg} could not be loaded on pro.meca.se")
         self._reg = reg
         log.info("Vehicle %s loaded.", reg)
 
     # ── Search and cart ──────────────────────────────────────────────────────
 
-    def _run_search(self, term: str) -> str:
+    def _run_search(self, term: str, reload_once: bool = True) -> str:
+        """Search and wait for the real results page of the loaded vehicle.
+
+        If the plate does not show within the budget, the vehicle is loaded again and the
+        search repeated once; only then is the vehicle reported lost."""
         reg = self._require_vehicle()
         self.page.fill(SEL_SEARCH, term)
         self.page.press(SEL_SEARCH, "Enter")
-        self._settle()
-        html = self.page.content()
-        if current_plate(html) != reg:
+        html = self._poll(lambda h: current_plate(h) == reg and is_results_page(h))
+        if html is None:
+            if reload_once:
+                log.warning("Results for %r did not show vehicle %s in time — loading the "
+                            "vehicle again and repeating the search once.", term, reg)
+                try:
+                    self.load_vehicle(reg)
+                except PartsPortalError as e:
+                    if e.code:
+                        raise
+                    raise PartsPortalError(f"vehicle {reg} is no longer loaded after searching "
+                                           "(loading it again failed)", "vehicle_lost") from e
+                return self._run_search(term, reload_once=False)
             raise PartsPortalError(f"vehicle {reg} is no longer loaded after searching",
                                    "vehicle_lost")
         self._last_search = term
@@ -296,7 +339,7 @@ class PartsPortal:
 
     def _cart(self) -> dict:
         reg = self._require_vehicle()
-        cart = parse_cart(self._goto(CART_URL))
+        cart = parse_cart(self._goto(CART_URL, ready=is_cart_page))
         if cart.get("reg_nr") != reg:
             raise PartsPortalError(f"cart page is for {cart.get('reg_nr')!r}, expected {reg}")
         return cart

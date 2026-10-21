@@ -107,11 +107,27 @@ class FakePage:
             raise AssertionError(f"unexpected click {selector}")
 
 
+class FakeClock:
+    """Injected into PartsPortal: sleep() only advances the fake time (tests stay fast)."""
+
+    def __init__(self):
+        self.now, self.sleeps = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def portal_with(page, reg="ABC123"):
     portal = PartsPortal({"parts_portal": {"username": "u", "password": "p"}, "portal": {}})
     portal._page = page
     portal._logged_in = True
     portal._reg = reg
+    portal.clock = FakeClock()
+    portal._clock, portal._sleep = portal.clock.monotonic, portal.clock.sleep
     return portal
 
 
@@ -430,11 +446,18 @@ class AddPage:
         self.close_tab_on_search = False
         self.input_reads, self.input_fails_on_read = 0, None
 
+    url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
+
     def fill(self, selector, value):
-        assert selector == parts_portal.SEL_SEARCH
+        assert selector in (parts_portal.SEL_SEARCH, parts_portal.SEL_REG_INPUT)
         self._typed = value
 
     def press(self, selector, key):
+        if selector == parts_portal.SEL_REG_INPUT:   # wave 4: the vehicle is loaded again
+            self.vehicle_loads = getattr(self, "vehicle_loads", 0) + 1
+            self.url = ("https://pro.meca.se/x/ViewCarOverview-Start?registrationNumber="
+                        + self._typed)
+            return
         self.term = self._typed
         self.searches.append(self.term)
         if self.close_tab_on_search:
@@ -466,6 +489,7 @@ def add_page(monkeypatch):
         page = AddPage(catalogue, in_cart)
         monkeypatch.setattr(parts_portal, "current_plate", lambda html: "ABC123")
         monkeypatch.setattr(parts_portal, "linked_tab_id", lambda html: "t1")
+        monkeypatch.setattr(parts_portal, "is_results_page", lambda html: True, raising=False)
         monkeypatch.setattr(parts_portal, "parse_search_results", lambda html: [
             {"title": f"Del {sku}", "url_or_id": sku} for sku in catalogue.get(page.term, ())])
         return page, portal_with(page)
@@ -615,7 +639,9 @@ def test_vehicle_lost_while_re_searching_has_a_code(add_page, monkeypatch):
     (cand,) = portal.search("Oljefilter")
     portal.search("Luftfilter")
     monkeypatch.setattr(parts_portal, "current_plate", lambda html: "OTHER1")
-    assert _err(portal, cand, 1).code == "vehicle_lost"
+    err = _err(portal, cand, 1)
+    assert err.code == "vehicle_lost"
+    assert page.vehicle_loads == 1          # wave 4: one re-load was tried first
 
 
 def test_no_vehicle_loaded_has_the_vehicle_code():
@@ -760,3 +786,146 @@ def test_stage_lists_a_read_failure_after_a_click_as_maybe_in_the_cart(add_page,
             "(lade 1 av 2, varukorgen uppdaterades inte).") in text
     assert "Kunde inte läggas till" not in text
     assert "SECRET-PAGE-TEXT" not in text
+
+
+
+# ── Wave 4: wait for the real results page; retry a lost vehicle once ───────
+
+SEARCH_RESULTS = (FIXTURES / "meca_search_no_linked.html").read_text(encoding="utf-8")
+MID_LOAD = "<html><head><title>Sök</title></head><body><main>laddar…</main></body></html>"
+OVERVIEW = ("<html><body><header><span class='js-current-license-plate-number'>ABC123</span>"
+            "</header><main>Fordonsöversikt</main></body></html>")
+OVERVIEW_URL = SHOP_URL = ("https://pro.meca.se/INTERSHOP/web/WFS/x/ViewCarOverview-Start"
+                           "?registrationNumber=ABC123")
+
+
+class PollPage:
+    """content() walks through the pages queued by the last Enter press (the last one sticks).
+
+    `searches` holds one list of pages per search press; `overviews` one per vehicle load."""
+
+    def __init__(self, searches, overviews=None):
+        self.search_queue = [list(x) for x in searches]
+        self.overview_queue = [list(x) for x in (overviews or [[OVERVIEW]])]
+        self.pages = [MID_LOAD]
+        self.url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
+        self.searched, self.loads, self.idle_timeouts, self.reads = [], 0, [], 0
+
+    def fill(self, selector, value):
+        self._typed = value
+
+    def press(self, selector, key):
+        if selector == parts_portal.SEL_SEARCH:
+            self.searched.append(self._typed)
+            self.pages = self.search_queue.pop(0) if self.search_queue else [MID_LOAD]
+            self.url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
+        else:
+            assert selector == parts_portal.SEL_REG_INPUT
+            self.loads += 1
+            self.pages = self.overview_queue.pop(0) if self.overview_queue else [OVERVIEW]
+            self.url = OVERVIEW_URL
+
+    def content(self):
+        self.reads += 1
+        return self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+
+    def wait_for_load_state(self, state, timeout=None):
+        self.idle_timeouts.append(timeout)
+
+
+def test_fast_results_page_does_not_wait():
+    page = PollPage([[SEARCH_RESULTS]])
+    portal = portal_with(page)
+
+    assert portal.search("Oljepluggspackning") == []
+
+    assert portal.clock.sleeps == []
+    assert page.loads == 0 and page.searched == ["Oljepluggspackning"]
+    assert all(t <= 10_000 for t in page.idle_timeouts)   # network idle is only a short hint
+
+
+def test_mid_load_page_is_polled_until_the_results_show():
+    page = PollPage([[MID_LOAD, MID_LOAD, SEARCH_RESULTS]])
+    portal = portal_with(page)
+
+    portal.search("Oljepluggspackning")
+
+    assert portal.clock.sleeps == [parts_portal.POLL_S, parts_portal.POLL_S]
+    assert page.loads == 0
+
+
+def test_plate_without_results_page_is_not_enough():
+    plate_only = OVERVIEW  # plate present, but not a results page yet
+    page = PollPage([[plate_only, SEARCH_RESULTS]])
+    portal = portal_with(page)
+
+    portal.search("Oljepluggspackning")
+
+    assert len(portal.clock.sleeps) == 1
+
+
+def test_persistently_missing_plate_reloads_the_vehicle_once_and_repeats_the_search():
+    page = PollPage([[MID_LOAD], [SEARCH_RESULTS]])
+    portal = portal_with(page)
+
+    portal.search("Oljepluggspackning")
+
+    assert page.loads == 1
+    assert page.searched == ["Oljepluggspackning", "Oljepluggspackning"]
+    assert portal._reg == "ABC123" and portal._last_search == "Oljepluggspackning"
+    assert sum(portal.clock.sleeps) >= parts_portal.RESULTS_WAIT_S
+
+
+def test_still_missing_after_one_reload_is_vehicle_lost():
+    page = PollPage([[MID_LOAD], [MID_LOAD], [SEARCH_RESULTS]])
+    portal = portal_with(page)
+
+    with pytest.raises(PartsPortalError) as info:
+        portal.search("Oljepluggspackning")
+
+    assert info.value.code == "vehicle_lost"
+    assert page.loads == 1 and len(page.searched) == 2
+    # two budgets (search, repeated search), no endless polling
+    assert sum(portal.clock.sleeps) <= 2 * parts_portal.RESULTS_WAIT_S + 2 * parts_portal.POLL_S
+
+
+def test_login_page_while_polling_is_a_login_error():
+    page = PollPage([[MID_LOAD, LOGIN_FORM]])
+    portal = portal_with(page)
+
+    with pytest.raises(PartsPortalError) as info:
+        portal.search("Oljepluggspackning")
+
+    assert info.value.code == "login"
+    assert page.loads == 0
+
+
+def test_load_vehicle_waits_for_the_plate():
+    page = PollPage([], overviews=[[MID_LOAD, MID_LOAD, OVERVIEW]])
+    portal = portal_with(page, reg=None)
+
+    portal.load_vehicle("ABC 123")
+
+    assert portal._reg == "ABC123"
+    assert len(portal.clock.sleeps) == 2
+
+
+def test_load_vehicle_that_never_shows_the_plate_fails_after_the_budget():
+    page = PollPage([], overviews=[[MID_LOAD]])
+    portal = portal_with(page, reg=None)
+
+    with pytest.raises(PartsPortalError, match="could not be loaded"):
+        portal.load_vehicle("ABC123")
+    assert portal._reg is None
+    assert sum(portal.clock.sleeps) >= parts_portal.RESULTS_WAIT_S
+
+
+def test_cart_page_is_polled_until_it_shows_the_cart():
+    page = FakePage()
+    portal = portal_with(page)
+    seq = [MID_LOAD, MID_LOAD, CART]
+    page.content = lambda: seq.pop(0) if len(seq) > 1 else seq[0]
+
+    cart = portal.read_cart()
+
+    assert cart["lines"] and len(portal.clock.sleeps) == 2
