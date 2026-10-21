@@ -171,12 +171,12 @@ def _approve(config, session, booking_id, record, rules, cb) -> bool:
     notifier.clear_buttons(config, record["message_id"])
     try:
         portal = session.get()
-    except Exception as e:
+    except Exception:  # already logged by _Portal; its raw text is never shown to the owner
         orders_state.put(booking_id, "failed")
         if not parts_order.send_with_klar(
                 config, booking_id,
-                f"Beställning misslyckades för {_label(booking_id, record)}: {e}. "
-                "Inget beställdes – beställ för hand."):
+                f"Beställning misslyckades för {_label(booking_id, record)}: "
+                "kunde inte öppna pro.meca.se. Inget beställdes – beställ för hand."):
             log.error("Failure message for %s was not delivered.", booking_id)
         return True
     result = parts_order.execute_order(config, portal, booking_id, record["plan"], rules)

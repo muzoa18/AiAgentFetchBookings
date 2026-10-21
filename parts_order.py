@@ -12,6 +12,11 @@ Every resolution message (ordered, blocked, failed, give-up; cancelled and expir
 approve.py) carries a Klar button (send_with_klar). The owner's tap makes approve.py
 mark the booking Hanterad; a booking with parts is never marked Hanterad otherwise.
 
+The cart is never emptied here: when some parts cannot be added, the others stay in the
+cart untouched so the owner can complete the order by hand on pro.meca.se.
+
+Owner-facing text never carries raw exception text (owner_reason); that goes to the log.
+
 pro.meca.se keeps one cart PER VEHICLE, so staging requires the loaded vehicle's cart
 to be empty: a second booking for a vehicle whose cart is in use is blocked rather than
 mixed into the same cart.
@@ -31,7 +36,7 @@ import notifier
 import orders_state
 from parts_matcher import choose, is_fluid, search_terms
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, order_body,
-                                 parse_qty, prepare_section, total_problem)
+                                 owner_reason, parse_qty, prepare_section, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -39,6 +44,11 @@ log = logging.getLogger(__name__)
 GIVE_UP_TEXT = "Försöker inte mer automatiskt för {label} – beställ för hand eller åtgärda orsaken."
 
 KLAR_FALLBACK = "\n(Klar-knappen kunde inte skickas – markera bokningen som Hanterad i portalen.)"
+
+PARTIAL_REASON = "kunde inte lägga alla delar i varukorgen"
+PARTIAL_PROMISE = ("Delarna som lades till ligger kvar orörda i varukorgen på pro.meca.se – "
+                   "komplettera för hand.")
+CART_UNTOUCHED = "Det som redan ligger i varukorgen är orört."
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -133,13 +143,23 @@ def send_with_klar(config: dict, booking_id, text: str) -> bool:
 
 # ── Status endings (each sends a message) ────────────────────────────────────
 
+def _cart_touched(booking_id) -> bool:
+    try:
+        return bool((orders_state.get(booking_id) or {}).get("cart_touched") is True)
+    except Exception:
+        return False
+
+
 def _fail(config: dict, booking_id, label: str, reason: str) -> str:
+    """Record 'failed' and message the owner. `reason` must be owner-safe Swedish text."""
     try:
         orders_state.put(booking_id, "failed")
     except Exception:
         log.exception("Could not record 'failed' for booking %r", booking_id)
-    if not send_with_klar(
-            config, booking_id, f"Delbeställning misslyckades för {label}: {reason}. Beställ för hand."):
+    text = f"Delbeställning misslyckades för {label}: {reason}. Beställ för hand."
+    if _cart_touched(booking_id):
+        text += " " + CART_UNTOUCHED
+    if not send_with_klar(config, booking_id, text):
         log.error("Failure message for %r was not delivered.", booking_id)
     return "failed"
 
@@ -162,7 +182,7 @@ def _block(config: dict, booking: dict, reason: str, fluids: list[dict],
                  "Inget beställdes – beställ för hand."]
         if cart_touched:
             lines.append("Varukorgen på pro.meca.se innehåller delarna – "
-                         "töm den eller beställ därifrån.")
+                         f"töm den eller beställ därifrån. {CART_UNTOUCHED}")
         text = "\n".join(lines + prepare_section(fluids))
     if send_with_klar(config, booking_id, text):
         return "blocked"
@@ -210,7 +230,7 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
         started = orders_state.begin(booking_id)
     except Exception as e:
         log.exception("Cannot start booking %r", booking_id)
-        return _fail(config, booking_id, label, _why(e))  # put fails the same way; logged
+        return _fail(config, booking_id, label, owner_reason(e))  # put fails the same way; logged
     if not started:
         try:
             return orders_state.get(booking_id)["status"]
@@ -221,7 +241,7 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
         status = _stage(config, booking, portal, rules, picker)
     except Exception as e:
         log.exception("Parts ordering failed for %s", booking_id)
-        return _fail(config, booking_id, label, _why(e))
+        return _fail(config, booking_id, label, owner_reason(e))
     if status == "blocked":
         try:
             if give_up_if_capped(config, booking) is False:
@@ -278,8 +298,20 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if matched:
         # Persisted before the first add: a later block or failure must not be retried.
         orders_state.update_fields(booking_id, cart_touched=True)
-    for _, candidate, qty in matched:
-        portal.add_to_cart(candidate, qty)
+    added, not_added = [], []
+    for name, candidate, qty in matched:
+        # Parts are independent: one that cannot be added never stops (or undoes) the others.
+        try:
+            portal.add_to_cart(candidate, qty)
+        except Exception as e:
+            log.warning("Could not add %r (%s) for %s to the cart: %s",
+                        name, candidate.get("url_or_id"), booking_id, _why(e))
+            not_added.append((name, owner_reason(e)))
+        else:
+            added.append((candidate, qty))
+    if not_added:
+        return block(PARTIAL_REASON, cart_touched=True,
+                     text=_partial_text(label, added, not_added, fluids))
 
     # What the cart must contain comes from our choices, never from the cart itself.
     expected = [{"title": c.get("title"), "qty": qty, "url_or_id": c.get("url_or_id")}
@@ -319,6 +351,17 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
                      "godkännandemeddelandet kunde inte skickas (varukorgen är fylld)")
     orders_state.put(booking_id, "pending", message_id=message_id)
     return "pending"
+
+
+def _partial_text(label: str, added: list, not_added: list, fluids: list[dict]) -> str:
+    if added:
+        first = (f"Delbeställning för {label}: i varukorgen: "
+                 + ", ".join(f"{c.get('title')} x{qty}" for c, qty in added) + ".")
+    else:
+        first = f"Delbeställning för {label}: Inget lades i varukorgen."
+    failed = "; ".join(f"{name} ({reason})" for name, reason in not_added)
+    return "\n".join([first, f"Kunde inte läggas till: {failed}.", PARTIAL_PROMISE]
+                     + prepare_section(fluids))
 
 
 # ── Execution (auto mode here, approve mode from the poller) ─────────────────
@@ -369,10 +412,10 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
             log.exception("Could not record 'failed' for booking %r", booking_id)
         if checkout_started:
             tail = f" (ordernummer {ref})" if ref else ""
-            text = (f"Beställning misslyckades för {label}{tail}: {_why(e)}. "
+            text = (f"Beställning misslyckades för {label}{tail}: {owner_reason(e)}. "
                     "Kontrollera pro.meca.se: ordern kan ha lagts.")
         else:
-            text = (f"Beställning misslyckades för {label}: {_why(e)}. "
+            text = (f"Beställning misslyckades för {label}: {owner_reason(e)}. "
                     "Inget beställdes – beställ för hand.")
         if not send_with_klar(config, booking_id, text):
             log.error("Failure message for %s was not delivered.", booking_id)

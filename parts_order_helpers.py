@@ -9,9 +9,33 @@ import math
 from collections import Counter
 
 from parts_matcher import has_non_latin, is_fluid, is_forbidden
+from parts_portal_parse import PartsPortalError
 from rules import Rules
 
 PREPARE_HEADER = "Förbered (finns på lager):"
+
+TECHNICAL = "tekniskt fel (se loggen)"
+# PartsPortalError message fragments -> short Swedish text for the owner. The raw
+# exception text (page text, English internals) only ever goes to the log.
+_PORTAL_REASONS = (
+    (("not found among linked parts", "not on the current page"),
+     "delen finns inte bland delarna som passar bilen"),
+    (("already in the cart",), "delen låg redan i varukorgen"),
+    (("no cart update seen", "did not reach", "cart update for", "quantity of"),
+     "varukorgen uppdaterades inte"),
+    (("no longer loaded",), "fordonet försvann från sidan"),
+    (("login", "not logged in"), "inloggningen på pro.meca.se misslyckades"),
+)
+
+
+def owner_reason(exc: BaseException) -> str:
+    """A short Swedish summary of a failure, safe to show the owner."""
+    if isinstance(exc, PartsPortalError):
+        text = str(exc)
+        for fragments, reason in _PORTAL_REASONS:
+            if any(f in text for f in fragments):
+                return reason
+    return TECHNICAL
 
 
 def parse_qty(raw) -> int | None:

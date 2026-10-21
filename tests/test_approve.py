@@ -1097,3 +1097,20 @@ def test_daily_run_is_clear_of_the_approval_poll():
     assert approve_on["schedule"] == [{"cron": "0 6 * * *"}]  # 9 h away from the daily run
     text = (REPO / ".github" / "workflows" / "bookings.yml").read_text(encoding="utf-8")
     assert "15:00 UTC" in text and "17:00" in text and "16:00" in text
+
+
+# ── Fix wave: raw exception text never reaches the owner ─────────────────────
+
+def test_portal_open_failure_message_has_no_raw_exception_text(tg, run_main):
+    stage()
+
+    def factory():
+        raise RuntimeError("SECRET-PAGE-TEXT Chromium exploded")
+
+    tg["updates"] = [tap(5)]
+    assert run_main(factory) == 1
+
+    (text,) = tg["sent"]
+    assert "SECRET-PAGE-TEXT" not in text
+    assert text.startswith("Beställning misslyckades för OLRD-3630: kunde inte öppna pro.meca.se.")
+    assert status() == "failed"
