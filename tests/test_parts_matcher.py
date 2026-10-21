@@ -1,10 +1,12 @@
 import json
+import unicodedata
 from types import SimpleNamespace
 
 import pytest
 
 import parts_matcher
-from parts_matcher import PICK_MODEL, choose, is_fluid, make_claude_picker, rank_candidates, search_terms
+from parts_matcher import (PICK_MODEL, SEARCH_SYNONYMS, choose, is_fluid, make_claude_picker, rank_candidates,
+                           search_terms)
 from rules import Rules
 
 RULES = Rules(brand_prefer=("Bosch", "Mann"), brand_forbid=("ProMeister",), ceiling_sek=10000, mode="approve")
@@ -610,3 +612,52 @@ def test_fettinsats_is_still_treated_as_a_fluid():
     # Documented decision (fail closed): Swedish "fett" stays a substring match, so
     # "Fettinsats" (grease insert/cartridge? not certain) keeps blocking.
     assert is_fluid("Fettinsats")
+
+
+# ── Wave 2 Task 11: search synonyms (Pollenfilter = Kupéfilter) ───────────────
+
+def test_search_synonyms_constant():
+    assert SEARCH_SYNONYMS == {"pollenfilter": ("kupéfilter", "kupefilter"),
+                               "kupefilter": ("kupéfilter",), "kupéfilter": ("kupefilter",)}
+
+
+def test_pollenfilter_searches_kupefilter_first_original_last():
+    terms = search_terms("Pollenfilter")
+    assert terms == ["kupéfilter", "kupefilter", "Pollenfilter"]
+    assert terms[0] == "kupéfilter" and terms[-1].casefold() == "pollenfilter"
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Pollenfilter fram x2", ["kupéfilter", "kupefilter", "pollenfilter", "Pollenfilter fram x2"]),
+    ("POLLENFILTER 2 st", ["kupéfilter", "kupefilter", "pollenfilter", "POLLENFILTER 2 st"]),
+    ("Kupéfilter", ["kupefilter", "Kupéfilter"]),
+    ("Kupefilter x1", ["kupéfilter", "kupefilter", "Kupefilter x1"]),
+    ("pollenfilter aktivt kol", ["kupéfilter aktivt kol", "kupefilter aktivt kol", "pollenfilter aktivt kol"]),
+    ("Pollenfilter aktivt kol fram", ["kupéfilter aktivt kol", "kupefilter aktivt kol",
+                                      "pollenfilter aktivt kol", "Pollenfilter aktivt kol fram"]),
+])
+def test_synonyms_after_quantity_and_placement_removal(name, expected):
+    assert search_terms(name) == expected
+
+
+def test_decomposed_accent_still_matches_synonym():
+    decomposed = unicodedata.normalize("NFD", "Kupéfilter")
+    assert search_terms(decomposed)[0] == "kupefilter"
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Oljefilter", ["Oljefilter"]),
+    ("Bromsskivor fram x2", ["bromsskiva", "Bromsskivor fram x2"]),
+    ("Kupé lampa", ["Kupé lampa"]),           # only whole words are replaced
+    ("Pollenfiltret", ["Pollenfiltret"]),
+])
+def test_unrelated_words_unaffected_by_synonyms(name, expected):
+    assert search_terms(name) == expected
+
+
+@pytest.mark.parametrize("name", ["Pollenfilter", "Pollenfilter fram x2", "Kupéfilter",
+                                  "kupefilter kupéfilter", "pollenfilter aktivt kol"])
+def test_synonym_terms_unique_and_non_empty(name):
+    terms = search_terms(name)
+    assert all(t and t == t.strip() for t in terms)
+    assert len({t.casefold() for t in terms}) == len(terms)

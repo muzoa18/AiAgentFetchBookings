@@ -131,20 +131,32 @@ _SINGULAR = {
     "bromsskivor": "bromsskiva", "kolvringar": "kolvring", "glödlampor": "glödlampa",
     "drivremmar": "drivrem",
 }
+# Search synonyms, keyed by the normalised (lowercase, NFC) word or phrase. Owner rule
+# (Wave 2): Pollenfilter = Kupéfilter. pro.meca.se returns NOTHING for "pollenfilter";
+# it files these parts as "Kupéfilter", so that word is searched first. The unaccented
+# spelling is searched too, in case the shop's search does not fold accents.
+SEARCH_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "pollenfilter": ("kupéfilter", "kupefilter"),
+    "kupefilter": ("kupéfilter",),
+    "kupéfilter": ("kupefilter",),
+}
 _PLACEMENT_TERMS = set(AXLE_WORDS) | set(SIDE_WORDS)
 _QTY_TOKEN = re.compile(r"(?:x\d+|\d+x|\d+st)")
 
 
 def search_terms(line_name) -> list[str]:
-    """Search terms for a booking line: [normalised, original], most specific last.
+    """Search terms for a booking line: [synonyms..., normalised, original], most specific last.
 
     normalised = lowercase, quantity ("x2", "2 st") and placement words removed, common
     plurals made singular. A form equal to the original (ignoring case) gives one term.
+    SEARCH_SYNONYMS are applied to the normalised form (the whole phrase, then each word in
+    place) and searched first. Duplicates (ignoring case) are dropped.
     """
     original = str(line_name or "").strip()
     if not original:
         return []
-    tokens = [t.strip(".:()[]-") for t in re.split(r"[\s/,;+&]+", original.casefold())]
+    folded = unicodedata.normalize("NFC", original).casefold()
+    tokens = [t.strip(".:()[]-") for t in re.split(r"[\s/,;+&]+", folded)]
     tokens = [t for t in tokens if t]
     drop = set()
     for i, tok in enumerate(tokens):
@@ -157,9 +169,19 @@ def search_terms(line_name) -> list[str]:
             drop.update((i, i + 1))  # "x 2", "2 st"
     kept = [_SINGULAR.get(t, t) for i, t in enumerate(tokens) if i not in drop]
     normalised = " ".join(kept)
-    if not normalised or normalised.casefold() == " ".join(original.split()).casefold():
+    if not normalised:
         return [original]
-    return [normalised, original]
+    synonyms = list(SEARCH_SYNONYMS.get(normalised, ()))
+    for i, tok in enumerate(kept):
+        synonyms += [" ".join(kept[:i] + [syn] + kept[i + 1:]) for syn in SEARCH_SYNONYMS.get(tok, ())]
+    same = normalised == " ".join(folded.split())
+    terms, seen = [], set()
+    for term in synonyms + ([] if same else [normalised]) + [original]:
+        key = unicodedata.normalize("NFC", term).casefold()
+        if term and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return terms
 
 
 def is_forbidden(cand: dict, rules: Rules) -> bool:
