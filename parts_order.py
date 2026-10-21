@@ -36,11 +36,12 @@ from datetime import datetime, timezone
 import notifier
 import orders_state
 from logsafe import describe
+from order_match import clean_vehicle_model
 from parts_matcher import choose, is_fluid, search_terms
 from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
                                  is_transient, order_body, owner_reason, parse_qty,
-                                 prepare_section, total_problem)
+                                 prepare_section, reference_line, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -298,6 +299,9 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     detail_url = booking.get("detail_url")
     if isinstance(detail_url, str) and detail_url.strip():
         fields["detail_url"] = detail_url.strip()
+    vehicle_model = clean_vehicle_model(booking.get("vehicle"))
+    if vehicle_model:  # the car model only, for the order checker (approve.py)
+        fields["vehicle_model"] = vehicle_model
     if fields:  # cart_touched=False marks the record as not legacy (orders_state.restage)
         orders_state.update_fields(booking_id, **fields)
     order_lines, fluids = split_lines(booking)
@@ -489,7 +493,7 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
             log.error("Failure message for %s was not delivered.", booking_id)
         return "failed"
 
-    text = "\n".join([f"Beställd: {label} ({plan.get('reg_nr')})", f"Ordernummer: {ref}", ""]
+    text = "\n".join([f"Beställd: {label} ({plan.get('reg_nr')})", reference_line(ref), ""]
                      + order_body(plan.get("parts") or [], plan.get("total_sek"),
                                   plan.get("fluids") or []))
     try:

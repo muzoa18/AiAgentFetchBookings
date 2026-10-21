@@ -38,7 +38,9 @@ jobs:
           cache: pip
 
       # Stdlib only: nothing installed yet. Most runs stop here. has_pending is
-      # true for an order awaiting approval or an outstanding Klar button.
+      # true for an order awaiting approval, an outstanding Klar button, or a
+      # placed order the order checker has not yet found in pro.meca.se
+      # "Skickade Beställningar" (and not yet warned about).
       - name: Anything pending?
         id: check
         run: python approve.py --check

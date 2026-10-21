@@ -14,6 +14,7 @@ import notifier
 import orders_state
 import parts_order
 import rules
+from parts_portal_parse import PartsPortalError
 from rules import Rules
 
 REPO = Path(__file__).resolve().parent.parent
@@ -207,6 +208,7 @@ def status(booking_id="B1"):
 
 def test_nothing_pending_exits_without_telegram_call(monkeypatch, tmp_path):
     orders_state.put("B9", "ordered", plan={"booking_id": "B9"})
+    orders_state.update_fields("B9", verified_at=T0.isoformat())   # nothing left to verify
 
     def forbidden(*a, **k):
         raise AssertionError("must not be called when nothing is pending")
@@ -962,7 +964,7 @@ def test_klar_exception_is_isolated_and_offset_advances(tg, hanterad, monkeypatc
 
 def test_check_true_for_outstanding_klar_false_after_handled(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    resolved()
+    resolved(status_="cancelled")             # an 'ordered' one would also await the checker
 
     assert approve.main(["--check"]) == 0
     assert "has_pending=true" in capsys.readouterr().out
@@ -997,7 +999,7 @@ def test_check_with_only_an_outstanding_klar_is_stdlib_only(tmp_path):
 
 
 def test_main_exits_early_when_only_handled_klar_records_exist(monkeypatch):
-    resolved(handled=True)
+    resolved(handled=True, verified_at=T0.isoformat())   # and the order checker is done
 
     def forbidden(*a, **k):
         raise AssertionError("must not be called")
@@ -1161,7 +1163,7 @@ def _klar_sent(days_ago, booking_id="B1", **fields):
 
 
 def test_expired_klar_is_closed_once_with_a_notice(tg, hanterad, run_main, monkeypatch, capsys):
-    _klar_sent(15)
+    _klar_sent(15, verified_at=T0.isoformat())       # the order checker is already done
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     assert approve.main(["--check"]) == 0            # the run must happen once to close it
     assert "has_pending=true" in capsys.readouterr().out
@@ -1213,3 +1215,293 @@ def test_handled_or_closed_records_get_no_expiry_notice(tg, run_main):
 
     assert run_main(PortalFactory(allowed=False)) == 0
     assert tg["sent"] == [] and tg["cleared"] == []
+
+
+# ── Task 14: the order checker (Skickade Beställningar) ──────────────────────
+
+RIO = "KIA, Rio Kombi-sedan (III), 12-16"
+ASTRA = "OPEL, Astra Sports Tourer (J), 10-16"
+
+
+def today() -> str:
+    return approve._local_date(datetime.now(timezone.utc)).isoformat()
+
+
+def sent_row(supplier_no, model, numbers, day=None, reg=""):
+    return {"supplier_no": supplier_no, "status": "", "date": day or today(), "reg_nr": reg,
+            "model": model, "order_numbers": numbers, "order_status": "Bekräftad"}
+
+
+ROWS = [sent_row("90000001", "", ""),
+        sent_row("90000002", RIO, "01000011/01000012"),
+        sent_row("90000004", ASTRA, "01000031/01000032"),
+        sent_row("90000005", ASTRA, "01000041/01000042")]
+
+
+class SentPortal:
+    """Only list_sent_orders: the checker must never touch carts, vehicles or checkout."""
+
+    def __init__(self, rows=ROWS, error=None):
+        self.rows, self.error, self.calls = rows, error, []
+
+    def login(self):
+        self.calls.append("login")
+
+    def list_sent_orders(self):
+        self.calls.append("list_sent_orders")
+        if self.error is not None:
+            raise self.error
+        return [dict(r) for r in self.rows]
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the order checker must not use portal.{name}")
+
+
+def placed(booking_id="B1", model="KIARIO (III)(2014)", age=timedelta(hours=1),
+           booking_nr="OLRD-0001", confirmation="UNVERIFIED-20261021T123728Z", **fields):
+    """An 'ordered' record as execute_order leaves it (Klar already handled)."""
+    orders_state.put(booking_id, "ordered",
+                     plan={**plan_for(booking_id, booking_nr), "confirmation": confirmation})
+    extra = {"handled": True, **fields}
+    if model is not None:
+        extra["vehicle_model"] = model
+    orders_state.update_fields(booking_id, **extra)
+    data = json.loads(orders_state.ORDERS_FILE.read_text(encoding="utf-8"))
+    data["bookings"][booking_id]["updated_at"] = (datetime.now(timezone.utc) - age).isoformat()
+    orders_state.ORDERS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def check_output(capsys) -> str:
+    assert approve.main(["--check"]) == 0
+    return capsys.readouterr().out.strip()
+
+
+def test_verified_order_is_stored_and_reported_once(tg, run_main, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    placed()
+    assert check_output(capsys) == "has_pending=true"
+    factory = PortalFactory(SentPortal())
+
+    assert run_main(factory) == 0
+
+    record = orders_state.get("B1")
+    assert record["verified_numbers"] == "90000002 · 01000011/01000012"
+    assert orders_state._parse_time(record["verified_at"]) is not None
+    assert record["status"] == "ordered"
+    assert record["plan"]["confirmation"] == "UNVERIFIED-20261021T123728Z"   # untouched
+    assert tg["sent"] == [f"Beställning verifierad: OLRD-0001 – {RIO}, ordernummer 90000002 "
+                          "(01000011/01000012)."]
+    assert tg["klar"] == []                       # a plain message, no Klar button
+    assert factory.portal.calls == ["list_sent_orders"]
+    assert orders_state.unverified_orders() == []
+    assert check_output(capsys) == "has_pending=false"
+
+    assert run_main(PortalFactory(allowed=False)) == 0      # nothing left: early exit
+    assert len(tg["sent"]) == 1
+
+
+def test_verified_message_undelivered_exits_1_but_the_state_is_saved(tg, run_main):
+    placed()
+    tg["send_ok"] = False
+    assert run_main(PortalFactory(SentPortal())) == 1
+    assert orders_state.get("B1")["verified_numbers"] == "90000002 · 01000011/01000012"
+
+
+def test_ambiguous_rows_are_reported_once_and_never_picked(tg, run_main, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    placed(model="OPELASTRA (J)(2012)")
+    assert run_main(PortalFactory(SentPortal())) == 0
+
+    record = orders_state.get("B1")
+    assert "verified_at" not in record and record["verify_warned"] is True
+    assert tg["sent"] == [f"Flera ordrar för {ASTRA} i Skickade Beställningar – kontrollera "
+                          "vilken som är OLRD-0001: 90000004 (01000031/01000032), "
+                          "90000005 (01000041/01000042)."]
+    assert check_output(capsys) == "has_pending=false"
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert len(tg["sent"]) == 1
+
+
+def test_ambiguous_list_is_capped_at_five(tg, run_main):
+    rows = [sent_row(f"9000001{i}", ASTRA, f"0100{i}") for i in range(7)]
+    placed(model="OPELASTRA (J)")
+    run_main(PortalFactory(SentPortal(rows)))
+    (text,) = tg["sent"]
+    assert text.count("9000001") == 5 and "90000015" not in text
+
+
+def test_ambiguous_message_undelivered_is_retried(tg, run_main):
+    placed(model="OPELASTRA (J)")
+    tg["send_ok"] = False
+    assert run_main(PortalFactory(SentPortal())) == 1
+    assert "verify_warned" not in orders_state.get("B1")
+
+
+def test_not_found_is_silent_for_three_days(tg, run_main, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    placed(model="KIANIRO (I)", age=timedelta(days=2, hours=23))
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert tg["sent"] == []
+    assert "verify_warned" not in orders_state.get("B1")
+    assert check_output(capsys) == "has_pending=true"       # polled again on the next run
+
+
+def test_not_found_after_three_days_warns_once(tg, run_main, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    placed(model="KIANIRO (I)", age=timedelta(days=3, minutes=1))
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert tg["sent"] == ["Kunde inte verifiera beställningen för OLRD-0001 i Skickade "
+                          "Beställningar efter 3 dagar – kontrollera i portalen."]
+    assert orders_state.get("B1")["verify_warned"] is True
+    assert check_output(capsys) == "has_pending=false"
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert len(tg["sent"]) == 1
+
+
+def test_warning_undelivered_exits_1_and_is_retried(tg, run_main):
+    placed(model="KIANIRO (I)", age=timedelta(days=4))
+    tg["send_ok"] = False
+    assert run_main(PortalFactory(SentPortal())) == 1
+    assert "verify_warned" not in orders_state.get("B1")
+
+
+def test_no_model_and_no_registration_never_opens_the_portal(tg, run_main, monkeypatch):
+    placed(model=None)
+    data = json.loads(orders_state.ORDERS_FILE.read_text(encoding="utf-8"))
+    data["bookings"]["B1"]["plan"]["reg_nr"] = None
+    orders_state.ORDERS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert tg["sent"] == []
+
+
+def test_no_model_record_warns_after_three_days(tg, run_main):
+    placed(model=None, age=timedelta(days=5))
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert tg["sent"] == ["Kunde inte verifiera beställningen för OLRD-0001 i Skickade "
+                          "Beställningar efter 3 dagar – kontrollera i portalen."]
+
+
+def test_no_model_record_is_verified_by_its_registration(tg, run_main):
+    rows = ROWS + [sent_row("90000009", "KIA, Rio (III), 12-16", "01000091/01000092",
+                            reg="TST001")]
+    placed(model=None)                     # the live record from before vehicle_model existed
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert orders_state.get("B1")["verified_numbers"] == "90000009 · 01000091/01000092"
+
+
+def test_numbers_verified_for_another_record_are_not_claimed_twice(tg, run_main):
+    placed("B0", booking_nr="OLRD-0000",
+           verified_at="2026-10-21T15:00:00+00:00",
+           verified_numbers="90000002 · 01000011/01000012")
+    placed("B1")
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert "verified_at" not in orders_state.get("B1") and tg["sent"] == []
+
+
+def test_two_orders_share_one_portal_session(tg, run_main):
+    placed("B1")
+    placed("B2", booking_nr="OLRD-0002", model="KIANIRO (I)")
+    factory = PortalFactory(SentPortal())
+    assert run_main(factory) == 0
+    assert factory.opened == 1 and factory.portal.calls == ["list_sent_orders"]
+    assert len(tg["sent"]) == 1 and "OLRD-0001" in tg["sent"][0]
+
+
+def test_rows_older_than_the_order_are_ignored(tg, run_main):
+    old = [sent_row("90000002", RIO, "01000011/01000012", day="2020-01-01")]
+    placed()
+    assert run_main(PortalFactory(SentPortal(old))) == 0
+    assert tg["sent"] == []
+
+
+@pytest.mark.parametrize("error", [
+    PartsPortalError("SECRET-PAGE-TEXT 0701234567 kund@example.com", "search_timeout"),
+    RuntimeError("SECRET-PAGE-TEXT 0701234567 kund@example.com"),
+])
+def test_portal_errors_are_logged_masked_and_retried_silently(tg, run_main, caplog, error):
+    placed()
+    with caplog.at_level("INFO"):
+        assert run_main(PortalFactory(SentPortal(error=error))) == 0
+    assert tg["sent"] == []
+    assert "verified_at" not in orders_state.get("B1")
+    assert "SECRET-PAGE-TEXT" not in caplog.text and "0701234567" not in caplog.text
+    assert "kund@example.com" not in caplog.text
+
+
+def test_portal_that_cannot_open_is_retried_silently(tg, run_main):
+    placed()
+    assert run_main(PortalFactory(open_fails=True)) == 0
+    assert tg["sent"] == []
+
+
+def test_portal_error_still_gives_the_three_day_warning(tg, run_main):
+    placed(age=timedelta(days=3, hours=1))
+    assert run_main(PortalFactory(SentPortal(error=RuntimeError("down")))) == 0
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Kunde inte verifiera")
+
+
+def test_checker_crash_never_breaks_the_run(tg, run_main, monkeypatch):
+    placed()
+
+    def broken(*a, **k):
+        raise RuntimeError("checker broke")
+
+    monkeypatch.setattr(approve, "_verify_orders", broken)
+    tg["updates"] = []
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert tg["offsets"] == [None]                    # the taps were still polled
+
+
+def test_checker_runs_after_an_approval_in_the_same_session(tg, run_main):
+    stage()
+    tg["updates"] = [tap(1)]
+
+    class Both(FakePortal):
+        def list_sent_orders(self):
+            self.calls.append("list_sent_orders")
+            return []
+
+    factory = PortalFactory(Both())
+    assert run_main(factory) == 0
+    assert status() == "ordered" and factory.opened == 1
+    assert factory.portal.calls[-1] == "list_sent_orders"
+
+
+def test_check_is_true_for_an_unverified_order_only_until_warned(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    placed()
+    assert check_output(capsys) == "has_pending=true"
+    orders_state.update_fields("B1", verify_warned=True)
+    assert check_output(capsys) == "has_pending=false"
+
+
+def test_check_with_only_an_unverified_order_is_stdlib_only(tmp_path):
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "orders.json").write_text(json.dumps(
+        {"last_update_id": None, "bookings": {"B1": {
+            "status": "ordered", "plan": {"confirmation": "UNVERIFIED-20261021T123728Z"},
+            "message_id": 77, "handled": True, "updated_at": T0.isoformat()}}}),
+        encoding="utf-8")
+    code = (
+        "import sys, approve\n"
+        "rc = approve.main(['--check'])\n"
+        "heavy = [m for m in ('playwright', 'anthropic', 'yaml', 'notifier', 'rules',\n"
+        "         'parts_order', 'config_loader', 'parts_portal', 'portal_scraper',\n"
+        "         'order_match') if m in sys.modules]\n"
+        "print('HEAVY', heavy)\n"
+        "sys.exit(rc)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    env.pop("GITHUB_OUTPUT", None)
+    out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "has_pending=true" in out.stdout
+    assert "HEAVY []" in out.stdout
+
+
+def test_main_polls_when_only_an_unverified_order_is_open(tg, run_main):
+    placed()
+    factory = PortalFactory(SentPortal([]))
+    assert run_main(factory) == 0
+    assert factory.portal.calls == ["list_sent_orders"]

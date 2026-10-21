@@ -1779,3 +1779,44 @@ def test_stage_budget_exceeded_while_adding_stops_and_lists_the_rest(tg, stage_c
 def test_stage_within_budget_is_unchanged(tg, stage_clock):
     portal = Clocked(stage_clock, per_search=10, per_add=10)
     assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "pending"
+
+
+# ── Task 14: vehicle model for the order checker; UNVERIFIED reference text ──
+
+def test_vehicle_model_is_stored_when_staging(tg, orders_file):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), APPROVE,
+                                      confident) == "pending"
+    assert orders_state.get("B1")["vehicle_model"] == "VOLKSWAGEN PASSAT"
+    _assert_no_pii(orders_file)
+
+
+def test_vehicle_model_is_sanitised_and_kept_when_blocked(tg, orders_file):
+    booking = {**BOOKING, "vehicle": " KIARIO\x00 (III)‎(2014)\n" + "x" * 100}
+    assert parts_order.plan_and_stage(CONFIG, booking, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+    model = orders_state.get("B1")["vehicle_model"]
+    assert model.startswith("KIARIO (III)(2014) x") and len(model) == 80
+
+
+@pytest.mark.parametrize("vehicle", [None, "", "   ", 42])
+def test_no_vehicle_model_stores_nothing(tg, vehicle):
+    booking = {**BOOKING, "vehicle": vehicle}
+    parts_order.plan_and_stage(CONFIG, booking, FakePortal(), APPROVE, confident)
+    assert "vehicle_model" not in orders_state.get("B1")
+
+
+def test_unverified_reference_is_not_shown_as_an_order_number(tg):
+    portal = FakePortal(ref="UNVERIFIED-20261021T123728Z")
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, AUTO, confident) == "ordered"
+    (text,) = tg["sent"]
+    assert "UNVERIFIED" not in text and "20261021T123728Z" not in text
+    assert ("Ordernummer: bekräftas senare (kolla Skickade Beställningar i pro.meca.se)"
+            in text.splitlines())
+    assert orders_state.get("B1")["plan"]["confirmation"] == "UNVERIFIED-20261021T123728Z"
+
+
+def test_real_reference_is_shown_as_before(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(ref="4500012345"), AUTO,
+                                      confident) == "ordered"
+    assert tg["sent"][0].splitlines()[:2] == ["Beställd: OLRD-0001 (TST001)",
+                                              "Ordernummer: 4500012345"]

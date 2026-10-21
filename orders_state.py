@@ -10,7 +10,9 @@ Stored as config/orders.json (committed back to the repo by the workflows):
      "bookings": {"<booking_id>": {"status", "plan", "message_id", "updated_at",
                                    optional: "cart_touched", "tries", "detail_url",
                                    "handled", "last_reason", "gave_up",
-                                   "klar_message_id", "klar_sent_at", "klar_closed"}}}
+                                   "klar_message_id", "klar_sent_at", "klar_closed",
+                                   "vehicle_model", "verified_at", "verified_numbers",
+                                   "verify_warned"}}}
 
 Optional fields (absent in older records) are kept by put()/begin() and set with
 update_fields(). Unknown record keys are rejected. Never store customer data here.
@@ -25,6 +27,7 @@ an empty state would allow a booking to be ordered again.
 import json
 import os
 import tempfile
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, get_args
@@ -46,7 +49,16 @@ OPTIONAL_FIELDS = {
     "klar_message_id": int,  # Telegram message carrying the booking's current Klar button
     "klar_sent_at": str,    # when that Klar message was sent (ISO 8601 with time zone)
     "klar_closed": bool,    # the Klar button was withdrawn (no link, or it expired)
+    # Order checker (approve.py, Task 14): the booking's car model as the MECA portal shows
+    # it ("KIARIO (III)(2014)"), when the order was found in pro.meca.se "Skickade
+    # Beställningar", the numbers found there, and whether the one warning was sent.
+    "vehicle_model": str,   # <= MODEL_MAX chars, no control characters
+    "verified_at": str,     # ISO 8601 with time zone
+    "verified_numbers": str,  # "<supplier no> · <portal order numbers>", <= NUMBERS_MAX
+    "verify_warned": bool,
 }
+MODEL_MAX = 80
+NUMBERS_MAX = 120
 KLAR_MAX_AGE = timedelta(days=14)
 MAX_TRIES = 10
 REASON_MAX = 200
@@ -101,8 +113,14 @@ def _field_problem(key: str, value) -> str | None:
         return "'tries' is negative"
     if key == "klar_message_id" and value < 1:
         return "'klar_message_id' is not positive"
-    if key == "klar_sent_at" and _parse_time(value) is None:
-        return "'klar_sent_at' is not an ISO time with a time zone"
+    if key in ("klar_sent_at", "verified_at") and _parse_time(value) is None:
+        return f"{key!r} is not an ISO time with a time zone"
+    limit = {"vehicle_model": MODEL_MAX, "verified_numbers": NUMBERS_MAX}.get(key)
+    if limit is not None:
+        if len(value) > limit:
+            return f"{key!r} is longer than {limit} characters"
+        if any(unicodedata.category(c) == "Cc" for c in value):
+            return f"{key!r} contains control characters"
     return None
 
 
@@ -307,6 +325,13 @@ def outstanding_klar(now: datetime | None = None) -> list[tuple[str, dict]]:
 def expired_klar(now: datetime | None = None) -> list[tuple[str, dict]]:
     """Records whose Klar button is older than KLAR_MAX_AGE and not yet closed."""
     return _open_klar(now)[1]
+
+
+def unverified_orders() -> list[tuple[str, dict]]:
+    """'ordered' records the order checker has not verified yet (no verified_at)."""
+    bookings = _load()["bookings"]
+    return [(bid, bookings[bid]) for bid in sorted(bookings)
+            if bookings[bid].get("status") == "ordered" and "verified_at" not in bookings[bid]]
 
 
 def last_update_id() -> int | None:

@@ -18,6 +18,13 @@ parts_order.execute_order then re-checks the live cart against the plan and
 the ceiling before checkout, and records "attempted" first, so a crash is
 never re-ordered (agent.py's start-of-run sweep reports it).
 
+After the taps, the order checker (_verify_orders) looks for every placed order that is
+not verified yet in pro.meca.se Orderöversikt -> "Skickade Beställningar" (read-only;
+the row appears there some time after the order) and matches it by car model, date and
+registration (order_match). Exactly one row: its order numbers are stored and the owner
+is told. Several rows: the owner is asked once to check which one. Nothing found for
+3 days: one warning. Portal errors are retried silently on the next run.
+
 A Klar tap is accepted with the same checks (owner, private chat, the booking's
 stored klar_message_id) and only once the order is resolved: never while it is
 "pending" or "attempted". A failed Hanterad keeps the button so the owner can tap
@@ -29,8 +36,9 @@ handled. An update that raised while its booking is still "pending" is left
 unconfirmed and retried on the next poll; nothing after it is processed.
 
   python approve.py --check   prints has_pending=true|false (stdlib only); true when an
-                              order awaits approval or a Klar button is
-                              outstanding or due to be withdrawn
+                              order awaits approval, a Klar button is
+                              outstanding or due to be withdrawn, or a placed
+                              order still awaits the order checker
   python approve.py           handles taps; exit 1 if anything failed
 """
 
@@ -46,6 +54,13 @@ import orders_state  # stdlib only: everything heavy is imported lazily below
 log = logging.getLogger(__name__)
 
 EXPIRY = timedelta(hours=48)
+VERIFY_WARN_AFTER = timedelta(days=3)
+AMBIGUOUS_LIST_MAX = 5
+VERIFIED_TEXT = "Beställning verifierad: {label} – {model}, ordernummer {numbers}."
+AMBIGUOUS_TEXT = ("Flera ordrar för {model} i Skickade Beställningar – kontrollera vilken som "
+                  "är {label}: {rows}.")
+NOT_VERIFIED_TEXT = ("Kunde inte verifiera beställningen för {label} i Skickade Beställningar "
+                     "efter 3 dagar – kontrollera i portalen.")
 CART_CLEARED = "Varukorgen är tömd."
 CART_MANUAL = "Varukorgen kunde inte tömmas – töm varukorgen på pro.meca.se för hand."
 CART_LEFT = "Varukorgen på pro.meca.se innehåller fortfarande delarna – töm varukorgen för hand."
@@ -339,14 +354,15 @@ def _still_pending(update) -> bool:
     return record is None or record.get("status") == "pending"
 
 
-def _handle(config: dict, portal_factory, rules, mark=None) -> tuple[int, bool]:
+def _handle(config: dict, portal_factory, rules, mark=None, session=None) -> tuple[int, bool]:
+    """(actions, problem). Uses `session` (a _Portal) when given, else opens its own."""
     import notifier
     last = orders_state.last_update_id()
     owner = str(config.get("telegram", {}).get("chat_id") or "")
     actions, problem = 0, False
     try:
         with ExitStack() as stack:
-            session = _Portal(portal_factory, stack)
+            session = session or _Portal(portal_factory, stack)
             for update in notifier.get_updates(config, None if last is None else last + 1):
                 try:
                     n, bad = _handle_one(config, session, rules, update, owner, mark)
@@ -374,6 +390,113 @@ def handle_updates(config: dict, portal_factory, rules, mark=None) -> int:
     return _handle(config, portal_factory, rules, mark)[0]
 
 
+# ── Order checker ────────────────────────────────────────────────────────────
+
+def _to_verify() -> list[tuple[str, dict]]:
+    """Placed orders the checker still works on: not verified and not yet warned about."""
+    return [(bid, rec) for bid, rec in orders_state.unverified_orders()
+            if rec.get("verify_warned") is not True]
+
+
+def _local_date(when: datetime):
+    """The Swedish calendar date of `when` (the "Datum" of Skickade Beställningar). Without
+    time zone data the UTC date is used: never later than the Swedish one, so no row of
+    the order's own day is ever skipped."""
+    try:
+        from zoneinfo import ZoneInfo
+        return when.astimezone(ZoneInfo("Europe/Stockholm")).date()
+    except Exception:
+        return when.astimezone(timezone.utc).date()
+
+
+def _numbers_text(row: dict) -> str:
+    numbers = str(row.get("order_numbers") or "").strip()
+    return f"{row['supplier_no']} ({numbers})" if numbers else str(row["supplier_no"])
+
+
+def _claimed() -> set[str]:
+    """Order numbers already stored on verified records (never given to another order)."""
+    import re
+    taken = set()
+    for _, rec in orders_state.by_status("ordered"):
+        taken.update(re.findall(r"[0-9A-Za-z-]+", str(rec.get("verified_numbers") or "")))
+    return taken
+
+
+def _send_once(config, booking_id, text) -> bool:
+    """One warning message; verify_warned is only set when it was delivered."""
+    import notifier
+    if not notifier.send_message(config, text):
+        log.error("Order checker message for %s was not delivered; retried next run.",
+                  booking_id)
+        return False
+    orders_state.update_fields(booking_id, verify_warned=True)
+    return True
+
+
+def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
+    """Find unverified placed orders in pro.meca.se "Skickade Beställningar" (read-only).
+
+    The portal is opened (once, through `session`) only when a record can be matched (a
+    car model or a registration number). Returns True when a message was not delivered.
+    """
+    import notifier
+    from order_match import match_sent_order
+    from parts_order_helpers import error_code
+
+    todo = _to_verify()
+    if not todo:
+        return False
+    rows, portal_failed, problem = None, False, False
+    claimed = _claimed()
+    for booking_id, record in todo:
+        label = _label(booking_id, record)
+        plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+        model = record.get("vehicle_model") or ""
+        reg = plan.get("reg_nr") if isinstance(plan.get("reg_nr"), str) else None
+        try:
+            since = datetime.fromisoformat(record["updated_at"])
+            since = since if since.tzinfo is not None else None
+        except Exception:
+            since = None
+        too_old = since is None or now - since > VERIFY_WARN_AFTER
+
+        result = None
+        if since is not None and (model or reg) and not portal_failed:
+            if rows is None:
+                try:
+                    rows = session.get().list_sent_orders()
+                except Exception as e:  # retried next run; never raw page text in the log
+                    portal_failed = True
+                    code = error_code(e)
+                    log.warning("Could not read Skickade Beställningar (%s%s); retried on the "
+                                "next run.", type(e).__name__, f", {code}" if code else "")
+            if rows is not None:
+                result = match_sent_order(rows, model, _local_date(since), claimed, reg_nr=reg)
+        status = result.status if result is not None else "unchecked"
+        log.info("Order checker: %s -> %s.", booking_id, status)
+
+        if status == "verified":
+            row = result.row
+            numbers = f"{row['supplier_no']} · {row.get('order_numbers') or ''}".strip(" ·")
+            orders_state.update_fields(booking_id, verified_at=now.isoformat(),
+                                       verified_numbers=numbers[:orders_state.NUMBERS_MAX])
+            claimed.update(n for n in numbers.replace("/", " ").split() if n != "·")
+            text = VERIFIED_TEXT.format(label=label, model=row["model"],
+                                        numbers=_numbers_text(row))
+            if not notifier.send_message(config, text):
+                log.error("Verified message for %s was not delivered.", booking_id)
+                problem = True
+        elif status == "ambiguous":
+            listed = ", ".join(_numbers_text(r) for r in result.rows[:AMBIGUOUS_LIST_MAX])
+            text = AMBIGUOUS_TEXT.format(model=result.rows[0]["model"], label=label, rows=listed)
+            problem = not _send_once(config, booking_id, text) or problem
+        elif too_old:  # not found (or not checkable) for 3 days
+            problem = not _send_once(config, booking_id,
+                                     NOT_VERIFIED_TEXT.format(label=label)) or problem
+    return problem
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def make_portal(config: dict):
@@ -390,7 +513,7 @@ def make_portal(config: dict):
 def _check() -> int:
     try:
         has_pending = (bool(orders_state.pending()) or bool(orders_state.outstanding_klar())
-                       or bool(orders_state.expired_klar()))
+                       or bool(orders_state.expired_klar()) or bool(_to_verify()))
     except Exception as e:
         print(f"Order state unreadable: {e}", file=sys.stderr)
         return 1
@@ -415,8 +538,8 @@ def main(argv=None) -> int:
                         handlers=[logging.StreamHandler(sys.stdout)])
     try:
         if not (orders_state.pending() or orders_state.outstanding_klar()
-                or orders_state.expired_klar()):
-            log.info("No pending approvals and no outstanding Klar buttons.")
+                or orders_state.expired_klar() or _to_verify()):
+            log.info("No pending approvals, no outstanding Klar buttons, no order to verify.")
             return 0
     except Exception:
         log.exception("Order state file unreadable — no approvals handled.")
@@ -443,9 +566,16 @@ def main(argv=None) -> int:
     except Exception:
         log.exception("Withdrawing expired Klar buttons failed.")
         expire_problem = True
-    actions, problem = _handle(config, lambda: make_portal(config), rules)
-    log.info("Approval poll done: %d action(s).", actions)
-    return 1 if expire_problem or problem else 0
+    with ExitStack() as stack:  # one pro.meca.se session for the taps and the order checker
+        session = _Portal(lambda: make_portal(config), stack)
+        actions, problem = _handle(config, None, rules, session=session)
+        log.info("Approval poll done: %d action(s).", actions)
+        try:
+            verify_problem = _verify_orders(config, session, datetime.now(timezone.utc))
+        except Exception:
+            log.exception("The order checker failed; it runs again next time.")
+            verify_problem = False
+    return 1 if expire_problem or problem or verify_problem else 0
 
 
 if __name__ == "__main__":

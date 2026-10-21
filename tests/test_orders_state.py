@@ -510,3 +510,53 @@ def test_outstanding_klar_defaults_to_now():
 def test_old_records_have_no_expired_klar(orders_file):
     _write(orders_file, {"B1": OLD_RECORD})
     assert orders_state.outstanding_klar(NOW) == [] and orders_state.expired_klar(NOW) == []
+
+
+# ── Order checker fields (Task 14) ───────────────────────────────────────────
+
+@pytest.mark.parametrize("field,value", [
+    ("vehicle_model", "KIARIO (III)(2014)"), ("vehicle_model", ""), ("vehicle_model", "A" * 80),
+    ("verified_at", "2026-10-22T06:00:01+00:00"),
+    ("verified_numbers", "28894701 · 01683001/01683002"), ("verified_numbers", "9" * 120),
+    ("verify_warned", True), ("verify_warned", False)])
+def test_order_checker_fields_load(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    assert orders_state.get("B1")[field] == value
+
+
+@pytest.mark.parametrize("field,value", [
+    ("vehicle_model", 5), ("vehicle_model", None), ("vehicle_model", "A" * 81),
+    ("vehicle_model", "KIA\nRIO"), ("vehicle_model", "KIA\x00"),
+    ("verified_at", "2026-10-22T06:00:01"), ("verified_at", "igår"), ("verified_at", 1),
+    ("verified_numbers", "9" * 121), ("verified_numbers", "1\t2"), ("verified_numbers", 28894701),
+    ("verify_warned", 1), ("verify_warned", "yes"), ("verify_warned", None)])
+def test_bad_order_checker_fields_raise(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+def test_update_fields_validates_order_checker_fields(orders_file):
+    orders_state.put("B1", "ordered")
+    orders_state.update_fields("B1", vehicle_model="KIARIO (III)", verify_warned=True,
+                               verified_at="2026-10-22T06:00:01+00:00",
+                               verified_numbers="28894701 · 01683001/01683002")
+    for bad in ({"verify_warned": 1}, {"verified_at": "2026-10-22"}, {"vehicle_model": "x\r"}):
+        with pytest.raises(ValueError):
+            orders_state.update_fields("B1", **bad)
+    assert orders_state.get("B1")["verify_warned"] is True
+
+
+def test_unverified_orders_are_ordered_records_without_verified_at():
+    orders_state.put("B1", "ordered")
+    orders_state.put("B2", "ordered")
+    orders_state.update_fields("B2", verified_at="2026-10-22T06:00:01+00:00")
+    orders_state.put("B3", "failed")
+    orders_state.put("B4", "pending")
+    orders_state.put("B5", "ordered")
+    orders_state.update_fields("B5", verify_warned=True)
+    assert [b for b, _ in orders_state.unverified_orders()] == ["B1", "B5"]
+
+
+def test_unverified_orders_empty_without_file(orders_file):
+    assert orders_state.unverified_orders() == []

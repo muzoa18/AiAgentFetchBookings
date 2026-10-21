@@ -178,6 +178,19 @@ def order_body(parts: list[dict], total, fluids: list[dict]) -> list[str]:
     return lines + prepare_section(fluids)
 
 
+UNVERIFIED_PREFIX = "UNVERIFIED-"
+REFERENCE_LATER = "Ordernummer: bekräftas senare (kolla Skickade Beställningar i pro.meca.se)"
+
+
+def reference_line(ref) -> str:
+    """The "Ordernummer" line of the Beställd message. An UNVERIFIED-<UTC> placeholder
+    (the page left checkout but showed no number) is not a number the owner can use: the
+    order checker in approve.py finds the real one later in "Skickade Beställningar"."""
+    if isinstance(ref, str) and ref.startswith(UNVERIFIED_PREFIX):
+        return REFERENCE_LATER
+    return f"Ordernummer: {ref}"
+
+
 def build_summary(booking: dict, cart: dict, fluids: list[dict], parts: list[dict]) -> str:
     """Approval text: booking header, chosen parts, cart total, fluids. Plain text."""
     reg = str(booking.get("reg_nr") or "–").strip()

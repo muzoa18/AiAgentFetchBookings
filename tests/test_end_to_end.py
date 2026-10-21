@@ -4,6 +4,7 @@ Real agent/parts_order/approve/orders_state code; only the pro.meca.se portal, t
 Hanterad step, the picker, Telegram and config/rules loading are faked."""
 import sys
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -45,9 +46,14 @@ class FakeMecaPortal:
         self.calls = []
         self.ceilings = []
         self.orders = []
+        self.sent_rows = []          # Orderöversikt -> Skickade Beställningar
 
     def login(self):
         self.calls.append("login")
+
+    def list_sent_orders(self):
+        self.calls.append("list_sent_orders")
+        return [dict(row) for row in self.sent_rows]
 
     def load_vehicle(self, reg_nr):
         self.calls.append("load_vehicle")
@@ -237,7 +243,21 @@ def test_stage_approve_and_order_end_to_end(world):
     for sentinel in PII:
         assert sentinel not in world["orders_file"].read_text(encoding="utf-8")
 
-    # Nothing pending and no Klar outstanding: the next poll exits before Telegram.
+    # ── later the order shows up in Skickade Beställningar: the checker verifies it ──
+    assert "verified_at" not in orders_state.get("B1")
+    assert orders_state.get("B1")["vehicle_model"] == "VOLKSWAGEN PASSAT"
+    portal.sent_rows = [{"supplier_no": "90000003", "status": "", "reg_nr": "TST001",
+                         "date": approve._local_date(datetime.now(timezone.utc)).isoformat(),
+                         "model": "VOLKSWAGEN, Passat Variant (B7) (365), 10-15",
+                         "order_numbers": "01000021/01000022", "order_status": "Bekräftad"}]
+    assert approve.main([]) == 0
+    assert world["sent"][-1] == ("Beställning verifierad: OLRD-0001 – VOLKSWAGEN, Passat "
+                                 "Variant (B7) (365), 10-15, ordernummer 90000003 "
+                                 "(01000021/01000022).")
+    assert orders_state.get("B1")["verified_numbers"] == "90000003 · 01000021/01000022"
+    assert portal.calls.count("checkout") == 1
+
+    # Nothing pending, no Klar outstanding, nothing to verify: the next poll exits early.
     offsets = list(world["offsets"])
     assert approve.main([]) == 0
     assert world["offsets"] == offsets
