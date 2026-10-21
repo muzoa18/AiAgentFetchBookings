@@ -51,9 +51,10 @@ approve.yml — daily 06:00 UTC, every day                      (python approve.
 weekly-improve.yml — Mondays 06:00 UTC                        (python improve.py --apply-all)
         │
         ▼
-  Claude (claude-opus-5-5) reviews code + SKILL.md + logs → proposals
+  Claude (claude-opus-5-5) reviews code + SKILL.md + logs → proposals + suggestions
         ▼
-  Apply (allowlisted files, outside locked symbols), syntax-check, revert anything broken
+  Apply only state.py / run_logger.py / new tests, syntax-check, revert anything broken;
+  everything else becomes a written suggestion for a developer
         ▼
   Pull Request → you review & merge
 ```
@@ -75,12 +76,12 @@ owner first).
   poller runs once a day; Telegram keeps unread taps for 24 h, so it runs every day.
 - **Fail closed.** Real money is spent unattended: any doubt (no confident match, unreadable
   total, cart mismatch, wrong chat) means no order and a message saying why.
-- **Improve agent opens PRs** and may only change selectors, parsing, logging and error
-  handling in `portal_scraper.py`, `parts_portal.py`, `parts_portal_parse.py`, `state.py` and
-  `run_logger.py`, outside locked symbols (checkout, cart, totals and order-reference parsing,
-  the Hanterad click), plus add new test files — enforced in code. Everything else (workflows,
-  config, rules, notifier, approval and ordering modules) is locked. Every PR still needs your
-  review: read the test diffs before running pytest locally, since they are LLM-written code.
+- **Improve agent opens PRs** and may only edit `state.py` and `run_logger.py` and add new
+  test files — enforced in code. Every other file (scrapers, parsers, notifier, approval and
+  ordering modules, workflows, config, rules) is suggestion-only: the PR body lists them under
+  "Suggestions (not applied — need a developer)". Selector and search-word fixes will move to a
+  validated data file later. Every PR still needs your review; read the new test files before
+  running pytest locally, since they are LLM-written code.
 - **No secrets in git.** Credentials live only in GitHub Secrets / a local
   `config/config.yaml` (gitignored). See [`config/config.example.yaml`](config/config.example.yaml).
 

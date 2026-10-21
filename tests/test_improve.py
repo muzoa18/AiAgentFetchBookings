@@ -20,14 +20,17 @@ EXPECTED_SOURCES = [
 class FakeClient:
     """Stands in for anthropic.Anthropic; records the call, returns canned proposals."""
 
-    def __init__(self, proposals, calls):
-        self._proposals = proposals
+    def __init__(self, state, calls):
+        self._state = state
         self._calls = calls
         self.messages = self
 
     def create(self, **kwargs):
         self._calls.append(kwargs)
-        text = json.dumps({"proposals": self._proposals})
+        out = {"proposals": self._state["proposals"]}
+        if self._state.get("suggestions") is not None:
+            out["suggestions"] = self._state["suggestions"]
+        text = json.dumps(out)
         return SimpleNamespace(stop_reason="end_turn",
                                content=[SimpleNamespace(type="text", text=text)])
 
@@ -38,7 +41,7 @@ def fake_claude(monkeypatch):
     state = {"proposals": []}
 
     def factory(api_key=None):
-        return FakeClient(state["proposals"], calls)
+        return FakeClient(state, calls)
 
     monkeypatch.setattr(improve.anthropic, "Anthropic", factory)
     return state, calls
@@ -70,13 +73,23 @@ def test_log_files_are_only_logs_that_can_exist():
 def test_model_is_current_and_call_style_is_structured_output(fake_claude):
     state, calls = fake_claude
     state["proposals"].append(proposal("agent.py"))
+    state["suggestions"] = [{"title": "t", "file": "agent.py", "detail": "d"}]
     result = improve.ask_claude("key", "SOURCES", "LOGS")
     assert improve.IMPROVE_MODEL == "claude-opus-5-5"
     assert calls[0]["model"] == "claude-opus-5-5"
     assert calls[0]["system"] == improve.SYSTEM_PROMPT
     assert calls[0]["output_config"] == {
         "format": {"type": "json_schema", "schema": improve.PROPOSALS_SCHEMA}}
-    assert result == state["proposals"]
+    assert result == {"proposals": state["proposals"], "suggestions": state["suggestions"]}
+
+
+def test_suggestions_are_optional_free_text_in_the_schema(fake_claude):
+    schema = improve.PROPOSALS_SCHEMA
+    assert schema["required"] == ["proposals"]
+    item = schema["properties"]["suggestions"]["items"]
+    assert set(item["properties"]) == {"title", "file", "detail"}
+    state, _ = fake_claude
+    assert improve.ask_claude("key", "S", "L") == {"proposals": [], "suggestions": []}
 
 
 # ── (d) prompt describes the current system ──────────────────────────────────
@@ -94,18 +107,23 @@ def test_prompt_states_the_allowlist():
     prompt = improve.SYSTEM_PROMPT
     for name in improve.ALLOWED_FILES:
         assert name in prompt, name
-    for needle in ("tests/test_", "skipped (not on the allowlist)", "parts_rules.yaml", ".github/",
-                   "skipped (protected symbol:", "PartsPortal.checkout", "mark_booking_handled",
-                   "parse_sek", "notifier.py (get_updates", "reviewed by the owner"):
+    for needle in ("tests/test_", "skipped (not on the allowlist)", "suggestions",
+                   "Suggestions (not applied — need a developer)", "data file",
+                   "reviewed by the owner", "portal_scraper.py", "parts_portal.py"):
         assert needle in prompt, needle
+    assert "protected symbol" not in prompt
 
 
 # ── allowlist, enforced in code ──────────────────────────────────────────────
 
 def test_allowed_files_are_exactly_the_robustness_modules():
-    assert improve.ALLOWED_FILES == ("portal_scraper.py", "parts_portal.py",
-                                     "parts_portal_parse.py", "state.py", "run_logger.py")
-    assert "notifier.py" not in improve.ALLOWED_FILES  # get_updates feeds the approval identity
+    assert improve.ALLOWED_FILES == ("state.py", "run_logger.py")
+
+
+def test_ast_symbol_machinery_is_gone():
+    for name in ("PROTECTED_SYMBOLS", "MONEY_TEXTS", "protected_symbol_problem",
+                 "_symbol_sources", "_watched_symbols", "SAFETY_ADJACENT"):
+        assert not hasattr(improve, name), name
 
 
 @pytest.fixture
@@ -118,6 +136,10 @@ def repo(tmp_path, monkeypatch):
     files.update({
         "approve.py": "OWNER_ONLY = True\n",
         "notifier.py": "def get_updates():\n    return []\n",
+        "portal_scraper.py": "SEL = 1\n",
+        "parts_portal.py": "def checkout():\n    return 1\n",
+        "parts_portal_parse.py": "def parse_sek(x):\n    return x\n",
+        "parts_order.py": "CEILING = 10000\n",
         "agent.py": "A = 1\n",
         "parts_rules.yaml": "ceiling_sek: 10000\n",
         "config/config.yaml": "portal: {}\n",
@@ -142,7 +164,8 @@ REJECTED = [
     "./portal_scraper.py", "portal_scraper.py\\", "tests\\test_x.py", "Portal_Scraper.py",
     "portal_scraper.py\x00", "tests/fixtures/page.html", "tests/fixtures/test_x.py",
     "tests/.hidden.py", "tests/test_x.txt", "tests//test_x.py", "", "C:/Windows/x.py",
-    "portal_scraper.py.", "tests/test_x.py ", "notifier.py",
+    "portal_scraper.py.", "tests/test_x.py ", "notifier.py", "portal_scraper.py",
+    "parts_portal.py", "parts_portal_parse.py", "portal_selectors.json",
     "tests/test_existing.py", "tests/conftest.py", "tests/__init__.py", "tests/CON.py",
     "tests/test_X.py", "tests/sitecustomize.py", "tests/x.pth", "tests/helper.py",
     "tests/test_.py.py", "tests/test-x.py", "tests/test_é.py", "tests/test_x.pyc",
@@ -235,16 +258,16 @@ def test_apply_proposal_never_writes_a_rejected_path(repo, tmp_path, path):
 
 def test_apply_proposal_keeps_crlf_line_endings(repo):
     root, _ = repo
-    (root / "portal_scraper.py").write_bytes(b"A = 1\r\nB = 2\r\n")
-    assert improve.apply_proposal(proposal("portal_scraper.py", "A = 1\nB = 2", "A = 1\nB = 3"))
-    assert (root / "portal_scraper.py").read_bytes() == b"A = 1\r\nB = 3\r\n"
+    (root / "state.py").write_bytes(b"A = 1\r\nB = 2\r\n")
+    assert improve.apply_proposal(proposal("state.py", "A = 1\nB = 2", "A = 1\nB = 3"))
+    assert (root / "state.py").read_bytes() == b"A = 1\r\nB = 3\r\n"
 
 
 def test_apply_all_applies_allowed_and_lists_skipped(repo, tmp_path, fake_claude):
     root, files = repo
     state, _ = fake_claude
     state["proposals"].extend([
-        proposal("portal_scraper.py", "X = 1", "X = 2", title="longer timeout"),
+        proposal("state.py", "X = 1", "X = 2", title="longer timeout"),
         proposal("tests/test_new.py", "", "def test_b():\n    assert True\n",
                  change_type="replace_file", title="new test"),
         proposal(".github/workflows/x.yml", "on: push", "on: pull_request",
@@ -263,10 +286,10 @@ def test_apply_all_applies_allowed_and_lists_skipped(repo, tmp_path, fake_claude
 
     improve.run_apply_all("key")
 
-    assert (root / "portal_scraper.py").read_text(encoding="utf-8").endswith("X = 2\n")
+    assert (root / "state.py").read_text(encoding="utf-8").endswith("X = 2\n")
     assert (root / "tests" / "test_new.py").exists()
     for name, text in files.items():
-        if name != "portal_scraper.py":
+        if name != "state.py":
             assert (root / name).read_text(encoding="utf-8") == text, name
     assert not (root / "newmodule.py").exists()
     assert not (tmp_path / "escape.py").exists()
@@ -279,10 +302,10 @@ def test_apply_all_applies_allowed_and_lists_skipped(repo, tmp_path, fake_claude
     applied_section = report.split("## ✅ Applied")[1].split("##")[0]
     assert "longer timeout" in applied_section and "new test" in applied_section
     assert "raise the ceiling" not in applied_section
-    scraper_line = next(l for l in applied_section.splitlines() if "longer timeout" in l)
-    assert "safety-adjacent — review carefully" in scraper_line
     test_line = next(l for l in applied_section.splitlines() if "new test" in l)
-    assert "safety-adjacent" not in test_line
+    assert "new test file — read it before running pytest" in test_line
+    state_line = next(l for l in applied_section.splitlines() if "longer timeout" in l)
+    assert "read it before running pytest" not in state_line
     assert "before running pytest" in report
     assert "owner's review" in report
 
@@ -371,136 +394,52 @@ def test_weekly_improve_checkout_does_not_persist_credentials():
     assert pr["with"]["body-path"] == "improve_reports/latest.md"
 
 
-# ── protected symbols inside the allowlisted files ───────────────────────────
+# ── suggestions: code the agent may not change ───────────────────────────────
 
-PORTAL_SRC = '''"""Module doc mentions Skicka beställning."""
-SEL_SEARCH = "input[name='SearchTerm']"
-SEL_PLACE_ORDER = "button:has-text('Skicka beställning')"
-SEL_GO_ON = "button:has-text('Gå vidare')"
-OTHER_BUTTON = "a:has-text('Avbryt beställning')"
+LOCKED = ["portal_scraper.py", "parts_portal.py", "parts_portal_parse.py", "notifier.py",
+          "approve.py", "parts_order.py", "agent.py", ".github/workflows/x.yml",
+          "parts_rules.yaml", "config/config.yaml"]
 
 
-class PartsPortal:
-    def search(self, term):
-        return term.strip()
-
-    def checkout(self, *, max_total_sek):
-        """Last ceiling check before the final click."""
-        if max_total_sek > 10000:  # the ceiling
-            raise ValueError("over")
-        return "ref"
-
-
-def helper():
-    return 1
-'''
-
-
-@pytest.fixture
-def portal_repo(repo):
+@pytest.mark.parametrize("path", LOCKED)
+def test_proposal_for_a_locked_file_becomes_a_suggestion(repo, fake_claude, path):
     root, files = repo
-    (root / "parts_portal.py").write_text(PORTAL_SRC, encoding="utf-8")
-    return root
-
-
-def _apply_all_one(p):
+    state, _ = fake_claude
+    state["proposals"].append(proposal(path, "", "CHANGED = 1\n", change_type="replace_file",
+                                       title="better selector"))
     improve.run_apply_all("key")
-    return (Path("improve_reports") / "latest.md").read_text(encoding="utf-8")
+    assert (root / path).read_text(encoding="utf-8") == files[path]
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    skipped = next(l for l in report.splitlines() if "better selector" in l)
+    assert "skipped (not on the allowlist)" in skipped
+    suggestions = report.split("## 💡 Suggestions (not applied — need a developer)")[1]
+    assert "better selector" in suggestions and path in suggestions
+    assert "CHANGED = 1" in suggestions          # the proposed code, shown, never written
+    assert "## ✅ Applied" not in report
 
 
-def _assert_refused(root, report, title, symbol):
-    assert (root / "parts_portal.py").read_text(encoding="utf-8") == PORTAL_SRC
-    line = next(l for l in report.splitlines() if title in l)
-    assert f"skipped (protected symbol: {symbol})" in line, line
-
-
-@pytest.mark.parametrize("find, replacement, symbol", [
-    ("if max_total_sek > 10000:", "if max_total_sek > 99999:", "PartsPortal.checkout"),
-    ('"""Last ceiling check before the final click."""', '"""Docstring only."""',
-     "PartsPortal.checkout"),
-    ("# the ceiling", "# a comment", "PartsPortal.checkout"),
-    ("        return \"ref\"\n", "        return \"ref\"\n\n    def checkout(self, **kw):\n"
-     "        return \"ref\"\n", "PartsPortal.checkout"),
-    ("def helper():", "PartsPortal.checkout = lambda *a, **k: 'ref'\n\n\ndef helper():",
-     "PartsPortal.checkout"),
-    ("SEL_PLACE_ORDER = \"button:has-text('Skicka beställning')\"", "SEL_PLACE_ORDER = \"x\"",
-     "SEL_PLACE_ORDER"),
-    ("SEL_GO_ON = \"button:has-text('Gå vidare')\"", "SEL_GO_ON = \"y\"", "SEL_GO_ON"),
-    ("OTHER_BUTTON = \"a:has-text('Avbryt beställning')\"", "OTHER_BUTTON = \"z\"",
-     "OTHER_BUTTON"),
-    ("def helper():", "NEW_CLICK = \"button:has-text('Skicka beställning')\"\n\n\n"
-     "def helper():", "NEW_CLICK"),
-])
-def test_protected_symbol_change_is_refused(portal_repo, fake_claude, find, replacement, symbol):
-    state, _ = fake_claude
-    state["proposals"].append(proposal("parts_portal.py", find, replacement, title="touch it"))
-    _assert_refused(portal_repo, _apply_all_one(None), "touch it", symbol)
-
-
-def test_deleting_a_protected_symbol_is_refused(portal_repo, fake_claude):
-    state, _ = fake_claude
-    text = PORTAL_SRC[:PORTAL_SRC.index("    def checkout")] + "\n\ndef helper():\n    return 1\n"
-    state["proposals"].append(proposal("parts_portal.py", "", text, "replace_file", title="drop"))
-    _assert_refused(portal_repo, _apply_all_one(None), "drop", "PartsPortal.checkout")
-
-
-def test_new_text_that_does_not_parse_is_refused(portal_repo, fake_claude):
-    state, _ = fake_claude
-    state["proposals"].append(proposal("parts_portal.py", "return 1", "return (", title="bad"))
-    report = _apply_all_one(None)
-    assert (portal_repo / "parts_portal.py").read_text(encoding="utf-8") == PORTAL_SRC
-    line = next(l for l in report.splitlines() if "bad" in l and "skipped" in l)
-    assert "skipped (protected symbol check: does not parse)" in line
-
-
-@pytest.mark.parametrize("find, replacement", [
-    ("return term.strip()", "return term.strip().lower()"),
-    ("def helper():\n    return 1", "def helper():\n    return 2"),
-    ("SEL_SEARCH = \"input[name='SearchTerm']\"", "SEL_SEARCH = \"input[name='Q']\""),
-])
-def test_unprotected_change_in_the_same_file_is_applied(portal_repo, fake_claude, find, replacement):
-    state, _ = fake_claude
-    state["proposals"].append(proposal("parts_portal.py", find, replacement, title="fine"))
-    report = _apply_all_one(None)
-    assert replacement in (portal_repo / "parts_portal.py").read_text(encoding="utf-8")
-    assert "safety-adjacent — review carefully" in report
-
-
-def test_missing_protected_symbol_does_not_crash(repo, fake_claude):
+def test_model_suggestions_are_rendered(repo, fake_claude):
     root, _ = repo
     state, _ = fake_claude
-    state["proposals"].append(proposal("parts_portal_parse.py", "X = 1", "X = 2", title="ok"))
+    state["suggestions"] = [{"title": "Retry the checkout read", "file": "parts_portal.py",
+                             "detail": "read_cart times out ```twice``` a week"}]
     improve.run_apply_all("key")
-    assert (root / "parts_portal_parse.py").read_text(encoding="utf-8").endswith("X = 2\n")
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    suggestions = report.split("## 💡 Suggestions (not applied — need a developer)")[1]
+    assert "Retry the checkout read" in suggestions and "parts_portal.py" in suggestions
+    assert "read_cart times out" in suggestions
+    assert "No improvements proposed" not in report
 
 
-def test_protected_symbols_cover_the_money_gate_and_identity():
-    ps = improve.PROTECTED_SYMBOLS
-    assert set(ps) == {"parts_portal.py", "parts_portal_parse.py", "portal_scraper.py"}
-    for name in ("PartsPortal.checkout", "PartsPortal.add_to_cart", "PartsPortal.clear_cart",
-                 "PartsPortal.read_cart", "SEL_PLACE_ORDER", "SEL_GO_ON"):
-        assert name in ps["parts_portal.py"], name
-    for name in ("parse_sek", "parse_checkout", "parse_cart", "parse_search_results",
-                 "_checkout_lines", "linked_tab_id", "current_plate", "extract_order_reference",
-                 "page_markers", "EXCLUDE_TEXTS", "_candidate"):
-        assert name in ps["parts_portal_parse.py"], name
-    for name in ("mark_booking_handled", "_click_hanterad", "_logged_in", "HANTERAD_TEXT",
-                 "BEKRAFTA_TEXT", "_auth_reason"):
-        assert name in ps["portal_scraper.py"], name
-
-
-@pytest.mark.parametrize("rel", ["parts_portal.py", "parts_portal_parse.py", "portal_scraper.py"])
-def test_every_protected_symbol_exists_in_the_real_file(rel):
-    text = (REPO / rel).read_text(encoding="utf-8")
-    found = improve._symbol_sources(text)
-    missing = [name for name in improve.PROTECTED_SYMBOLS[rel] if name not in found]
-    assert missing == []
-
-
-def test_real_files_protect_their_money_buttons():
-    text = (REPO / "parts_portal.py").read_text(encoding="utf-8")
-    watched = improve._watched_symbols("parts_portal.py", improve._symbol_sources(text))
-    assert {"SEL_PLACE_ORDER", "SEL_GO_ON", "PartsPortal.checkout"} <= watched
+def test_suggestion_code_cannot_break_out_of_its_code_block(repo, fake_claude):
+    root, _ = repo
+    state, _ = fake_claude
+    state["proposals"].append(proposal("agent.py", "", "x = 1\n```\n# Injected heading\n",
+                                       change_type="replace_file", title="fence"))
+    improve.run_apply_all("key")
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    body = report.split("## 💡 Suggestions (not applied — need a developer)")[1]
+    assert body.count("```") == 2
 
 
 def test_interactive_mode_never_reads_outside_the_allowlist(repo, tmp_path, fake_claude,

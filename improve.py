@@ -19,9 +19,8 @@ THREE MODES:
       python improve.py --auto
       → Applies only proposals marked auto_apply. Logs to logs/improve_auto.log.
 
-In every mode a proposal may only write an allowlisted file (ALLOWED_FILES, outside
-PROTECTED_SYMBOLS) or create a new tests/test_<name>.py; everything else is skipped
-and reported.
+In every mode a proposal may only write state.py, run_logger.py or a new
+tests/test_<name>.py; everything else is skipped and reported as a suggestion.
 """
 
 import sys
@@ -29,7 +28,6 @@ import os
 import json
 import difflib
 import argparse
-import ast
 import re
 import py_compile
 import subprocess
@@ -82,18 +80,18 @@ LOG_FILES = [
 ]
 
 # The ONLY files a proposal may write, enforced in code (allowed_path) at write
-# time, whatever the model says: these existing modules (outside their
-# PROTECTED_SYMBOLS), plus NEW test files tests/test_<name>.py. Everything else
-# (.git/, .github/, .claude/, config/, parts_rules.yaml, approve.py, notifier.py,
-# parts_matcher.py, parts_order*.py, orders_state.py, rules.py, agent.py,
-# config_loader.py, improve.py, docs, existing tests, new modules) is skipped and
-# listed in the report as "skipped (not on the allowlist)". Writing .git/ or
-# .github/ would run code in CI before anyone reviews the PR. notifier.py is not
-# allowed: get_updates() produces the chat/user ids approve.py trusts.
+# time, whatever the model says: two low-risk bookkeeping modules, plus NEW test
+# files tests/test_<name>.py. No Python logic file that decides what is ordered,
+# what is marked Hanterad or who may approve is writable: code in an allowed file
+# could reach any other module, so policing edits symbol by symbol is not safe.
+# A proposal for any other path (.git/, .github/, .claude/, config/,
+# parts_rules.yaml, the scrapers and parsers, notifier.py, approve.py,
+# parts_*.py, orders_state.py, rules.py, agent.py, config_loader.py, improve.py,
+# docs, existing tests, new modules) is skipped ("skipped (not on the
+# allowlist)") and turned into a suggestion for a developer. Selector and
+# search-word fixes will move to a validated data file (portal_selectors.json,
+# not yet present) that will be added here.
 ALLOWED_FILES = (
-    "portal_scraper.py",
-    "parts_portal.py",
-    "parts_portal_parse.py",
     "state.py",
     "run_logger.py",
 )
@@ -102,47 +100,8 @@ ALLOWED_TEST_DIR = "tests"
 NEW_TEST_NAME = re.compile(r"test_[a-z0-9_]+\.py")
 NOT_ALLOWED = "skipped (not on the allowlist)"
 
-# Symbols inside the allowlisted files that a proposal may not change, add, remove
-# or shadow (checked with ast before anything is written; any source change counts,
-# including docstrings and comments). They are the money gate (checkout, cart, the
-# totals and order-reference parsing, the linked-parts and "utgått"/"Ersätts av"
-# filters) and the Hanterad click. Names are "func", "CONST" or "Class.method"; a
-# name missing from the file is simply not checked. Any top-level symbol whose
-# source mentions one of MONEY_TEXTS is protected too.
-PROTECTED_SYMBOLS = {
-    "parts_portal.py": (
-        "PartsPortal", "PartsPortal.checkout", "PartsPortal.add_to_cart",
-        "PartsPortal.clear_cart", "PartsPortal.read_cart", "PartsPortal._cart",
-        "PartsPortal._confirmation", "PartsPortal._overview_tokens",
-        "PartsPortal.load_vehicle", "PartsPortal._require_vehicle",
-        "SEL_PLACE_ORDER", "SEL_GO_ON", "SEL_SHIPPING_CHECKED", "SEL_REMOVE_LINE",
-        "MAX_CLEAR_ATTEMPTS", "CART_URL", "ORDER_OVERVIEW_URL", "SHOP",
-        "normalise_reg", "_is_qty_update",
-        "PartsPortalError", "PartsPortalPartialAdd",
-    ),
-    "parts_portal_parse.py": (
-        "PartsPortalError", "PartsPortalPartialAdd",
-        "parse_sek", "_SEK", "parse_qty_text", "_first_int",
-        "parse_checkout", "_checkout_lines", "parse_cart", "_cart_row", "_cart_counts",
-        "_heading_reg", "same_lines",
-        "parse_search_results", "_candidate", "_not_related", "_in_stock",
-        "linked_tab_id", "_linked_tab", "LINKED_TAB_LABEL", "MAX_CANDIDATES",
-        "EXCLUDE_TEXTS",
-        "current_plate", "extract_order_reference", "_plausible_ref", "_REF_LABEL",
-        "_REF_VALUE", "_REF_PARAMS", "_CUSTOMER_WORD", "order_tokens",
-        "page_markers", "is_login_page",
-    ),
-    "portal_scraper.py": (
-        "mark_booking_handled", "_click_hanterad", "HANTERAD_TEXT", "BEKRAFTA_TEXT",
-        "_logged_in", "_require_login", "_auth_reason", "_detect_booking_type",
-        "PortalLoginError",
-    ),
-}
-MONEY_TEXTS = ("Skicka beställning", "Avbryt beställning", "Gå vidare")
-PROTECTED = "skipped (protected symbol: {})"
-UNPARSABLE = "skipped (protected symbol check: does not parse)"
-# Applied changes to these files are flagged in the report for careful review.
-SAFETY_ADJACENT = ("parts_portal.py", "parts_portal_parse.py", "portal_scraper.py")
+SUGGESTIONS_HEADER = "## 💡 Suggestions (not applied — need a developer)"
+NEW_TEST_FLAG = " — 🧪 new test file — read it before running pytest"
 
 
 def _repo_root() -> Path:
@@ -246,91 +205,6 @@ def _delete_checked(file: str, created=frozenset()) -> bool:
     return True
 
 
-def _target_names(target, prefix: str = "") -> list[str]:
-    if isinstance(target, ast.Name):
-        return [prefix + target.id]
-    if isinstance(target, ast.Attribute):
-        base = _target_names(target.value)
-        return [f"{base[0]}.{target.attr}"] if base else []
-    if isinstance(target, (ast.Tuple, ast.List)):
-        return [n for elt in target.elts for n in _target_names(elt, prefix)]
-    if isinstance(target, ast.Starred):
-        return _target_names(target.value, prefix)
-    return []
-
-
-def _symbol_sources(text: str) -> dict[str, list[tuple[str, str]]]:
-    """Every name a module defines, assigns, imports or deletes at module or class
-    level (also inside module-level if/try/for/with blocks) -> [(source, ast dump)].
-    Raises SyntaxError if `text` does not parse."""
-    tree = ast.parse(text)
-    out: dict[str, list[tuple[str, str]]] = {}
-
-    def add(name: str, node, dump=None):
-        source = ast.get_source_segment(text, node) or ""
-        if getattr(node, "decorator_list", None):
-            source = "\n".join(ast.get_source_segment(text, d) or "" for d in node.decorator_list) \
-                + "\n" + source
-        out.setdefault(name, []).append((source, dump or ast.dump(node)))
-
-    def scan(body, prefix: str = ""):
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                add(prefix + node.name, node)
-            elif isinstance(node, ast.ClassDef):
-                header = ast.dump(ast.ClassDef(name=node.name, bases=node.bases,
-                                               keywords=node.keywords, body=[],
-                                               decorator_list=node.decorator_list))
-                out.setdefault(prefix + node.name, []).append(("", header))
-                scan(node.body, prefix + node.name + ".")
-            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
-                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) \
-                    else [node.target]
-                for target in targets:
-                    for name in _target_names(target, prefix):
-                        add(name, node)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    add(prefix + (alias.asname or alias.name.split(".")[0]), node)
-            elif isinstance(node, (ast.If, ast.Try, ast.For, ast.AsyncFor, ast.While,
-                                   ast.With, ast.AsyncWith)):
-                for field in ("body", "orelse", "finalbody"):
-                    scan(getattr(node, field, []) or [], prefix)
-                for handler in getattr(node, "handlers", []) or []:
-                    scan(handler.body, prefix)
-
-    scan(tree.body)
-    return out
-
-
-def _watched_symbols(rel: str, *sources: dict) -> set[str]:
-    watched = set(PROTECTED_SYMBOLS.get(rel, ()))
-    for src in sources:
-        for name, entries in src.items():
-            if "." not in name and any(t in s for s, _ in entries for t in MONEY_TEXTS):
-                watched.add(name)
-    return watched
-
-
-def protected_symbol_problem(rel: str, before: str, after: str) -> str | None:
-    """None if the edit leaves every protected symbol of `rel` untouched, else the
-    report text ("skipped (protected symbol: X)" or the does-not-parse text)."""
-    if rel not in PROTECTED_SYMBOLS:
-        return None
-    try:
-        new = _symbol_sources(after)
-    except (SyntaxError, ValueError):
-        return UNPARSABLE
-    try:
-        old = _symbol_sources(before)
-    except (SyntaxError, ValueError):
-        return UNPARSABLE
-    for name in sorted(_watched_symbols(rel, old, new)):
-        if old.get(name) != new.get(name):
-            return PROTECTED.format(name)
-    return None
-
-
 SYSTEM_PROMPT = """
 You are an expert Python developer reviewing the MECA Agent System.
 This is a real production system used daily at MD Bilreparationer AB,
@@ -371,33 +245,22 @@ THE SYSTEM:
    booking is never ordered twice; "attempted" is written before checkout.
 
 WHAT YOU MAY CHANGE (enforced in code; everything else is skipped):
-- portal_scraper.py, parts_portal.py, parts_portal_parse.py, state.py,
-  run_logger.py (existing files only) — selectors, parsing robustness,
-  logging and error handling OUTSIDE the locked symbols below,
+- state.py and run_logger.py (existing files only),
 - NEW test files tests/test_<lowercase_name>.py (never an existing test,
   conftest.py or __init__.py).
+Nothing else is written. A proposal for any other file — including
+portal_scraper.py, parts_portal.py, parts_portal_parse.py, notifier.py,
+approve.py, parts_matcher.py, parts_order.py, parts_order_helpers.py,
+orders_state.py, rules.py, agent.py, config_loader.py, improve.py,
+parts_rules.yaml, .github/, .git/, config/, docs and new modules — is reported
+as "skipped (not on the allowlist)" and shown to a developer under
+"Suggestions (not applied — need a developer)". Selector and search-word fixes
+will move to a validated data file later; until then they are suggestions too.
 
-LOCKED (a proposal that changes, adds, removes or shadows one of these — even a
-docstring or comment inside it — is NOT applied and is reported as
-"skipped (protected symbol: <name>)"):
-- parts_portal.py: PartsPortal.checkout, add_to_cart, clear_cart, read_cart,
-  _cart, _confirmation, _overview_tokens, load_vehicle, _require_vehicle,
-  SEL_PLACE_ORDER, SEL_GO_ON and any constant naming "Skicka beställning",
-  "Avbryt beställning" or "Gå vidare" (the money gate and the order click),
-- parts_portal_parse.py: parse_sek, parse_cart, parse_checkout, _checkout_lines,
-  parse_search_results, _candidate, EXCLUDE_TEXTS ("utgått" / "Ersätts av"),
-  linked_tab_id, current_plate, extract_order_reference, page_markers and
-  their helpers,
-- portal_scraper.py: mark_booking_handled, _click_hanterad, HANTERAD_TEXT,
-  BEKRAFTA_TEXT, _logged_in, _require_login, _auth_reason, _detect_booking_type.
-Every other file is not on the allowlist and is reported as
-"skipped (not on the allowlist)": .github/, .git/, config/, parts_rules.yaml,
-rules.py, approve.py (approval authorisation), notifier.py (get_updates feeds
-the approval identity), parts_matcher.py, parts_order.py,
-parts_order_helpers.py (ceiling, ProMeister, fluid and placement safety),
-orders_state.py (validation), agent.py, config_loader.py, improve.py, docs,
-existing tests and new modules. Only propose such a change for a real, clearly
-explained bug, knowing a human must apply it. Every PR is reviewed by the owner.
+SUGGESTIONS: for any problem in code you may not change, add an entry to the
+optional "suggestions" list (title, file, detail: the problem, the evidence and
+the fix you recommend, in prose or a short snippet). Suggestions are never
+applied. Every PR is reviewed by the owner.
 
 KNOWN ISSUES TO WATCH FOR:
 - Cookie popups on both portals must be dismissed before any clicks work.
@@ -456,7 +319,20 @@ PROPOSALS_SCHEMA = {
                              "find", "replacement", "impact", "auto_apply"],
                 "additionalProperties": False,
             },
-        }
+        },
+        "suggestions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title":  {"type": "string"},
+                    "file":   {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+                "required": ["title", "file", "detail"],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": ["proposals"],
     "additionalProperties": False,
@@ -517,7 +393,8 @@ def read_logs(max_chars_per_log: int = 3000) -> str:
     return "\n\n".join(parts) if parts else "(no logs found)"
 
 
-def ask_claude(api_key: str, sources: str, logs: str) -> list[dict]:
+def ask_claude(api_key: str, sources: str, logs: str) -> dict:
+    """{"proposals": [...], "suggestions": [...]} (both lists, possibly empty)."""
     client = anthropic.Anthropic(api_key=api_key)
     print(f"Sending codebase + logs to Claude ({IMPROVE_MODEL}) for analysis ...")
     print(f"  Source files: {len(SOURCE_FILES)}")
@@ -539,12 +416,13 @@ def ask_claude(api_key: str, sources: str, logs: str) -> list[dict]:
 
     if response.stop_reason == "refusal":
         print("Claude declined to respond (refusal). No proposals.")
-        return []
+        return {"proposals": [], "suggestions": []}
 
     # output_config.format guarantees the first text block is valid JSON.
     content = next((b.text for b in response.content if b.type == "text"), "{}")
     data = json.loads(content)
-    return data.get("proposals", [])
+    return {"proposals": list(data.get("proposals") or []),
+            "suggestions": list(data.get("suggestions") or [])}
 
 
 def show_diff(original: str, replacement: str, filename: str):
@@ -565,9 +443,8 @@ def show_diff(original: str, replacement: str, filename: str):
 
 def apply_detail(proposal: dict, created=frozenset()) -> tuple[str, str]:
     """Apply one proposal -> (status, note). status: "applied", "config",
-    "not_allowed", "protected" (note = report text) or "failed". Only allowlisted
-    files are ever written (allowed_path, checked again at write time), and never
-    with a change to a protected symbol (protected_symbol_problem)."""
+    "not_allowed" (note = report text) or "failed". Only allowlisted files are
+    ever written (allowed_path, checked again at write time)."""
     file    = proposal.get("file", "")
     ctype   = proposal.get("change_type", "")
     find    = (proposal.get("find", "") or "").replace("\r\n", "\n")
@@ -603,10 +480,6 @@ def apply_detail(proposal: dict, created=frozenset()) -> tuple[str, str]:
     else:
         return "failed", f"unknown change_type {ctype!r}"
 
-    problem = protected_symbol_problem(rel, current, new)
-    if problem:
-        print(f"  SKIPPED: {rel} — {problem}.")
-        return "protected", problem
     if not _write_checked(rel, new, eol, created):
         return "not_allowed", NOT_ALLOWED
     print(f"  Updated {rel}.")
@@ -637,7 +510,10 @@ def run_interactive(api_key: str):
     print("  MECA Agent — Self-Improvement (Interactive)")
     print("=" * 60)
 
-    proposals = ask_claude(api_key, read_sources(), read_logs())
+    answer = ask_claude(api_key, read_sources(), read_logs())
+    proposals = answer["proposals"]
+    for sug in answer["suggestions"]:
+        print(f"  [SUGGESTION] {sug.get('title')} ({sug.get('file')}): {sug.get('detail')}")
 
     if not proposals:
         print("\nNo improvements proposed — code looks good!")
@@ -731,7 +607,10 @@ def run_auto(api_key: str):
     log("=" * 50)
 
     try:
-        proposals = ask_claude(api_key, read_sources(), read_logs())
+        answer = ask_claude(api_key, read_sources(), read_logs())
+        proposals = answer["proposals"]
+        for sug in answer["suggestions"]:
+            log(f"  [SUGGESTION] {sug.get('title')} ({sug.get('file')})")
     except Exception as e:
         log(f"ERROR: Claude API call failed: {e}")
         return
@@ -785,10 +664,11 @@ def run_apply_all(api_key: str):
     print("  MECA Agent — Self-Improvement (PR mode: apply-all)")
     print("=" * 60)
 
-    proposals = ask_claude(api_key, read_sources(), read_logs())
+    answer = ask_claude(api_key, read_sources(), read_logs())
+    proposals, suggestions = answer["proposals"], list(answer["suggestions"])
     if not proposals:
-        print("No improvements proposed — code looks healthy.")
-        _write_report([], [], [], [], [])
+        print("No changes proposed.")
+        _write_report([], [], [], [], [], suggestions)
         return
 
     # Snapshot each target before its first change so a broken file can be
@@ -817,7 +697,7 @@ def run_apply_all(api_key: str):
                 created.add(rel)
             applied.append((i, {**p, "file": rel}))
             print(f"  [APPLY] {title}")
-        elif status in ("not_allowed", "protected"):
+        elif status == "not_allowed":
             not_allowed.append({**p, "_skip": note})
             print(f"  [SKIP] {title} ({rel}) — {note}")
         else:
@@ -844,29 +724,49 @@ def run_apply_all(api_key: str):
             print(f"  [REVERT] {rel} — does not compile, reverted.")
 
     save_proposal_log(proposals, [i for i, _ in applied], "apply_all")
-    _write_report(proposals, [p for _, p in applied], skipped + failed, reverted, not_allowed)
+    # Code the agent may not change is shown to a developer, never written.
+    suggestions += [_as_suggestion(p) for p in not_allowed]
+    _write_report(proposals, [p for _, p in applied], skipped + failed, reverted, not_allowed,
+                  suggestions)
     print(f"\nApplied {len(applied)} change(s). Reverted {len(reverted)} broken file(s).")
 
 
-def _write_report(proposals, applied, not_applied, reverted, not_allowed=()):
+def _as_suggestion(p: dict) -> dict:
+    """A proposal for a file the agent may not write, as a suggestion (never applied)."""
+    detail = str(p.get("reason") or "")
+    code = str(p.get("replacement") or "")
+    if code:
+        detail += f"\n\nProposed {p.get('change_type')} (not applied):\n" + code[:1500]
+        if len(code) > 1500:
+            detail += "\n… (truncated)"
+    return {"title": p.get("title"), "file": p.get("file"), "detail": detail}
+
+
+def _code_block(text: str) -> list[str]:
+    """Text as a fenced block it cannot break out of (no ``` inside)."""
+    safe = str(text).replace("`", "'")
+    return ["  ```text"] + [f"  {line}" for line in safe.splitlines()] + ["  ```"]
+
+
+def _write_report(proposals, applied, not_applied, reverted, not_allowed=(), suggestions=()):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"# Weekly improve report — {ts}", ""]
 
-    if not proposals:
+    if not proposals and not suggestions:
         lines.append("No improvements proposed this week. Code looks healthy. ✅")
     else:
-        lines.append(f"Claude proposed **{len(proposals)}** change(s).")
+        lines.append(f"Claude proposed **{len(proposals)}** change(s) and "
+                     f"**{len(suggestions)}** suggestion(s).")
         lines.append("")
         lines.append("Every change in this PR needs the owner's review before merging. "
-                     "Read every test diff before running pytest locally: the tests were "
+                     "Read every new test file before running pytest locally: the tests were "
                      "written by an LLM and run as code on your machine.")
         lines.append("")
         if applied:
             lines.append("## ✅ Applied (in this PR)")
             for p in applied:
-                flag = (" — ⚠️ safety-adjacent — review carefully"
-                        if p.get("file") in SAFETY_ADJACENT else "")
+                flag = NEW_TEST_FLAG if str(p.get("file", "")).startswith("tests/") else ""
                 lines.append(f"- **{p.get('title')}** (`{p.get('file')}`, "
                              f"impact: {p.get('impact','?')}){flag} — {p.get('reason')}")
             lines.append("")
@@ -877,7 +777,7 @@ def _write_report(proposals, applied, not_applied, reverted, not_allowed=()):
                              f"{p.get('change_type')}) — {p.get('reason')}")
             lines.append("")
         if not_allowed:
-            lines.append("## 🔒 Skipped (locked file or symbol) — NOT applied, review by hand")
+            lines.append("## 🔒 Skipped (not on the allowlist) — see Suggestions")
             for p in not_allowed:
                 lines.append(f"- **{p.get('title')}** (`{p.get('file')!r}`) — "
                              f"{p.get('_skip', NOT_ALLOWED)} — {p.get('reason')}")
@@ -886,6 +786,12 @@ def _write_report(proposals, applied, not_applied, reverted, not_allowed=()):
             lines.append("## ⛔ Reverted (failed to compile)")
             for fname, err in reverted:
                 lines.append(f"- `{fname}` — reverted, syntax error")
+            lines.append("")
+        if suggestions:
+            lines.append(SUGGESTIONS_HEADER)
+            for sug in suggestions:
+                lines.append(f"- **{sug.get('title')}** (`{sug.get('file')!r}`)")
+                lines.extend(_code_block(sug.get("detail", "")))
             lines.append("")
 
     report_path = REPORT_DIR / "latest.md"
