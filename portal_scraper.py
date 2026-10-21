@@ -502,6 +502,26 @@ def _extract_detail_page(page, booking_id: str) -> dict:
     return result
 
 
+# Specifikation column headers (the portal repeats a header row per section: Tjänster,
+# Delar, Vätskor / Oljor). Rows are read by column, never by position in the text: a fluid
+# row has EMPTY OEM No / Artikel-ID cells, and service rows carry labour codes (F00093,
+# 3546) in those columns that must never become part ids.
+SPEC_COLUMNS = {"oem no": "oem_no", "artikel-id": "article_id", "antal": "qty"}
+DEFAULT_SPEC_COLUMNS = {"qty": 3}  # no recognised header row: the historical Antal position
+
+
+def _spec_columns(header_texts) -> dict:
+    """{key: cell index} from one header row's texts; defaults when nothing is recognised."""
+    columns = dict(DEFAULT_SPEC_COLUMNS)
+    seen = set()
+    for i, text in enumerate(header_texts):
+        key = SPEC_COLUMNS.get(" ".join(str(text or "").split()).casefold())
+        if key and key not in seen:
+            columns[key] = i
+            seen.add(key)
+    return columns
+
+
 def _extract_specification(page) -> tuple:
     """
     Extract only from the Specifikation section — stops before Handelselogg.
@@ -512,6 +532,9 @@ def _extract_specification(page) -> tuple:
 
     Strategy: find the Specifikation heading, then only read rows
     inside that container. Stop at any heading containing 'logg' or 'händelse'.
+
+    Each section's header row (th cells) names the columns; parts and fluids get
+    `oem_no` and `article_id` from the "OEM No" / "Artikel-ID" columns ("" when absent).
     """
     services = []
     parts    = []
@@ -549,6 +572,7 @@ def _extract_specification(page) -> tuple:
 
         category = "service"
         in_handelselogg = False
+        columns = dict(DEFAULT_SPEC_COLUMNS)
 
         for row in rows:
             row_text  = row.inner_text().strip()
@@ -571,6 +595,9 @@ def _extract_specification(page) -> tuple:
                     category = "fluids"
                 elif row_lower.startswith("service") and "kontroll" not in row_lower:
                     category = "service"
+                headers = row.query_selector_all("th")
+                if headers:
+                    columns = _spec_columns([h.inner_text() for h in headers])
                 continue
 
             # Skip header rows (th elements)
@@ -614,9 +641,15 @@ def _extract_specification(page) -> tuple:
                     price = t
                     break
 
-            qty  = cells[3].inner_text().strip() if len(cells) > 3 else ""
-            item = {"name": name, "qty": qty, "price": price}
+            def column(key: str) -> str:
+                i = columns.get(key)
+                return cells[i].inner_text().strip() if i is not None and i < len(cells) else ""
 
+            item = {"name": name, "qty": column("qty"), "price": price}
+
+            if category in ("parts", "fluids"):
+                item["article_id"] = column("article_id")
+                item["oem_no"] = column("oem_no")
             if category == "parts":
                 parts.append(item)
             elif category == "fluids":
