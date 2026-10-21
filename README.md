@@ -46,6 +46,8 @@ approve.yml — daily 06:00 UTC, every day                      (python approve.
         ├─ Klar    → Hanterad → Bekräfta in the MECA portal
         └─ approvals older than 48 h expire
         ▼
+  Order checker: placed orders not yet verified → pro.meca.se "Skickade Beställningar"
+        ▼
   Commit config/orders.json back
 
 weekly-improve.yml — Mondays 06:00 UTC                        (python improve.py --apply-all)
@@ -58,6 +60,16 @@ weekly-improve.yml — Mondays 06:00 UTC                        (python improve.
         ▼
   Pull Request → you review & merge
 ```
+
+**Order checker.** pro.meca.se often shows no order number right after "Skicka beställning"; the
+Beställd message then says "Ordernummer: bekräftas senare". The placed order appears later under
+Orderöversikt → "Skickade Beställningar". Every approve run (daily, or by hand) opens that tab
+read-only and looks for a row dated on or after the order day whose car model ("Bilmodell")
+matches the booking's vehicle (and whose hidden registration column does not contradict it).
+Exactly one row → the numbers are stored in `config/orders.json` (`verified_numbers`) and the
+owner gets "Beställning verifierad: <bokning> – <modell>, ordernummer …". Several rows → one
+message asking which one it is (never picked automatically). Nothing found within **3 days** →
+one warning to check by hand. A pro.meca.se error is retried silently on the next run.
 
 Parts rules (owner-editable in [`parts_rules.yaml`](parts_rules.yaml), no code change needed):
 Bosch preferred, then another brand; never ProMeister; never fluids or oils; only parts linked to
@@ -160,7 +172,8 @@ that the GitHub runs never see.
 
 ```
 agent.py               # Daily booking run: scrape, notify once, Hanterad or stage order
-approve.py             # Daily poller: Approve / Cancel / Klar taps, expiry
+approve.py             # Daily poller: Approve / Cancel / Klar taps, expiry, order checker
+order_match.py         # Order checker: match a placed order to a "Skickade Beställningar" row
 notifier.py            # Telegram Bot API client
 portal_scraper.py      # MECA portal: login, Nya tab, detail extraction, Hanterad
 parts_order.py         # Plan, stage and execute a pro.meca.se order

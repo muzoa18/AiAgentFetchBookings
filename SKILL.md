@@ -26,7 +26,9 @@ parts ends in a message saying ordered, blocked or failed: nothing fails silentl
 ## File map
 ```
 agent.py                 Daily booking run: scrape → notify once → Hanterad (no parts) or stage order
-approve.py               Daily poller: Approve / Cancel / Klar taps, 48 h expiry, Klar withdrawal
+approve.py               Daily poller: Approve / Cancel / Klar taps, 48 h expiry, Klar withdrawal,
+                         order checker (verifies placed orders in "Skickade Beställningar")
+order_match.py           Order checker matching (pure): car model / date / registration → one row
 notifier.py              Telegram Bot API client (stdlib): messages, inline buttons, getUpdates
 portal_scraper.py        MECA portal (Playwright): login, Nya tab, detail page, Hanterad → Bekräfta
 parts_order.py           Plan, stage (cart), approval message, execute_order (checkout)
@@ -106,6 +108,25 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   as already handled by hand. Klar buttons older than 14 days are withdrawn once with a notice.
 - `python approve.py --check` (stdlib only) prints `has_pending=true|false`; the workflow skips
   installing Playwright when nothing is pending.
+
+## Order checker (approve.py, after the taps)
+- A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the
+  final click); the Beställd message then says "Ordernummer: bekräftas senare (kolla Skickade
+  Beställningar i pro.meca.se)". The real order shows up later in Orderöversikt → tab
+  "Skickade Beställningar" (columns: Ordernummer, Status, Datum, Registreringsnummer (hidden),
+  Bilmodell, Ordernummer (portal, "01681392/01681393"), …, Beställningsstatus).
+- Each approve run (daily 06:00 UTC, or by hand) checks every `ordered` record without
+  `verified_at` that has not been warned about: `PartsPortal.list_sent_orders()` (read-only; the
+  only click is the tab) → `order_match.match_sent_order`. A candidate row is dated on or after
+  the order's Swedish date, has a model, is not already claimed by another record, and its
+  Bilmodell starts with the booking's brand + whole model words (`KIARIO (III)(2014)` ↔
+  `KIA, Rio Kombi-sedan (III), 12-16`); a different registration excludes it; without a stored
+  `vehicle_model` the registration alone can match.
+- One row → `verified_at` + `verified_numbers` stored, message "Beställning verifierad: …". Two or
+  more → ONE message listing them (max 5), never picked. None for 3 days (by `updated_at`) → ONE
+  warning. `verify_warned` stops repeats. Portal errors: logged without page text, retried next
+  run, no message (the 3-day warning still goes out).
+- `plan_and_stage` stores the booking's car model as `vehicle_model` (sanitised, ≤ 80 chars).
 
 ## Parts rules
 - Only parts under **"Kopplade reservdelar"** (linked to the loaded vehicle) are candidates.
@@ -188,7 +209,8 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
 - pro.meca.se login: TWO email fields — use `#ShopLoginForm_Login` / `#ShopLoginForm_Password`.
 - pro.meca.se checkout: cart → "Gå vidare" → "Beställning <REG>" → "Skicka beställning" (the only
   click that places an order). The confirmation page has not been seen yet; it is handled
-  defensively (an order without a readable reference is reported as `UNVERIFIED-…`).
+  defensively (an order without a readable reference is stored as `UNVERIFIED-…`; the order
+  checker finds the real number later in "Skickade Beställningar").
 
 ## Safety invariants (never break these)
 - A booking is never ordered twice (`orders_state`; `attempted` is written before checkout and a
