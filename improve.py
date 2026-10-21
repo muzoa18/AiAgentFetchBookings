@@ -3,21 +3,23 @@ improve.py
 ----------
 Self-improvement system for the MECA Agent System.
 
-TWO MODES:
+THREE MODES:
+
+  PR mode (GitHub Actions, .github/workflows/weekly-improve.yml, Mondays):
+      python improve.py --apply-all
+      → Applies every proposal that does not touch a protected path, py_compiles
+        each changed .py (reverting any that fail), writes
+        improve_reports/latest.md, and the workflow opens a Pull Request.
 
   Interactive (manual review):
       python improve.py
       → Shows all proposals with diffs, you approve each one.
 
-  Automatic (runs after agent.py):
+  Automatic (local, by hand):
       python improve.py --auto
-      → Applies only safe fixes silently.
-        Saves a log of what was changed.
+      → Applies only proposals marked auto_apply. Logs to logs/improve_auto.log.
 
-Task Scheduler setup:
-  17:00 → agent.py
-  17:30 → improve.py --auto
-  Every 30 min → email_agent.py
+In every mode a proposal for a PROTECTED_PATHS file is never written (is_protected).
 """
 
 import sys
@@ -31,7 +33,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Improve agent reviews and edits real source — use the most capable model.
-IMPROVE_MODEL = "claude-opus-4-8"
+IMPROVE_MODEL = "claude-opus-5-5"
 
 try:
     import anthropic
@@ -50,69 +52,146 @@ CONFIG_PATH  = Path("config/config.yaml")
 SKILL_FILE   = Path("SKILL.md")
 PROPOSAL_DIR = Path("logs/proposals")
 
-# All source files to include in review
+# All source files to include in review (the real current modules; see SKILL.md).
 SOURCE_FILES = [
     "agent.py",
+    "approve.py",
+    "notifier.py",
+    "orders_state.py",
+    "parts_order.py",
+    "parts_order_helpers.py",
+    "parts_matcher.py",
+    "parts_portal.py",
+    "parts_portal_parse.py",
     "portal_scraper.py",
-    "parts_agent.py",
-    "email_agent.py",
-    "sms_sender.py",
-    "state.py",
+    "rules.py",
+    "parts_rules.yaml",
     "config_loader.py",
+    "state.py",
     "run_logger.py",
 ]
 
-# All log files to include
+# Log files that can exist (logs/agent.log only inside a CI run or a local run).
 LOG_FILES = [
     ("logs/agent.log",        "BOOKING AGENT LOG"),
-    ("logs/email_agent.log",  "EMAIL AGENT LOG"),
-    ("logs/parts_agent.log",  "PARTS AGENT LOG"),
     ("logs/improve_auto.log", "AUTO-IMPROVE LOG"),
 ]
+
+# Paths a proposal may never write, enforced in code (is_protected) before any file
+# is touched, whatever the model says. An entry ending in "/" protects a directory.
+# The safety logic named in SYSTEM_PROMPT lives in whole files below, so those files
+# are protected entirely: a proposal for them is listed as "skipped (protected)" in
+# the report for a human to apply by hand.
+PROTECTED_PATHS = (
+    ".github/",                 # workflows, schedules, secrets wiring
+    ".claude/",                 # agent context
+    "config/",                  # config, state files (seen_ids.txt, orders.json)
+    "parts_rules.yaml",         # brand rules, 10,000 SEK ceiling, approve/auto mode
+    "rules.py",                 # validation of the rules file
+    "approve.py",               # approval authorisation (owner, private chat, message id)
+    "parts_matcher.py",         # ProMeister / fluid / placement / brand safety
+    "parts_order.py",           # ceiling and cart checks, attempted-before-checkout
+    "parts_order_helpers.py",   # cart and total checks
+    "orders_state.py",          # order-state validation (never order twice)
+    "improve.py",               # this file, including this list
+)
+
+
+def is_protected(file: str) -> bool:
+    """True if a proposal may not write `file`. Fails closed: anything that is not
+    a plain relative path inside the repo (absolute, '..', empty) counts as protected.
+    Compared case-insensitively, with '\\' as a separator, before and after resolving
+    symlinks."""
+    raw = str(file or "").strip().replace("\\", "/")
+    # ":" covers drive letters and NTFS streams; a trailing dot/space names the
+    # same file on Windows ("parts_rules.yaml." == "parts_rules.yaml").
+    if not raw or raw.startswith("/") or ":" in raw:
+        return True
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts or any(part[-1] in ". " for part in parts):
+        return True
+    root = Path.cwd().resolve()
+    try:
+        resolved = (root / "/".join(parts)).resolve().relative_to(root).as_posix()
+    except (ValueError, OSError):
+        return True
+    return any(_matches_protected(rel) for rel in ("/".join(parts), resolved))
+
+
+def _matches_protected(rel: str) -> bool:
+    rel = rel.casefold()
+    for entry in PROTECTED_PATHS:
+        entry = entry.casefold()
+        if entry.endswith("/"):
+            if rel == entry.rstrip("/") or rel.startswith(entry):
+                return True
+        elif rel == entry:
+            return True
+    return False
+
 
 SYSTEM_PROMPT = """
 You are an expert Python developer reviewing the MECA Agent System.
 This is a real production system used daily at MD Bilreparationer AB,
-a Swedish MECA car workshop in Eskilstuna.
+a Swedish MECA car workshop in Eskilstuna. It runs unattended on GitHub
+Actions and places real parts orders, so it must fail closed.
+SKILL.md (included below) is the full description; this is the summary.
 
-THE SYSTEM HAS THREE AGENTS:
+THE SYSTEM:
 
-1. agent.py — Booking agent (runs daily at 17:00)
-   - Logs into meca.promeisterportal.com
-   - Opens /Booking/Index → clicks Nya tab
-   - For each new booking: opens detail page, extracts all info
-   - Sends SMS via 46elks to workshop owner(s)
-   - Clicks Hanterad → Bekräfta if booking_type == Bokning
-   - If booking_type == Förfrågan → calls parts_agent.py
+1. agent.py — daily booking run (bookings.yml, 15:00 UTC Mon-Sat)
+   - Logs into meca.promeisterportal.com (portal_scraper.py, Playwright),
+     opens /Booking/Index, Nya tab, reads every listed booking's detail page.
+   - The PORTAL is the truth for a Bokning: listed on the Nya tab = not handled.
+     config/seen_ids.txt only means "the owner was notified": one Telegram
+     message per booking (notifier.py), never repeated unless the outcome changes.
+   - Bokning without spare parts (fluids only count as no parts): Hanterad ->
+     Bekräfta right away, retried every run until it succeeds.
+   - Bokning with spare parts: never marked Hanterad by agent.py. It stages a
+     pro.meca.se order (parts_order.py, parts_portal.py, parts_matcher.py) and
+     sends a Telegram message with Approve / Cancel buttons.
+   - Offert / Förfrågan: no Hanterad button; notified once (local storage).
 
-2. email_agent.py — Email customer service (runs every 30 min)
-   - Reads unread Gmail threads (full conversation, not just latest)
-   - Claude decides: ask_info | send_quote | general_reply | ignore
-   - If send_quote and reg_nr + work exist → calls parts_agent.py
-   - Creates Gmail DRAFT for workshop owner to review before sending
-   - SMS only when a quote PDF was successfully created
-   - Non-customer/supplier emails → marked back as UNREAD
-   - Known suppliers excluded: riddermarkbil.se, dssparts.se etc.
-   - Service packages: liten service = oljefilter + pollenfilter kolfilter + Mobil 1 motorolja
-   - Parts brand rules: always Bosch filters/brakes, always Mobil 1 oil, never ProMeister
+2. approve.py — daily approval poller (approve.yml, 06:00 UTC every day)
+   - Reads the owner's Telegram taps. Approve -> re-checks the live cart against
+     the stored plan and the ceiling, then checks out. Cancel -> clears the cart.
+     Approvals expire after 48 h.
+   - Klar: every resolution message (ordered, blocked, failed, cancelled, expired)
+     has a Klar button; the tap marks the booking Hanterad in the MECA portal.
+   - Only the owner, in the private chat, on the booking's own message is accepted.
 
-3. parts_agent.py — Quote builder (triggered by agent.py or email_agent.py)
-   - Logs into pro.meca.se using #ShopLoginForm_Login / #ShopLoginForm_Password
-   - Loads vehicle by reg number via URL parameter
-   - Searches each part in catalog search bar
-   - Claude AI picks best match (prefer Bosch, prefer Mobil 1, reject ProMeister)
-   - Adds parts to cart
-   - Adds labor via Fritext dialog (Typ=Arbetstid, fills hours and rate)
-   - Writes AI-generated Offertnotering in Swedish
-   - Clicks "Skriv ut prisförslag (PDF)" → downloads PDF to logs/quotes/
-   - PDF is attached to Gmail draft addressed to mdbilreparationer@gmail.com
+3. Parts rules — parts_rules.yaml (owner-edited, loaded by rules.py)
+   - Prefer Bosch, then another brand; never ProMeister; never fluids or oils.
+   - Only parts under "Kopplade reservdelar" (linked to the vehicle) are candidates.
+   - Axle/side placement must match; axle-specific parts need an axle in the line.
+   - Ceiling 10,000 SEK per booking order; mode: approve (ask owner) or auto.
+
+4. State — config/orders.json (orders_state.py): one status per booking so a
+   booking is never ordered twice; "attempted" is written before checkout.
+
+PROTECTED AREAS — proposals must NOT touch:
+- anything under .github/ (workflows, schedules, secrets) or config/,
+- parts_rules.yaml and rules.py,
+- the approval authorisation in approve.py (owner / private chat / message id),
+- the ceiling, ProMeister, fluid and placement safety logic in parts_matcher.py,
+  parts_order.py and parts_order_helpers.py,
+- the validation in orders_state.py,
+- improve.py itself.
+This is enforced in code: a proposal for approve.py, parts_matcher.py,
+parts_order.py, parts_order_helpers.py, orders_state.py, rules.py, improve.py,
+parts_rules.yaml or any path under .github/ or config/ is NOT applied; it is
+listed in the report as "skipped (protected)" for a human to review. Only
+propose changes there for a real, clearly explained bug.
+
+WELCOME: selector fixes and parsing robustness (portal_scraper.py,
+parts_portal.py, parts_portal_parse.py), logging, error handling, clearer
+owner messages that stay Swedish and never carry raw exception text, and tests.
 
 KNOWN ISSUES TO WATCH FOR:
-- pro.meca.se login: has TWO email fields — must use #ShopLoginForm_Login, NOT placeholder*mail
-- Cookie popups on both portals must be dismissed before any clicks work
-- Specification table scraping stops at Händelselogg to avoid parsing event log
-- Claude sometimes returns ask_info with only mätarställning missing — code override forces send_quote
-- mätarställning is NEVER required — code strips it from missing_info
+- Cookie popups on both portals must be dismissed before any clicks work.
+- pro.meca.se login has TWO email fields: use #ShopLoginForm_Login.
+- Specification scraping stops at Händelselogg so event-log rows are not parsed.
+- The pro.meca.se cart is per vehicle; the order confirmation page is unverified.
 
 YOUR JOB:
 - Identify REAL problems visible in logs or code
@@ -279,6 +358,10 @@ def apply_proposal(proposal: dict) -> bool:
     replace = proposal.get("replacement", "")
     path    = Path(file)
 
+    if is_protected(file):
+        print(f"  SKIPPED: {file} is a protected path — not written.")
+        return False
+
     if not path.exists():
         print(f"  ERROR: {file} not found.")
         return False
@@ -398,7 +481,7 @@ def run_interactive(api_key: str):
     save_proposal_log(proposals, applied, "interactive")
     print(f"\nApplied {len(applied)}/{len(chosen)} improvements.")
     if applied:
-        print("Run `python agent.py` or `python email_agent.py` to test.")
+        print("Run the test suite (python -m pytest) before running anything live.")
 
 
 # ── Automatic mode ────────────────────────────────────────────────────────────
@@ -406,7 +489,7 @@ def run_interactive(api_key: str):
 def run_auto(api_key: str):
     """
     Silent mode — applies only auto_apply=true proposals.
-    Run via Task Scheduler after agent.py.
+    Run by hand; protected paths are never written (apply_proposal).
     """
     log_path = Path("logs/improve_auto.log")
     Path("logs").mkdir(exist_ok=True)
@@ -481,16 +564,21 @@ def run_apply_all(api_key: str):
     proposals = ask_claude(api_key, read_sources(), read_logs())
     if not proposals:
         print("No improvements proposed — code looks healthy.")
-        _write_report([], [], [], [])
+        _write_report([], [], [], [], [])
         return
 
     # Snapshot originals so we can revert files that end up broken.
     snapshots = {f: Path(f).read_text(encoding="utf-8")
                  for f in SOURCE_FILES if Path(f).exists()}
 
-    applied, failed, skipped = [], [], []
+    applied, failed, skipped, protected = [], [], [], []
     for p in proposals:
         title = p.get("title", "?")
+        if is_protected(p.get("file", "")):
+            # Checked before anything is written (apply_proposal checks again).
+            protected.append(p)
+            print(f"  [PROTECTED] {title} ({p.get('file')}) — skipped (protected)")
+            continue
         if p.get("change_type") == "config_change":
             # Config lives in GitHub Secrets, not in the repo — can't auto-apply.
             skipped.append(p)
@@ -520,11 +608,11 @@ def run_apply_all(api_key: str):
             print(f"  [REVERT] {fname} — does not compile, reverted.")
 
     save_proposal_log(proposals, list(range(len(applied))), "apply_all")
-    _write_report(proposals, applied, skipped + failed, reverted)
+    _write_report(proposals, applied, skipped + failed, reverted, protected)
     print(f"\nApplied {len(applied)} change(s). Reverted {len(reverted)} broken file(s).")
 
 
-def _write_report(proposals, applied, not_applied, reverted):
+def _write_report(proposals, applied, not_applied, reverted, protected=()):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"# Weekly improve report — {ts}", ""]
@@ -545,6 +633,12 @@ def _write_report(proposals, applied, not_applied, reverted):
             for p in not_applied:
                 lines.append(f"- **{p.get('title')}** (`{p.get('file')}`, "
                              f"{p.get('change_type')}) — {p.get('reason')}")
+            lines.append("")
+        if protected:
+            lines.append("## 🔒 Skipped (protected) — NOT applied, review by hand")
+            for p in protected:
+                lines.append(f"- **{p.get('title')}** (`{p.get('file')}`) — "
+                             f"skipped (protected) — {p.get('reason')}")
             lines.append("")
         if reverted:
             lines.append("## ⛔ Reverted (failed to compile)")
