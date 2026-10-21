@@ -40,7 +40,7 @@ parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling
 config_loader.py         Env-first config (GitHub Secrets) with config/config.yaml fallback
 state.py                 config/seen_ids.txt (notified once) + no-Hanterad-button bookkeeping
 run_logger.py            Appends one structured line per run to logs/run_history.jsonl
-improve.py               Weekly self-improve → PR (write allowlist enforced in code)
+improve.py               Weekly self-improve → PR (file allowlist + locked symbols enforced in code)
 inspect_portal.py        Dev helper: inspect the portal's HTML when selectors break
 config/config.example.yaml   Template; env var name for each field is in its comments
 tests/                   Offline pytest suite (fixtures for both portals' HTML)
@@ -151,16 +151,36 @@ every day; tap within ~36 h of the staging message.
 `.py`, reverts any file that does not compile, writes `improve_reports/latest.md`, and the
 workflow opens a **Pull Request**. It never pushes to `main`; a human reviews and merges.
 
-**Write allowlist** (`ALLOWED_FILES` / `allowed_path` in `improve.py`, enforced in code at write
-time, not only in the prompt): a proposal may write ONLY `portal_scraper.py`, `parts_portal.py`,
-`parts_portal_parse.py`, `notifier.py`, `state.py`, `run_logger.py`, or a `.py` file directly
-under `tests/`. Everything else — `.git/`, `.github/`, `.claude/`, `config/`, `parts_rules.yaml`,
-`rules.py`, `approve.py` (approval authorisation), `parts_matcher.py`, `parts_order*.py` (ceiling,
-ProMeister, fluid, placement safety), `orders_state.py`, `agent.py`, `config_loader.py`,
-`improve.py`, docs, new modules — is never written and is listed in the report as
-"skipped (not on the allowlist)". Dot-components, `..`, absolute paths, backslashes and symlinks
-are always refused. The workflow checks out with `persist-credentials: false`. Welcome: selector
-fixes and parsing robustness, logging, error handling, tests.
+**What the improve agent may change** (enforced in code in `improve.py`, not only in the prompt;
+every PR still needs the owner's review before merging):
+- `portal_scraper.py`, `parts_portal.py`, `parts_portal_parse.py`, `state.py`, `run_logger.py`
+  (`ALLOWED_FILES`, existing files only): selectors, parsing robustness, logging and error
+  handling **outside the locked symbols**;
+- NEW test files `tests/test_<lowercase_name>.py` (never an existing test, `conftest.py`,
+  `__init__.py`, `sitecustomize.py` or `*.pth`).
+
+**Locked symbols** (`PROTECTED_SYMBOLS`, compared with `ast` before anything is written; any
+source change inside them, even a docstring or comment, or a new definition shadowing them, is
+refused as "skipped (protected symbol: <name>)"; a change that does not parse is refused too):
+`parts_portal.py` — `PartsPortal.checkout`, `add_to_cart`, `clear_cart`, `read_cart`, `_cart`,
+`_confirmation`, `_overview_tokens`, `load_vehicle`, `_require_vehicle`, `SEL_PLACE_ORDER`,
+`SEL_GO_ON` and any top-level symbol naming "Skicka beställning" / "Avbryt beställning" /
+"Gå vidare"; `parts_portal_parse.py` — `parse_sek`, `parse_cart`, `parse_checkout`,
+`_checkout_lines`, `parse_search_results`, `_candidate`, `EXCLUDE_TEXTS`, `linked_tab_id`,
+`current_plate`, `extract_order_reference`, `page_markers` and their helpers;
+`portal_scraper.py` — `mark_booking_handled`, `_click_hanterad`, `HANTERAD_TEXT`,
+`BEKRAFTA_TEXT`, `_logged_in`, `_require_login`, `_auth_reason`, `_detect_booking_type`.
+
+**Everything else is locked** and reported as "skipped (not on the allowlist)": `.git/`,
+`.github/`, `.claude/`, `config/`, `parts_rules.yaml`, `rules.py`, `approve.py` (approval
+authorisation), `notifier.py` (`get_updates` produces the chat/user ids approve.py trusts),
+`parts_matcher.py`, `parts_order*.py` (ceiling, ProMeister, fluid, placement safety),
+`orders_state.py`, `agent.py`, `config_loader.py`, `improve.py`, docs, existing tests, new
+modules. Dot-components, `..`, absolute paths, backslashes and symlinks are always refused; the
+path is checked again at write time. Applied changes to the three scraper/parser files are
+flagged "safety-adjacent — review carefully" in the report. Read test diffs before running
+pytest locally: the tests are LLM-written code. The workflow checks out with
+`persist-credentials: false`.
 
 ## Secrets (GitHub Secrets; env var overrides config.yaml)
 `PORTAL_USERNAME`, `PORTAL_PASSWORD` (MECA portal), `PARTS_PORTAL_USERNAME`,
@@ -192,7 +212,8 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
   be delivered turns the run red.
 - Owner messages are Swedish and never carry raw exception text; customer data is never written
   to `config/orders.json` (it is committed to git).
-- No secrets in git. The improve agent only opens PRs and only writes allowlisted files.
+- No secrets in git. The improve agent only opens PRs, only writes allowlisted files outside the
+  locked symbols, and every PR needs the owner's review.
 
 ## Known limitations
 - The order confirmation page, quantity semantics ("x4" pieces vs sets), the real format of

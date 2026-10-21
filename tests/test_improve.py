@@ -94,7 +94,9 @@ def test_prompt_states_the_allowlist():
     prompt = improve.SYSTEM_PROMPT
     for name in improve.ALLOWED_FILES:
         assert name in prompt, name
-    for needle in ("tests/", "skipped (not on the allowlist)", "parts_rules.yaml", ".github/"):
+    for needle in ("tests/test_", "skipped (not on the allowlist)", "parts_rules.yaml", ".github/",
+                   "skipped (protected symbol:", "PartsPortal.checkout", "mark_booking_handled",
+                   "parse_sek", "notifier.py (get_updates", "reviewed by the owner"):
         assert needle in prompt, needle
 
 
@@ -102,8 +104,8 @@ def test_prompt_states_the_allowlist():
 
 def test_allowed_files_are_exactly_the_robustness_modules():
     assert improve.ALLOWED_FILES == ("portal_scraper.py", "parts_portal.py",
-                                     "parts_portal_parse.py", "notifier.py", "state.py",
-                                     "run_logger.py")
+                                     "parts_portal_parse.py", "state.py", "run_logger.py")
+    assert "notifier.py" not in improve.ALLOWED_FILES  # get_updates feeds the approval identity
 
 
 @pytest.fixture
@@ -115,6 +117,7 @@ def repo(tmp_path, monkeypatch):
     files = {name: f"# {name}\nX = 1\n" for name in improve.ALLOWED_FILES}
     files.update({
         "approve.py": "OWNER_ONLY = True\n",
+        "notifier.py": "def get_updates():\n    return []\n",
         "agent.py": "A = 1\n",
         "parts_rules.yaml": "ceiling_sek: 10000\n",
         "config/config.yaml": "portal: {}\n",
@@ -139,7 +142,10 @@ REJECTED = [
     "./portal_scraper.py", "portal_scraper.py\\", "tests\\test_x.py", "Portal_Scraper.py",
     "portal_scraper.py\x00", "tests/fixtures/page.html", "tests/fixtures/test_x.py",
     "tests/.hidden.py", "tests/test_x.txt", "tests//test_x.py", "", "C:/Windows/x.py",
-    "portal_scraper.py.", "tests/test_x.py ",
+    "portal_scraper.py.", "tests/test_x.py ", "notifier.py",
+    "tests/test_existing.py", "tests/conftest.py", "tests/__init__.py", "tests/CON.py",
+    "tests/test_X.py", "tests/sitecustomize.py", "tests/x.pth", "tests/helper.py",
+    "tests/test_.py.py", "tests/test-x.py", "tests/test_é.py", "tests/test_x.pyc",
 ]
 
 
@@ -149,7 +155,7 @@ def test_rejected_paths(repo, path):
 
 
 @pytest.mark.parametrize("path", list(improve.ALLOWED_FILES) + [
-    "tests/test_existing.py", "tests/test_new.py"])
+    "tests/test_new.py", "tests/test_new_2.py"])
 def test_allowed_paths(repo, path):
     assert improve.allowed_path(path) == path
 
@@ -181,7 +187,7 @@ def test_allowed_name_that_is_a_symlink_outside_is_rejected(repo, tmp_path):
 def test_symlink_inside_the_repo_is_rejected_even_to_an_allowed_file(repo):
     root, _ = repo
     (root / "run_logger.py").unlink()
-    _symlink(root / "run_logger.py", root / "notifier.py")
+    _symlink(root / "run_logger.py", root / "state.py")
     assert improve.allowed_path("run_logger.py") is None
 
 
@@ -205,16 +211,16 @@ def test_write_is_rechecked_at_write_time(repo, tmp_path, monkeypatch):
     real_check = improve.allowed_path
     calls = {"n": 0}
 
-    def flip(path):
+    def flip(path, created=frozenset()):
         calls["n"] += 1
-        result = real_check(path)
+        result = real_check(path, created)
         if calls["n"] == 1:  # after the first check, swap the file for a symlink
-            (root / "notifier.py").unlink()
-            _symlink(root / "notifier.py", outside)
+            (root / "state.py").unlink()
+            _symlink(root / "state.py", outside)
         return result
 
     monkeypatch.setattr(improve, "allowed_path", flip)
-    assert improve.apply_proposal(proposal("notifier.py", "", "EVIL = 1\n", "replace_file")) is False
+    assert improve.apply_proposal(proposal("state.py", "", "EVIL = 1\n", "replace_file")) is False
     assert outside.read_text(encoding="utf-8") == "V = 1\n"
 
 
@@ -273,25 +279,63 @@ def test_apply_all_applies_allowed_and_lists_skipped(repo, tmp_path, fake_claude
     applied_section = report.split("## ✅ Applied")[1].split("##")[0]
     assert "longer timeout" in applied_section and "new test" in applied_section
     assert "raise the ceiling" not in applied_section
+    scraper_line = next(l for l in applied_section.splitlines() if "longer timeout" in l)
+    assert "safety-adjacent — review carefully" in scraper_line
+    test_line = next(l for l in applied_section.splitlines() if "new test" in l)
+    assert "safety-adjacent" not in test_line
+    assert "before running pytest" in report
+    assert "owner's review" in report
 
 
 def test_apply_all_reverts_a_file_that_does_not_compile(repo, fake_claude):
     root, files = repo
     state, _ = fake_claude
     state["proposals"].extend([
-        proposal("portal_scraper.py", "X = 1", "X = (", title="broken"),
+        proposal("state.py", "X = 1", "X = (", title="broken"),
         proposal("tests/test_broken.py", "", "def (:\n", change_type="replace_file",
                  title="broken new test"),
-        proposal("tests/test_existing.py", "assert True", "assert (", title="broken test"),
     ])
     improve.run_apply_all("key")
-    assert (root / "portal_scraper.py").read_text(encoding="utf-8") == files["portal_scraper.py"]
-    assert (root / "tests" / "test_existing.py").read_text(encoding="utf-8") == \
-        files["tests/test_existing.py"]
+    assert (root / "state.py").read_text(encoding="utf-8") == files["state.py"]
     assert not (root / "tests" / "test_broken.py").exists()
     report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
-    assert "Reverted" in report and "portal_scraper.py" in report
+    assert "Reverted" in report and "state.py" in report and "tests/test_broken.py" in report
     assert "## ✅ Applied" not in report
+
+
+def test_a_new_test_file_may_be_edited_again_in_the_same_run_only(repo, fake_claude):
+    root, files = repo
+    state, _ = fake_claude
+    state["proposals"].extend([
+        proposal("tests/test_new.py", "", "def test_b():\n    assert 1\n",
+                 change_type="replace_file", title="new test"),
+        proposal("tests/test_new.py", "assert 1", "assert 2", title="tweak new test"),
+        proposal("tests/test_existing.py", "assert True", "assert False", title="weaken old"),
+    ])
+    improve.run_apply_all("key")
+    assert (root / "tests" / "test_new.py").read_text(encoding="utf-8") == \
+        "def test_b():\n    assert 2\n"
+    assert (root / "tests" / "test_existing.py").read_text(encoding="utf-8") == \
+        files["tests/test_existing.py"]
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    line = next(l for l in report.splitlines() if "weaken old" in l)
+    assert "skipped (not on the allowlist)" in line
+    # the next run may not overwrite it
+    assert improve.allowed_path("tests/test_new.py") is None
+
+
+def test_proposal_log_records_the_indices_of_applied_proposals(repo, fake_claude):
+    root, _ = repo
+    state, _ = fake_claude
+    state["proposals"].extend([
+        proposal("approve.py", "", "X\n", change_type="replace_file", title="refused"),
+        proposal("state.py", "X = 1", "X = 2", title="ok"),
+        proposal("state.py", "NOT THERE", "Y", title="fails"),
+        proposal("run_logger.py", "X = 1", "X = 3", title="ok too"),
+    ])
+    improve.run_apply_all("key")
+    (log,) = (root / "logs" / "proposals").glob("proposal_apply_all_*.json")
+    assert json.loads(log.read_text(encoding="utf-8"))["applied_indices"] == [1, 3]
 
 
 def test_apply_all_with_no_proposals_writes_the_healthy_report(tmp_path, monkeypatch, fake_claude):
@@ -325,3 +369,168 @@ def test_weekly_improve_checkout_does_not_persist_credentials():
     assert "python improve.py --apply-all" in runs
     pr = next(s for s in job["steps"] if "create-pull-request" in str(s.get("uses", "")))
     assert pr["with"]["body-path"] == "improve_reports/latest.md"
+
+
+# ── protected symbols inside the allowlisted files ───────────────────────────
+
+PORTAL_SRC = '''"""Module doc mentions Skicka beställning."""
+SEL_SEARCH = "input[name='SearchTerm']"
+SEL_PLACE_ORDER = "button:has-text('Skicka beställning')"
+SEL_GO_ON = "button:has-text('Gå vidare')"
+OTHER_BUTTON = "a:has-text('Avbryt beställning')"
+
+
+class PartsPortal:
+    def search(self, term):
+        return term.strip()
+
+    def checkout(self, *, max_total_sek):
+        """Last ceiling check before the final click."""
+        if max_total_sek > 10000:  # the ceiling
+            raise ValueError("over")
+        return "ref"
+
+
+def helper():
+    return 1
+'''
+
+
+@pytest.fixture
+def portal_repo(repo):
+    root, files = repo
+    (root / "parts_portal.py").write_text(PORTAL_SRC, encoding="utf-8")
+    return root
+
+
+def _apply_all_one(p):
+    improve.run_apply_all("key")
+    return (Path("improve_reports") / "latest.md").read_text(encoding="utf-8")
+
+
+def _assert_refused(root, report, title, symbol):
+    assert (root / "parts_portal.py").read_text(encoding="utf-8") == PORTAL_SRC
+    line = next(l for l in report.splitlines() if title in l)
+    assert f"skipped (protected symbol: {symbol})" in line, line
+
+
+@pytest.mark.parametrize("find, replacement, symbol", [
+    ("if max_total_sek > 10000:", "if max_total_sek > 99999:", "PartsPortal.checkout"),
+    ('"""Last ceiling check before the final click."""', '"""Docstring only."""',
+     "PartsPortal.checkout"),
+    ("# the ceiling", "# a comment", "PartsPortal.checkout"),
+    ("        return \"ref\"\n", "        return \"ref\"\n\n    def checkout(self, **kw):\n"
+     "        return \"ref\"\n", "PartsPortal.checkout"),
+    ("def helper():", "PartsPortal.checkout = lambda *a, **k: 'ref'\n\n\ndef helper():",
+     "PartsPortal.checkout"),
+    ("SEL_PLACE_ORDER = \"button:has-text('Skicka beställning')\"", "SEL_PLACE_ORDER = \"x\"",
+     "SEL_PLACE_ORDER"),
+    ("SEL_GO_ON = \"button:has-text('Gå vidare')\"", "SEL_GO_ON = \"y\"", "SEL_GO_ON"),
+    ("OTHER_BUTTON = \"a:has-text('Avbryt beställning')\"", "OTHER_BUTTON = \"z\"",
+     "OTHER_BUTTON"),
+    ("def helper():", "NEW_CLICK = \"button:has-text('Skicka beställning')\"\n\n\n"
+     "def helper():", "NEW_CLICK"),
+])
+def test_protected_symbol_change_is_refused(portal_repo, fake_claude, find, replacement, symbol):
+    state, _ = fake_claude
+    state["proposals"].append(proposal("parts_portal.py", find, replacement, title="touch it"))
+    _assert_refused(portal_repo, _apply_all_one(None), "touch it", symbol)
+
+
+def test_deleting_a_protected_symbol_is_refused(portal_repo, fake_claude):
+    state, _ = fake_claude
+    text = PORTAL_SRC[:PORTAL_SRC.index("    def checkout")] + "\n\ndef helper():\n    return 1\n"
+    state["proposals"].append(proposal("parts_portal.py", "", text, "replace_file", title="drop"))
+    _assert_refused(portal_repo, _apply_all_one(None), "drop", "PartsPortal.checkout")
+
+
+def test_new_text_that_does_not_parse_is_refused(portal_repo, fake_claude):
+    state, _ = fake_claude
+    state["proposals"].append(proposal("parts_portal.py", "return 1", "return (", title="bad"))
+    report = _apply_all_one(None)
+    assert (portal_repo / "parts_portal.py").read_text(encoding="utf-8") == PORTAL_SRC
+    line = next(l for l in report.splitlines() if "bad" in l and "skipped" in l)
+    assert "skipped (protected symbol check: does not parse)" in line
+
+
+@pytest.mark.parametrize("find, replacement", [
+    ("return term.strip()", "return term.strip().lower()"),
+    ("def helper():\n    return 1", "def helper():\n    return 2"),
+    ("SEL_SEARCH = \"input[name='SearchTerm']\"", "SEL_SEARCH = \"input[name='Q']\""),
+])
+def test_unprotected_change_in_the_same_file_is_applied(portal_repo, fake_claude, find, replacement):
+    state, _ = fake_claude
+    state["proposals"].append(proposal("parts_portal.py", find, replacement, title="fine"))
+    report = _apply_all_one(None)
+    assert replacement in (portal_repo / "parts_portal.py").read_text(encoding="utf-8")
+    assert "safety-adjacent — review carefully" in report
+
+
+def test_missing_protected_symbol_does_not_crash(repo, fake_claude):
+    root, _ = repo
+    state, _ = fake_claude
+    state["proposals"].append(proposal("parts_portal_parse.py", "X = 1", "X = 2", title="ok"))
+    improve.run_apply_all("key")
+    assert (root / "parts_portal_parse.py").read_text(encoding="utf-8").endswith("X = 2\n")
+
+
+def test_protected_symbols_cover_the_money_gate_and_identity():
+    ps = improve.PROTECTED_SYMBOLS
+    assert set(ps) == {"parts_portal.py", "parts_portal_parse.py", "portal_scraper.py"}
+    for name in ("PartsPortal.checkout", "PartsPortal.add_to_cart", "PartsPortal.clear_cart",
+                 "PartsPortal.read_cart", "SEL_PLACE_ORDER", "SEL_GO_ON"):
+        assert name in ps["parts_portal.py"], name
+    for name in ("parse_sek", "parse_checkout", "parse_cart", "parse_search_results",
+                 "_checkout_lines", "linked_tab_id", "current_plate", "extract_order_reference",
+                 "page_markers", "EXCLUDE_TEXTS", "_candidate"):
+        assert name in ps["parts_portal_parse.py"], name
+    for name in ("mark_booking_handled", "_click_hanterad", "_logged_in", "HANTERAD_TEXT",
+                 "BEKRAFTA_TEXT", "_auth_reason"):
+        assert name in ps["portal_scraper.py"], name
+
+
+@pytest.mark.parametrize("rel", ["parts_portal.py", "parts_portal_parse.py", "portal_scraper.py"])
+def test_every_protected_symbol_exists_in_the_real_file(rel):
+    text = (REPO / rel).read_text(encoding="utf-8")
+    found = improve._symbol_sources(text)
+    missing = [name for name in improve.PROTECTED_SYMBOLS[rel] if name not in found]
+    assert missing == []
+
+
+def test_real_files_protect_their_money_buttons():
+    text = (REPO / "parts_portal.py").read_text(encoding="utf-8")
+    watched = improve._watched_symbols("parts_portal.py", improve._symbol_sources(text))
+    assert {"SEL_PLACE_ORDER", "SEL_GO_ON", "PartsPortal.checkout"} <= watched
+
+
+def test_interactive_mode_never_reads_outside_the_allowlist(repo, tmp_path, fake_claude,
+                                                            monkeypatch, capsys):
+    root, _ = repo
+    secret = tmp_path / "secret.py"
+    secret.write_text("TOKEN = 'abc'\n", encoding="utf-8")
+    state, _ = fake_claude
+    state["proposals"].extend([
+        proposal("../secret.py", "TOKEN = 'abc'", "TOKEN = 'x'", title="outside"),
+        proposal("state.py", "X = 1", "X = 2", title="inside"),
+    ])
+    opened = []
+    real_open = open
+
+    def spy(file, *a, **k):
+        opened.append(str(file))
+        return real_open(file, *a, **k)
+
+    real_read_text = Path.read_text
+
+    def spy_read_text(self, *a, **k):
+        opened.append(str(self))
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr("builtins.open", spy)
+    monkeypatch.setattr(Path, "read_text", spy_read_text)
+    monkeypatch.setattr("builtins.input", lambda *_: "none")
+    improve.run_interactive("key")
+    out = capsys.readouterr().out
+    assert not any("secret.py" in f for f in opened)
+    assert out.count("(proposed)") == 1  # only the allowlisted file gets a diff
+    assert "not on the allowlist" in out

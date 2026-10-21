@@ -53,7 +53,7 @@ weekly-improve.yml — Mondays 06:00 UTC                        (python improve.
         ▼
   Claude (claude-opus-5-5) reviews code + SKILL.md + logs → proposals
         ▼
-  Apply (allowlisted files only), syntax-check, revert anything broken
+  Apply (allowlisted files, outside locked symbols), syntax-check, revert anything broken
         ▼
   Pull Request → you review & merge
 ```
@@ -75,9 +75,12 @@ owner first).
   poller runs once a day; Telegram keeps unread taps for 24 h, so it runs every day.
 - **Fail closed.** Real money is spent unattended: any doubt (no confident match, unreadable
   total, cart mismatch, wrong chat) means no order and a message saying why.
-- **Improve agent opens PRs** and may only write an allowlist (scrapers, parsers, notifier,
-  state, run logger, tests) — enforced in code; workflows, config, rules and the safety modules
-  are never touched.
+- **Improve agent opens PRs** and may only change selectors, parsing, logging and error
+  handling in `portal_scraper.py`, `parts_portal.py`, `parts_portal_parse.py`, `state.py` and
+  `run_logger.py`, outside locked symbols (checkout, cart, totals and order-reference parsing,
+  the Hanterad click), plus add new test files — enforced in code. Everything else (workflows,
+  config, rules, notifier, approval and ordering modules) is locked. Every PR still needs your
+  review: read the test diffs before running pytest locally, since they are LLM-written code.
 - **No secrets in git.** Credentials live only in GitHub Secrets / a local
   `config/config.yaml` (gitignored). See [`config/config.example.yaml`](config/config.example.yaml).
 

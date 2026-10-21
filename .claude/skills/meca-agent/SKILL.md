@@ -19,8 +19,8 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   Approve/Cancel message) → `run_logger.log_run`.
 - `approve.py` (daily 06:00 UTC): `notifier.get_updates` → Approve: `parts_order.execute_order`;
   Cancel: clear cart; Klar: `mark_booking_handled`; expire approvals older than 48 h.
-- `improve.py --apply-all` (Mondays 06:00 UTC): proposals → PR; only `ALLOWED_FILES` and
-  `tests/*.py` are ever written.
+- `improve.py --apply-all` (Mondays 06:00 UTC): proposals → PR; only `ALLOWED_FILES` (outside
+  `PROTECTED_SYMBOLS`) and new `tests/test_*.py` files are ever written.
 
 ## Invariants (break these and bookings get missed, duplicated or wrongly ordered)
 - **The portal is the truth for a `Bokning`.** Listed on Nya = not handled. `seen_ids` only means
@@ -35,8 +35,9 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   `no_button_*.txt`, `run_history.jsonl`). Those files show as modified locally after a pull;
   that is normal, don't "clean" them.
 - **No secrets in git.** Config is env-first (`config_loader.py`); `config/config.yaml` is gitignored.
-- **Improve agent opens PRs only** and writes only its allowlist (scrapers, parsers, notifier,
-  state, run_logger, tests). Never make it push to `main` or widen the allowlist casually.
+- **Improve agent opens PRs only** and writes only its allowlist (scrapers, parsers, state,
+  run_logger, new tests), never the locked money-gate / Hanterad symbols. Never make it push to
+  `main` or widen the allowlist casually; every PR needs the owner's review.
 
 ## Working on it
 - Tests: `python -m pytest` (offline, fixtures for both portals). Run it before every commit.
