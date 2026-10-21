@@ -100,6 +100,14 @@ is a mechanic, not a developer: it must be safe by default and adjustable withou
 - **Infrastructure failures (my call):** a failed pro.meca.se login or a blocked IP sends a Telegram
   message ("parts ordering failed: login") so it is never silent.
 
+## Decisions after live recon of pro.meca.se (2026-10-21, owner-confirmed)
+- **Cart is per vehicle**, not per session; several sessions may exist. Every cart operation runs with the booking's vehicle loaded, and the empty-cart precondition applies per reg number.
+- **Fitment:** only parts under "Kopplade reservdelar" (linked to the loaded vehicle) are candidates. Prefer Bosch among those; if no linked Bosch part exists for the same part, another linked brand is acceptable (never ProMeister). No linked candidate -> nothing ordered for that booking and the message says so.
+- **Exclusions:** discontinued items ("Produkten har utgått") and items marked "Ersätts av" are never candidates.
+- **Value ceiling:** compared against the HIGHER of the totals visible on the cart page and the checkout page (not what is actually paid); a missing/unreadable total means no order. The checkout step re-checks this before the final click.
+- **Checkout path:** cart page -> "Gå vidare" -> checkout page ("Beställning <REG>") -> "Skicka beställning" (the order is placed here). The confirmation page has not been seen yet.
+- **First real order is a supervised live test:** the owner follows it and cancels if anything is wrong; the confirmation-page handling is verified and adjusted against it. Rollout stays approve-first.
+
 ## Left to the builder
 - Part-matching method (the repo already uses the Anthropic API; model choice, prompt and
   confidence threshold are the builder's call, as long as ambiguity fails closed).
