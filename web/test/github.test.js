@@ -122,3 +122,24 @@ test('dispatch refuses a workflow file name that is not plain', async () => {
   const gh = createGitHub({ ...base, fetchImpl: mockFetch(() => response(204, '')) });
   await assert.rejects(gh.dispatch('../../x'), (e) => e.code === 'config');
 });
+
+test('redirects are never followed', async () => {
+  const fetchImpl = mockFetch(() => response(200, 'x'));
+  const gh = createGitHub({ ...base, fetchImpl });
+  await gh.getFile('a');
+  await gh.getLatestCommit().catch(() => {});
+  await gh.dispatch('approve.yml');
+  assert.ok(fetchImpl.calls.every((c) => c.init.redirect === 'error'));
+  const failing = createGitHub({ ...base, fetchImpl: async () => { throw new TypeError('fetch failed: redirect mode is set to error'); } });
+  await assert.rejects(failing.getFile('a'), (e) => e.code === 'network');
+});
+
+test('response bodies over 2 MB are refused', async () => {
+  const big = 'x'.repeat(2 * 1024 * 1024 + 1);
+  const streamed = createGitHub({ ...base, fetchImpl: mockFetch(() => response(200, big)) });
+  await assert.rejects(streamed.getFile('config/orders.json'), (e) => e.code === 'too_large' && !e.message.includes('x'.repeat(10)));
+  const declared = createGitHub({ ...base, fetchImpl: mockFetch(() => new Response('small', { status: 200, headers: { 'content-length': String(50 * 1024 * 1024) } })) });
+  await assert.rejects(declared.getFile('config/orders.json'), (e) => e.code === 'too_large');
+  const ok = createGitHub({ ...base, fetchImpl: mockFetch(() => response(200, 'x'.repeat(1024 * 1024))) });
+  assert.equal((await ok.getFile('x')).length, 1024 * 1024);
+});

@@ -44,7 +44,7 @@ const NOW = Date.parse('2026-10-21T12:00:00Z');
 function vmWith(extra = {}) {
   return summarize({
     ordersText: JSON.stringify({ bookings: {
-      a: { status: 'blocked', updated_at: '2026-10-21T10:00:00Z', detail_url: 'https://portal.example.test/b/1',
+      a: { status: 'blocked', updated_at: '2026-10-21T10:00:00Z', detail_url: 'https://meca.promeisterportal.com/b/1',
         vehicle_model: EVIL,
         plan: { booking_nr: EVIL, reg_nr: 'QAB123', reason: EVIL,
           expected_lines: [{ title: EVIL, qty: 1, price_sek: 10 }], fluids: [{ name: EVIL, qty: EVIL }] }, ...extra },
@@ -58,7 +58,7 @@ function vmWith(extra = {}) {
 }
 
 test('XSS payloads are rendered as text, never as elements or attributes', () => {
-  const vm = { ...vmWith(), links: { orderOverview: 'https://pro.meca.example/orders' } };
+  const vm = { ...vmWith(), links: { orderOverview: 'https://pro.meca.se/orders' } };
   const roots = [R.orders(doc, vm, NOW), R.lastRun(doc, vm, NOW), R.history(doc, vm, NOW), R.freshness(doc, vm, NOW), R.tiles(doc, vm)];
   for (const root of roots) {
     for (const el of all(root)) {
@@ -81,7 +81,7 @@ test('javascript: links are never rendered', () => {
   const hrefs = all(R.orders(doc, vm2, NOW)).filter((e) => e.tagName === 'a');
   assert.equal(hrefs.length, 0);
   assert.equal(R.safeHref('JAVASCRIPT:alert(1)'), null);
-  assert.equal(R.safeHref('https://ok.example/'), 'https://ok.example/');
+  assert.equal(R.safeHref('https://pro.meca.se/'), 'https://pro.meca.se/');
 });
 
 test('status badges always carry text, not only colour', () => {

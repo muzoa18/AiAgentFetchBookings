@@ -11,7 +11,7 @@ function ordersFile(now) {
   const bookings = {
     'DEMO-A1': {
       status: 'pending', message_id: 1, updated_at: t(3), cart_touched: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-A1', vehicle_model: 'Volvo V60 D4 2017',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-A1', vehicle_model: 'Volvo V60 D4 2017',
       plan: {
         booking_id: 'DEMO-A1', booking_nr: '880142', reg_nr: 'QXA112', total_sek: 1486.0,
         expected_lines: [
@@ -25,7 +25,7 @@ function ordersFile(now) {
     },
     'DEMO-A2': {
       status: 'pending', message_id: 2, updated_at: t(5), cart_touched: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-A2',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-A2',
       plan: {
         booking_id: 'DEMO-A2', booking_nr: '880151', reg_nr: 'QLM48K', total_sek: 2390.5,
         expected_lines: [
@@ -37,7 +37,7 @@ function ordersFile(now) {
     },
     'DEMO-B1': {
       status: 'ordered', message_id: 3, updated_at: t(20), cart_touched: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-B1', vehicle_model: 'Volkswagen Golf 1.4 TSI 2015',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-B1', vehicle_model: 'Volkswagen Golf 1.4 TSI 2015',
       verified_at: t(14), verified_numbers: ['4471093'],
       klar_message_id: 31, klar_sent_at: t(14),
       plan: {
@@ -52,7 +52,7 @@ function ordersFile(now) {
     },
     'DEMO-B2': {
       status: 'ordered', message_id: 4, updated_at: t(30), cart_touched: true, handled: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-B2', vehicle_model: 'Toyota Corolla Hybrid 2020',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-B2', vehicle_model: 'Toyota Corolla Hybrid 2020',
       verified_at: t(26), verified_numbers: ['4470811', '4470812'],
       klar_message_id: 32, klar_sent_at: t(26),
       plan: {
@@ -65,7 +65,7 @@ function ordersFile(now) {
     },
     'DEMO-C1': {
       status: 'ordered', message_id: 5, updated_at: t(1.2), cart_touched: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-C1', vehicle_model: 'Škoda Octavia Combi 2.0 TDI 2019',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-C1', vehicle_model: 'Škoda Octavia Combi 2.0 TDI 2019',
       plan: {
         booking_id: 'DEMO-C1', booking_nr: '880160', reg_nr: 'QHN920', total_sek: 668.0, confirmation: 'väntar',
         expected_lines: [
@@ -79,7 +79,7 @@ function ordersFile(now) {
     'DEMO-D1': {
       status: 'blocked', message_id: 6, updated_at: t(9), cart_touched: false, tries: 3,
       last_reason: 'ingen säker träff för "Bromsskiva bak"',
-      detail_url: 'https://portal.example.com/booking/DEMO-D1', vehicle_model: 'Ford Focus 1.0 EcoBoost 2016',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-D1', vehicle_model: 'Ford Focus 1.0 EcoBoost 2016',
       plan: {
         booking_id: 'DEMO-D1', booking_nr: '880133', reg_nr: 'QBF66T',
         reason: 'ingen säker träff för "Bromsskiva bak"',
@@ -88,7 +88,7 @@ function ordersFile(now) {
     },
     'DEMO-E1': {
       status: 'failed', message_id: 7, updated_at: t(28), cart_touched: true,
-      detail_url: 'https://portal.example.com/booking/DEMO-E1',
+      detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-E1',
       plan: {
         booking_id: 'DEMO-E1', booking_nr: '880120', reg_nr: 'QKS402',
         reason: 'pro.meca.se svarade inte vid beställning',

@@ -1,6 +1,7 @@
 // Pure DOM building for the dashboard. Every dynamic value goes in through
 // createTextNode / textContent / setAttribute, never through an HTML parser.
 // Functions take the document as their first argument so tests can pass a fake.
+import { safeHref } from './links.js';
 
 export const STATUS = {
   attempted: { label: 'Förbereds', tone: 'neutral', mark: '○' },
@@ -49,20 +50,12 @@ function append(doc, el, children) {
   }
 }
 
-/** Only absolute https links are ever rendered as links. */
-export function safeHref(url) {
-  if (typeof url !== 'string') return null;
-  try {
-    const u = new URL(url);
-    return u.protocol === 'https:' ? u.href : null;
-  } catch {
-    return null;
-  }
-}
+// Only https links to allow-listed hosts are ever rendered as links.
+export { safeHref };
 
 function link(doc, url, text, cls = 'link') {
   const href = safeHref(url);
-  if (!href) return null;
+  if (!href) return typeof url === 'string' && url ? h(doc, 'span', { class: 'muted' }, text) : null;
   return h(doc, 'a', { class: cls, href, target: '_blank', rel: 'noopener noreferrer' }, text);
 }
 

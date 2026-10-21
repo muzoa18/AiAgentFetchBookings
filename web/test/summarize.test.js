@@ -60,7 +60,7 @@ test('order rows expose parts, fluids, total, reason, model and a safe link', ()
   const vm = summarize({
     ordersText: orders({
       x: rec('blocked', {
-        detail_url: 'https://portal.example.test/booking/1', last_reason: 'gammal orsak',
+        detail_url: 'https://meca.promeisterportal.com/booking/1', last_reason: 'gammal orsak',
         vehicle_model: 'Volvo V70', tries: 2,
       }, {
         reason: 'ingen säker träff',
@@ -80,7 +80,7 @@ test('order rows expose parts, fluids, total, reason, model and a safe link', ()
   assert.deepEqual(by.x.fluids, [{ name: 'Motorolja 5W-30', qty: '4,5 l' }]);
   assert.equal(by.x.total, 412.25);
   assert.equal(by.x.reason, 'ingen säker träff');
-  assert.equal(by.x.detailUrl, 'https://portal.example.test/booking/1');
+  assert.equal(by.x.detailUrl, 'https://meca.promeisterportal.com/booking/1');
   assert.equal(by.x.tries, 2);
   assert.equal(by.y.detailUrl, null, 'non-https links are dropped');
   assert.equal(by.y.total, 1234.5);

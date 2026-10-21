@@ -45,14 +45,15 @@ npm test
 
 | Variable | Required | Value |
 |---|---|---|
-| `DASHBOARD_PASSWORD` | yes | The shared login password. Use a long passphrase. |
+| `DASHBOARD_PASSWORD` | yes | The shared login password. At least 16 characters with at least 6 different characters, otherwise the API refuses every request. Use a passphrase of four random words, e.g. `kaffe ratt vinter lampa`. |
 | `SESSION_SECRET` | yes | Random, at least 32 characters. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. If it is missing or weak, the API refuses every request. |
 | `GITHUB_TOKEN` | yes | Fine-grained personal access token (see below). |
 | `GITHUB_REPO` | yes | `owner/name` of this repository. |
 | `GITHUB_BRANCH` | no | Branch the workflows commit state to. Default `main`. |
 
-Never set `DEMO` on Vercel. Demo mode is ignored there anyway, because
-`VERCEL` is set.
+The deployed functions always run in live mode. Demo mode can only be started
+by `dev-server.js --demo` on your own machine, and an environment variable
+called `DEMO` has no effect.
 
 ### The GitHub token
 
@@ -78,21 +79,32 @@ start `approve.yml` or `bookings.yml`.
 ### Rotating secrets
 
 - **Password:** change `DASHBOARD_PASSWORD` in Vercel → Settings →
-  Environment Variables, then redeploy.
-- **Session secret:** set a new random `SESSION_SECRET` and redeploy. Every
-  existing session becomes invalid, so everyone has to log in again. Do this
-  when you change the password too, so old sessions stop working.
+  Environment Variables, then redeploy. All sessions end, because the session
+  key is derived from the password, so everyone has to log in again.
+- **Session secret:** set a new random `SESSION_SECRET` and redeploy. This
+  also ends every existing session.
 - **GitHub token:** create a new token, update `GITHUB_TOKEN`, redeploy, then
   revoke the old token on GitHub.
 
 ## Security model
 
-- **One shared password.** It is compared with HMAC and `timingSafeEqual`.
-  Failed logins are rate-limited to 5 per 10 minutes per IP. The limiter is
-  in memory and per function instance, so it is best-effort. Errors are generic.
-- **Session cookie.** It holds an expiry and a nonce signed with
-  HMAC-SHA256(`SESSION_SECRET`), and is `HttpOnly; Secure; SameSite=Strict`
-  with a 12 h lifetime. No user data is stored in it. Logging out clears it.
+- **One shared password.** It must be at least 16 characters with 6 or more
+  different characters. It is compared with HMAC and `timingSafeEqual`, and
+  errors are generic.
+- **Login throttling.** Failed logins are limited to 5 per 10 minutes per
+  client. IPv4 is counted per address and IPv6 per /64 network. On Vercel the
+  client IP comes from the platform's `x-vercel-forwarded-for` / `x-real-ip`
+  headers. Locally these headers are ignored and the socket address is used.
+  After 100 failed logins in 10 minutes across all clients, every login
+  attempt waits about 2 s. That slows guessing but never locks the owner out.
+  **Caveat:** these counters live in memory in each Vercel function instance.
+  They are reset on a cold start and are not shared between instances, so
+  they are best-effort. The real protection is a long passphrase.
+- **Session cookie.** It holds an expiry and a nonce signed with HMAC-SHA256.
+  The key is derived from `SESSION_SECRET` and a hash of the current
+  password. The cookie is `HttpOnly; Secure; SameSite=Strict` with a 12 h
+  lifetime. No user data is stored in it. Logging out clears it. The local
+  demo leaves out `Secure` because it runs on plain `http://`.
 - **Read-only data.** `/api/status` returns only a summarised view model:
   whitelisted fields with types and lengths checked. It never returns raw
   `orders.json`, seen booking IDs, Telegram message IDs, GitHub's response
@@ -100,15 +112,22 @@ start `approve.yml` or `bookings.yml`.
 - **Run-now allow-list.** `POST /api/run` accepts exactly
   `{"workflow": "approve" | "bookings"}` and nothing else. It needs a
   session, `Content-Type: application/json`, the header
-  `X-Requested-With: dashboard`, and an `Origin`/`Referer` that matches the
-  host when one is sent. Each workflow has a 30 s server-side cooldown
+  `X-Requested-With: dashboard`, and an `Origin`/`Referer` whose scheme,
+  host and port match the request when one is sent. `Origin: null` is
+  rejected and `X-Forwarded-Host` is ignored. Bodies are capped at 4 KB. Each workflow has a 30 s server-side cooldown
   (best-effort) and the button is disabled for 30 s.
 - **Browser hardening.** A strict CSP (`default-src 'none'`, scripts and
   styles from self only, no inline code), `nosniff`, `no-referrer`,
-  `frame-ancestors 'none'`, `X-Robots-Tag: noindex`, and `no-store` on the
-  API. Every value is put into the page with `textContent` and DOM APIs, never
-  `innerHTML`. Only `https:` links are rendered.
-- **No customer data.** The state files hold none, and the dashboard adds none.
+  `frame-ancestors 'none'`, `Cross-Origin-Resource-Policy: same-origin`,
+  `X-Robots-Tag: noindex`, and `no-store` on the API. Every value is put into
+  the page with `textContent` and DOM APIs, never `innerHTML`. A link is only
+  rendered when it is `https:` to `meca.promeisterportal.com`, `pro.meca.se`
+  or `github.com`. Anything else is shown as plain text.
+- **GitHub client.** It never follows redirects, refuses responses over
+  2 MB, times out after 8 s, and never passes GitHub's error bodies on.
+- **Data shown.** Vehicle identifiers only: registration numbers, booking
+  numbers and car models. No names or contact details. The state files hold
+  none, and the dashboard adds none.
 
 ## Data freshness
 
@@ -125,7 +144,7 @@ refreshes every 60 s while the tab is visible.
 web/
   api/        login.js logout.js status.js run.js  (Vercel functions, thin wrappers)
   lib/        auth.js github.js summarize.js ratelimit.js http.js handlers.js runtime.js demo.js
-  public/     index.html app.js render.js style.css robots.txt
+  public/     index.html app.js render.js links.js style.css robots.txt
   test/       node:test suites (no network)
   dev-server.js  local server for the demo, or for live mode with real env vars
   vercel.json    headers and output directory

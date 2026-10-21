@@ -4,6 +4,8 @@
 // config/seen_ids.txt (null when a file is missing). Output contains only the
 // fields the UI shows: whitelisted, type-checked and length-limited. Nothing
 // here throws on bad input; problems are listed in `problems`.
+import { safeHref } from '../public/links.js';
+
 export const HISTORY_LIMIT = 30;
 export const ORDERS_LIMIT = 200;
 export const STALE_HOURS = 36;
@@ -49,16 +51,6 @@ function time(value) {
   return Number.isFinite(ms) ? new Date(ms).toISOString().replace('.000Z', 'Z') : null;
 }
 
-function httpsUrl(value) {
-  const s = str(value, 500);
-  if (!s) return null;
-  try {
-    const u = new URL(s);
-    return u.protocol === 'https:' ? u.href : null;
-  } catch {
-    return null;
-  }
-}
 
 function parseOrders(text, problems) {
   if (text == null) return [];
@@ -136,7 +128,7 @@ function order(id, r) {
     tries: Number.isInteger(r.tries) ? r.tries : 0,
     handled: r.handled === true,
     waitingKlar: isWaitingKlar(r),
-    detailUrl: httpsUrl(r.detail_url),
+    detailUrl: safeHref(r.detail_url),
   };
 }
 

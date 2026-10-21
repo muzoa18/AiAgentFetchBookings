@@ -5,6 +5,7 @@ const API = 'https://api.github.com';
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const BRANCH_RE = /^[A-Za-z0-9_./-]{1,200}$/;
 const WORKFLOW_RE = /^[A-Za-z0-9_-]{1,100}\.ya?ml$/;
+export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 export class GitHubError extends Error {
   constructor(code, status = 0) {
@@ -15,7 +16,8 @@ export class GitHubError extends Error {
   }
 }
 
-export function createGitHub({ token, repo, branch = 'main', fetchImpl = globalThis.fetch, timeoutMs = 8000 }) {
+export function createGitHub({ token, repo, branch = 'main', fetchImpl = globalThis.fetch, timeoutMs = 8000,
+  maxBytes = MAX_RESPONSE_BYTES }) {
   if (typeof token !== 'string' || token.length < 10) throw new GitHubError('config');
   if (typeof repo !== 'string' || !REPO_RE.test(repo) || repo.includes('..')) throw new GitHubError('config');
   if (typeof branch !== 'string' || !BRANCH_RE.test(branch) || branch.includes('..')) throw new GitHubError('config');
@@ -40,6 +42,7 @@ export function createGitHub({ token, repo, branch = 'main', fetchImpl = globalT
           },
           body: body ? JSON.stringify(body) : undefined,
           signal: controller.signal,
+          redirect: 'error', // a redirect is never followed (it could leave api.github.com)
         });
       } catch {
         // The caught error may echo request details; it is deliberately dropped.
@@ -57,14 +60,39 @@ export function createGitHub({ token, repo, branch = 'main', fetchImpl = globalT
         if (res.status === 422) throw new GitHubError('rejected', 422);
         throw new GitHubError('upstream', res.status);
       }
-      try {
-        return await res.text();
-      } catch {
-        throw new GitHubError(controller.signal.aborted ? 'timeout' : 'network');
+      const declared = Number(res.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        controller.abort();
+        throw new GitHubError('too_large', res.status);
       }
+      return await readCapped(res, controller);
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function readCapped(res, controller) {
+    if (!res.body) return '';
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) {
+          reader.cancel().catch(() => {});
+          controller.abort();
+          throw new GitHubError('too_large', res.status);
+        }
+        chunks.push(value);
+      }
+    } catch (err) {
+      if (err instanceof GitHubError) throw err;
+      throw new GitHubError(controller.signal.aborted ? 'timeout' : 'network');
+    }
+    return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8');
   }
 
   return {

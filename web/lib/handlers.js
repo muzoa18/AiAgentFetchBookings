@@ -1,14 +1,14 @@
 // The four API handlers, built from injected dependencies so tests and the demo
 // server use exactly the same code as the Vercel functions.
 import {
-  assertSecret, checkPassword, signSession, verifySession,
+  assertSecret, assertPassword, checkPassword, signSession, verifySession,
   sessionCookie, clearedCookie, readSessionCookie,
 } from './auth.js';
-import { createLimiter } from './ratelimit.js';
+import { createLimiter, createBrake } from './ratelimit.js';
 import { GitHubError } from './github.js';
 import { summarize } from './summarize.js';
 import {
-  sendJson, sendError, RequestError, assertDashboardPost, readJsonBody, assertKeys, clientIp,
+  sendJson, sendError, RequestError, assertDashboardPost, readJsonBody, assertKeys, clientIp, rateLimitKey,
 } from './http.js';
 
 export const STATE_FILES = {
@@ -20,6 +20,9 @@ export const STATE_FILES = {
 // The only workflows the dashboard may start. Key = request value, value = file.
 export const WORKFLOWS = { approve: 'approve.yml', bookings: 'bookings.yml' };
 export const RUN_COOLDOWN_MS = 30_000;
+export const LOGIN_LIMIT = { attempts: 5, windowMs: 10 * 60_000 };
+// Per instance: after this many failed logins in the window, every login waits BRAKE_DELAY_MS.
+export const BRAKE = { failures: 100, windowMs: 10 * 60_000, delayMs: 2000 };
 export const ORDER_OVERVIEW_URL = 'https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrderOverview-Start';
 
 const NOT_CONFIGURED = 'Instrumentpanelen är inte konfigurerad';
@@ -42,12 +45,19 @@ function githubMessage(err) {
  * deps: {
  *   env: { DASHBOARD_PASSWORD, SESSION_SECRET },
  *   source: () => { getFile, getLatestCommit, dispatch, actionsUrl }   (lazy: may throw GitHubError('config'))
- *   now?: () => ms, log?: (msg) => void, demo?: boolean
+ *   now?: () => ms, log?: (msg) => void,
+ *   demo?: boolean        local demo only: short password allowed, cookie without Secure
+ *   trustProxy?: boolean  true on Vercel: trust the platform's client-IP and proto headers
+ *   sleep?: (ms) => Promise
  * }
  */
-export function createHandlers({ env, source, now = Date.now, log, demo = false }) {
+export function createHandlers({ env, source, now = Date.now, log, demo = false, trustProxy = false,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
   log ??= (m) => console.error(m);
-  const loginLimiter = createLimiter({ limit: 5, windowMs: 10 * 60_000, clock: now });
+  const loginLimiter = createLimiter({ limit: LOGIN_LIMIT.attempts, windowMs: LOGIN_LIMIT.windowMs, clock: now });
+  const brake = createBrake({ threshold: BRAKE.failures, windowMs: BRAKE.windowMs, clock: now });
+  const cookieOpts = { secure: !demo };
+  const postOpts = { trustProxy };
   const lastRun = new Map(); // workflow -> ms
 
   function configured(res) {
@@ -58,8 +68,10 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
       sendError(res, 500, NOT_CONFIGURED);
       return false;
     }
-    if (typeof env.DASHBOARD_PASSWORD !== 'string' || env.DASHBOARD_PASSWORD.length < 1) {
-      log('dashboard: DASHBOARD_PASSWORD missing; refusing to serve');
+    try {
+      if (!demo) assertPassword(env.DASHBOARD_PASSWORD);
+    } catch {
+      log('dashboard: DASHBOARD_PASSWORD missing or too weak; refusing to serve');
       sendError(res, 500, NOT_CONFIGURED);
       return false;
     }
@@ -67,7 +79,7 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
   }
 
   function authed(req) {
-    return verifySession(readSessionCookie(req), env.SESSION_SECRET, now());
+    return verifySession(readSessionCookie(req), env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
   }
 
   function fail(res, err) {
@@ -80,8 +92,10 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
   async function login(req, res) {
     if (!configured(res)) return;
     try {
-      assertDashboardPost(req);
-      const ip = clientIp(req);
+      assertDashboardPost(req, postOpts);
+      // Many failures across all clients: slow everyone down rather than lock the owner out.
+      if (brake.tripped()) await sleep(BRAKE.delayMs);
+      const ip = rateLimitKey(clientIp(req, { trustProxy }));
       const limit = loginLimiter.hit(ip);
       if (!limit.allowed) {
         return sendError(res, 429, 'För många försök. Vänta en stund och försök igen.',
@@ -90,10 +104,12 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
       const body = await readJsonBody(req);
       assertKeys(body, ['password']);
       if (typeof body.password !== 'string' || !checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {
+        brake.record();
         return sendError(res, 401, LOGIN_FAILED);
       }
       loginLimiter.reset(ip); // only failed attempts accumulate
-      return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(signSession(env.SESSION_SECRET, now())) });
+      const token = signSession(env.SESSION_SECRET, now(), env.DASHBOARD_PASSWORD);
+      return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token, cookieOpts) });
     } catch (err) {
       return fail(res, err);
     }
@@ -102,13 +118,13 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
   async function logout(req, res) {
     if (!configured(res)) return;
     try {
-      assertDashboardPost(req);
+      assertDashboardPost(req, postOpts);
     } catch (err) {
       return fail(res, err);
     }
     const ok = authed(req);
     return sendJson(res, ok ? 200 : 401, ok ? { ok: true } : { error: 'Inte inloggad' },
-      { 'Set-Cookie': clearedCookie() });
+      { 'Set-Cookie': clearedCookie(cookieOpts) });
   }
 
   async function status(req, res) {
@@ -140,7 +156,7 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false 
   async function run(req, res) {
     if (!configured(res)) return;
     try {
-      assertDashboardPost(req);
+      assertDashboardPost(req, postOpts);
       if (!authed(req)) return sendError(res, 401, 'Inte inloggad');
       const body = await readJsonBody(req);
       assertKeys(body, ['workflow']);
