@@ -8,8 +8,8 @@ from parts_matcher import PICK_MODEL, choose, is_fluid, make_claude_picker, rank
 from rules import Rules
 
 RULES = Rules(brand_prefer=("Bosch", "Mann"), brand_forbid=("ProMeister",), ceiling_sek=10000, mode="approve")
-# No placement words: generic choose() tests must not be affected by the axle/side filter.
-LINE = {"name": "Bromsbelägg", "qty": 1}
+# Not axle-specific and no placement words: generic choose() tests are unaffected by placement rules.
+LINE = {"name": "Oljefilter", "qty": 1}
 
 
 def cand(title, brand, price=100, ref="x"):
@@ -133,7 +133,8 @@ def test_claude_picker_sends_model_and_titles_and_parses():
     assert call["model"] == PICK_MODEL == "claude-sonnet-5-5"
     assert call["output_config"]["format"]["type"] == "json_schema"
     prompt = call["messages"][0]["content"]
-    assert "Bosch Bromsbelägg" in prompt and "Febi Bromsskiva" in prompt and "Bromsbelägg" in prompt
+    assert "Bosch Bromsbelägg" in prompt and "Febi Bromsskiva" in prompt
+    assert "Booking line: Oljefilter (qty 1)" in prompt
 
 
 def test_claude_picker_refusal_returns_no_match():
@@ -266,9 +267,10 @@ def test_english_placement_words():
 
 
 def test_line_without_axle_and_mixed_candidates_is_ambiguous():
+    # Torkarblad is not axle-specific, but candidates disagreeing on axle is still ambiguous.
     picker = recording()
-    cands = [pcand("Bromsbelägg Bosch", "fram"), pcand("Bromsbelägg Bosch", "bak")]
-    assert choose({"name": "Bromsbelägg", "qty": 1}, cands, RULES, picker) is None
+    cands = [pcand("Torkarblad Bosch", "fram"), pcand("Torkarblad Bosch", "bak")]
+    assert choose({"name": "Torkarblad", "qty": 1}, cands, RULES, picker) is None
     assert picker.seen == []
 
 
@@ -280,9 +282,9 @@ def test_line_without_side_and_mixed_sides_is_ambiguous():
 
 
 def test_line_without_axle_and_same_axle_candidates_proceeds():
-    a, b = pcand("Bromsbelägg Bosch", "fram"), pcand("Bromsbelägg Hengst fram")
+    a, b = pcand("Torkarblad Bosch", "fram"), pcand("Torkarblad Hengst fram")
     picker = recording()
-    assert choose({"name": "Bromsbelägg", "qty": 1}, [b, a], RULES, picker) is a
+    assert choose({"name": "Torkarblad", "qty": 1}, [b, a], RULES, picker) is a
     assert picker.seen == [[a, b]]
 
 
@@ -301,8 +303,8 @@ def test_placement_needs_whole_words_in_line(name):
 def test_placement_needs_whole_words_in_candidate():
     # "Bakgrund"/"Höjd" in a title are not "bak"/"hö": the candidate has an unknown axle.
     picker = recording()
-    cands = [pcand("Bromsbelägg Bakgrund Höjd"), pcand("Bromsbelägg Bosch", "fram")]
-    assert choose({"name": "Bromsbelägg", "qty": 1}, cands, RULES, picker) is cands[1]
+    cands = [pcand("Torkarblad Bakgrund Höjd"), pcand("Torkarblad Bosch", "fram")]
+    assert choose({"name": "Torkarblad", "qty": 1}, cands, RULES, picker) is cands[1]
     assert picker.seen == [[cands[1], cands[0]]]
 
 
@@ -321,7 +323,7 @@ def test_line_naming_both_axles_is_ambiguous():
 def test_non_latin_candidate_dropped(title, brand):
     bad, good = pcand(title, brand=brand), pcand("Bromsbelägg Bosch")
     picker = recording()
-    assert choose({"name": "Bromsbelägg", "qty": 1}, [bad, good], RULES, picker) is good
+    assert choose(LINE, [bad, good], RULES, picker) is good
     assert picker.seen == [[good]]
     assert rank_candidates([bad], RULES) == []
 
@@ -372,3 +374,133 @@ def test_search_terms_single_item(name, expected):
 @pytest.mark.parametrize("name", ["", "   ", None])
 def test_search_terms_empty(name):
     assert search_terms(name) == []
+
+
+# ── Task 6b fix round 1: compound axle forms, Latin look-alikes, axle-specific parts ──
+
+@pytest.mark.parametrize("word,axle", [
+    ("fram", "fram"), ("front", "fram"), ("framaxel", "fram"), ("framaxeln", "fram"),
+    ("framhjul", "fram"), ("framhjulet", "fram"), ("framre", "fram"), ("främre", "fram"),
+    ("Fram-", "fram"), ("FRAMAXELN", "fram"),
+    ("bak", "bak"), ("rear", "bak"), ("back", "bak"), ("bakaxel", "bak"), ("bakaxeln", "bak"),
+    ("bakhjul", "bak"), ("bakhjulet", "bak"), ("bakre", "bak"), ("Bak-", "bak"),
+])
+def test_axle_forms_recognised(word, axle):
+    assert parts_matcher.placement_of(f"Bromsbelägg {word}") == ({axle}, set())
+
+
+@pytest.mark.parametrize("word,side", [
+    ("vä", "vä"), ("vänster", "vä"), ("vänstra", "vä"), ("left", "vä"), ("LH", "vä"),
+    ("hö", "hö"), ("höger", "hö"), ("högra", "hö"), ("right", "hö"), ("rh", "hö"),
+])
+def test_side_forms_recognised(word, side):
+    assert parts_matcher.placement_of(f"Bromsskiva {word}") == (set(), {side})
+
+
+@pytest.mark.parametrize("text", [
+    "Bakgrund", "höjd", "väl", "Framrutan", "Bakrutan", "Framruta", "fa", "ra", "va", "ha",
+    "Framtida", "Backspegel", "Bakljus",
+])
+def test_non_placement_tokens_not_parsed(text):
+    assert parts_matcher.placement_of(text) == (set(), set())
+
+
+def test_fram_slash_bak_states_both():
+    assert parts_matcher.placement_of("Bromsbelägg fram/bak") == ({"fram", "bak"}, set())
+    assert parts_matcher.placement_of("Fram-/bakaxel") == ({"fram", "bak"}, set())
+
+
+@pytest.mark.parametrize("front,rear", [
+    ("Bromsbelägg framaxeln", "Bromsbelägg bakaxeln"),
+    ("Bromsbelägg framhjul", "Bromsbelägg bakhjul"),
+    ("Bromsbelägg Fram-", "Bromsbelägg Bak-"),
+])
+def test_compound_axle_forms_filter_candidates(front, rear):
+    f, r = pcand(front), pcand(rear)
+    picker = recording()
+    assert choose({"name": "Bromsbelägg framaxel", "qty": 1}, [r, f], RULES, picker) is f
+    assert picker.seen == [[f]]
+    picker = recording()
+    assert choose({"name": "Bromsbelägg bakhjul", "qty": 1}, [f, r], RULES, picker) is r
+    assert picker.seen == [[r]]
+
+
+def test_reviewer_case_no_axle_line_with_compound_forms_is_none():
+    cands = [pcand("Bromsbelägg framaxeln"), pcand("Bromsbelägg bakaxeln")]
+    assert parts_matcher._placement_filter("Bromsbelägg", cands) == []
+    cands = [pcand("Bromsbelägg framhjul"), pcand("Bromsbelägg bakhjul")]
+    assert parts_matcher._placement_filter("Bromsbelägg", cands) == []
+    # Same for a part that is not axle-specific: disagreeing candidates are ambiguous.
+    cands = [pcand("Torkarblad framaxeln"), pcand("Torkarblad bakaxeln")]
+    assert parts_matcher._placement_filter("Torkarblad", cands) == []
+
+
+def test_side_compound_both_states_neither():
+    picker = recording()
+    cands = [pcand("Bromsskiva fram", "vä/hö"), pcand("Bromsskiva fram rh")]
+    assert choose({"name": "Bromsskiva fram höger", "qty": 1}, cands, RULES, picker) is cands[1]
+    assert picker.seen == [[cands[1]]]
+
+
+@pytest.mark.parametrize("text", [
+    "ProMéister belägg", "Promeıster belägg", "PróMeister", "Pro.Meister", "Pro Meister", "Pro-Meister",
+    "PRO_MEISTER", "P r o m e i s t e r", "Pro/Meister", "ProMeíster",
+])
+def test_latin_promeister_lookalikes_forbidden(text):
+    assert parts_matcher.is_forbidden(pcand(text), RULES)
+    assert parts_matcher.is_forbidden(pcand("Belägg", brand=text), RULES)
+    rules_cleared = Rules(("Bosch",), (), 10000, "approve")
+    assert rank_candidates([pcand(text)], rules_cleared) == []
+
+
+def test_promotion_meister_is_not_promeister():
+    assert parts_matcher._norm("Promotion Meister") == "promotionmeister"
+    assert not parts_matcher.is_forbidden(pcand("Promotion Meister"), RULES)
+
+
+def test_norm_strips_marks_and_punctuation():
+    assert parts_matcher._norm("Bosch GmbH") == "boschgmbh"
+    assert parts_matcher._norm(" BOSCH. ") == "bosch"
+    assert parts_matcher._norm("Pró-Meıster​") == "promeister"
+
+
+def test_bosch_still_ranks_with_strict_norm():
+    a, b, c, d = pcand("Oljefilter Hengst"), pcand("x", brand="BOSCH "), pcand("Bosch GmbH filter"), \
+        pcand("Oljefilter, Bosch.")
+    assert rank_candidates([a, b, c, d], RULES) == [b, c, d, a]
+
+
+@pytest.mark.parametrize("name", [
+    "Bromsbelägg", "Bromsskivor", "Bromsskiva x2", "Bromsklotsar", "Bromsklossar", "Bromsok",
+    "Bromstrumma", "Stötdämpare", "Fjäder", "Spiralfjädrar", "Hjullager", "Länkarm",
+    "Krängningshämmare länk", "Spindelled", "Styrled", "Hjulnav", "Drivaxel",
+])
+def test_axle_specific_part_without_axle_is_blocked(name):
+    picker = recording()
+    # Even a single candidate with no stated axle is not enough: the owner must name the axle.
+    assert choose({"name": name, "qty": 1}, [pcand(f"{name} Bosch")], RULES, picker) is None
+    assert choose({"name": name, "qty": 1}, [pcand(f"{name} Bosch", "fram")], RULES, picker) is None
+    assert picker.seen == []
+
+
+@pytest.mark.parametrize("name", ["Bromsbelägg fram", "Stötdämpare bak", "Hjullager framaxel vä"])
+def test_axle_specific_part_with_axle_proceeds(name):
+    axle = "bak" if "bak" in name else "fram"
+    side = " vä" if " vä" in name else ""
+    good = pcand("Del Bosch", axle + side)
+    assert choose({"name": name, "qty": 1}, [good], RULES, recording()) is good
+
+
+@pytest.mark.parametrize("name", ["Oljefilter", "Luftfilter", "Torkarblad", "Tändstift", "Pollenfilter"])
+def test_not_axle_specific_part_without_axle_proceeds(name):
+    good = pcand(f"{name} Bosch")
+    assert choose({"name": name, "qty": 1}, [good], RULES, recording()) is good
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Bromsbelägg framaxeln", ["bromsbelägg", "Bromsbelägg framaxeln"]),
+    ("Stötdämpare Bak- x2", ["stötdämpare", "Stötdämpare Bak- x2"]),
+    ("Bromsskivor bakhjul LH", ["bromsskiva", "Bromsskivor bakhjul LH"]),
+])
+def test_search_terms_drop_new_placement_forms(name, expected):
+    assert search_terms(name) == expected

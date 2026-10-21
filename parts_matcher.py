@@ -46,10 +46,11 @@ def is_fluid(name: str) -> bool:
 
 
 def _norm(value) -> str:
-    """NFKC, drop format chars (zero-width, soft hyphen), lowercase, remove spaces/hyphens/underscores."""
-    text = unicodedata.normalize("NFKC", str(value or ""))
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
-    return re.sub(r"[\s\-_]+", "", text.lower())
+    """Comparison key for brands: NFKD, accents dropped, dotless i -> i, lowercase, and every
+    character that is not a letter or digit removed ("Pró.Meıster" -> "promeister")."""
+    text = unicodedata.normalize("NFKD", str(value or "")).replace("\u0131", "i")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
 def has_non_latin(value) -> bool:
@@ -58,15 +59,26 @@ def has_non_latin(value) -> bool:
                for ch in str(value or ""))
 
 
-# Whole words only (compared per token), so "Bakgrund"/"Höjd" never count as placement.
+# Whole tokens only, explicit forms only: "Bakgrund", "Höjd", "Framrutan" never count as
+# placement. Two-letter codes like fa/ra/va/ha are deliberately absent (false positives).
+# Tokens are \w+ runs, so "Fram-" gives "fram" and "fram/bak" gives both.
 AXLE_WORDS = {
-    "fram": "fram", "främre": "fram", "framaxel": "fram", "front": "fram",
-    "bak": "bak", "bakre": "bak", "bakaxel": "bak", "rear": "bak", "back": "bak",
+    **dict.fromkeys(("fram", "front", "framaxel", "framaxeln", "framhjul", "framhjulet",
+                     "framre", "främre"), "fram"),
+    **dict.fromkeys(("bak", "rear", "back", "bakaxel", "bakaxeln", "bakhjul", "bakhjulet",
+                     "bakre"), "bak"),
 }
 SIDE_WORDS = {
-    "vä": "vä", "vänster": "vä", "vänstra": "vä", "left": "vä",
-    "hö": "hö", "höger": "hö", "högra": "hö", "right": "hö",
+    **dict.fromkeys(("vä", "vänster", "vänstra", "left", "lh"), "vä"),
+    **dict.fromkeys(("hö", "höger", "högra", "right", "rh"), "hö"),
 }
+# Parts that exist per axle: a booking line naming none of these without an axle is blocked
+# (casefolded substring of the line name). Extend as needed.
+AXLE_SPECIFIC = (
+    "belägg", "bromsskiv", "bromsklots", "bromsklossar", "bromsok", "bromstrumma",
+    "stötdämpare", "fjäder", "fjädrar", "hjullager", "länkarm", "krängningshämmare",
+    "spindelled", "styrled", "hjulnav", "drivaxel",
+)
 
 
 def _words(value) -> list[str]:
@@ -85,12 +97,16 @@ def _placement_filter(line_name: str, ranked: list[dict]) -> list[dict]:
     """Keep only candidates whose axle/side agrees with the booking line. Fails closed.
 
     A line naming an axle (or side) keeps only candidates stating exactly that axle (side);
-    candidates stating none or both are dropped. A line naming none keeps everything unless
-    the candidates disagree among themselves, which is ambiguous ([]). A line naming both
-    axles (or both sides) is ambiguous too.
+    candidates stating none or both are dropped. An axle-specific part (AXLE_SPECIFIC) on a
+    line naming no axle is blocked ([]): the owner must say which axle. Otherwise a line
+    naming none keeps everything unless the candidates disagree among themselves, which is
+    ambiguous ([]). A line naming both axles (or both sides) is ambiguous too.
     """
     line_axles, line_sides = placement_of(line_name)
     if len(line_axles) > 1 or len(line_sides) > 1:
+        return []
+    folded = unicodedata.normalize("NFKC", str(line_name or "")).casefold()
+    if not line_axles and any(part in folded for part in AXLE_SPECIFIC):
         return []
     states = [(c, *placement_of(c.get("placement"), c.get("title"))) for c in ranked]
     for i, wanted in ((1, line_axles), (2, line_sides)):
@@ -119,7 +135,7 @@ def search_terms(line_name) -> list[str]:
     original = str(line_name or "").strip()
     if not original:
         return []
-    tokens = [t.strip(".:()[]") for t in re.split(r"[\s/,;+&]+", original.casefold())]
+    tokens = [t.strip(".:()[]-") for t in re.split(r"[\s/,;+&]+", original.casefold())]
     tokens = [t for t in tokens if t]
     drop = set()
     for i, tok in enumerate(tokens):
