@@ -104,12 +104,14 @@ class _Portal:
         return self.portal
 
 
-def _clear_cart(session: _Portal) -> bool:
-    """Best effort: empty the pro.meca.se cart. Never raises."""
+def _clear_cart(session: _Portal, reg_nr) -> bool:
+    """Best effort: empty the pro.meca.se cart of vehicle `reg_nr` (carts are per vehicle).
+
+    Never raises."""
     try:
         portal = session.get()
         portal.login()
-        portal.clear_cart()
+        portal.clear_cart(reg_nr=reg_nr)
         return True
     except Exception:
         log.exception("Could not clear the pro.meca.se cart.")
@@ -177,7 +179,8 @@ def _cancel(config, session, booking_id, record, cb) -> bool:
     orders_state.put(booking_id, "cancelled")
     notifier.clear_buttons(config, record["message_id"])
     notifier.answer_callback(config, cb, "Avbruten.")
-    tail = CART_CLEARED if _clear_cart(session) else CART_MANUAL
+    tail = CART_CLEARED if _clear_cart(session, (record.get("plan") or {}).get("reg_nr")) \
+        else CART_MANUAL
     log.info("Order for %s cancelled by the owner.", booking_id)
     if not notifier.send_message(config, f"Avbruten: {_label(booking_id, record)}. {tail}"):
         log.error("Cancel message for %s was not delivered.", booking_id)

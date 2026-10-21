@@ -244,7 +244,7 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
             return "failed"
 
         checkout_started = True
-        ref = portal.checkout()
+        ref = portal.checkout(max_total_sek=rules.ceiling_sek)
         if not isinstance(ref, str) or not ref.strip():
             raise ValueError("ingen orderbekräftelse")
         ordered_plan = {**plan, "confirmation": ref}

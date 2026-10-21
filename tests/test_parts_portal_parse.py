@@ -190,20 +190,56 @@ def test_parse_checkout_unreadable_line_is_none():
     assert parse_checkout(html)["lines"] is None
 
 
+# ── Unreadable totals fail closed ───────────────────────────────────────────
+
+def test_parse_cart_present_but_unreadable_total_is_none():
+    html = fixture("meca_cart.html").replace("Totalt:<span>248:75</span>", "Totalt:<span>2x8</span>")
+    assert parse_cart(html)["total_sek"] is None
+
+
+def test_parse_checkout_present_but_unreadable_total_is_none():
+    html = fixture("meca_checkout.html").replace(
+        "</strong></p>", "</strong></p><p>Totalt <span class=\"js-total-tot-sum\">??</span></p>", 1)
+    assert parse_checkout(html)["total_sek"] is None
+
+
 # ── extract_order_reference ─────────────────────────────────────────────────
+
+REG = "ABC123"
+
 
 @pytest.mark.parametrize("html, url, expected", [
     ("<p>Tack för din beställning! Ordernummer: 4501234567</p>", "https://x/ViewOrder", "4501234567"),
+    ("<p>Ordernummer 123456789</p>", "https://x/", "123456789"),
     ("<p>Ditt ordernr är SO-778899</p>", "https://x/", "SO-778899"),
     ("<p>Beställningsnummer 12345678</p>", "https://x/", "12345678"),
     ("<p>Tack!</p>", "https://x/ViewOrderConfirmation?OrderNo=99887766&x=1", "99887766"),
 ])
 def test_extract_order_reference(html, url, expected):
-    assert extract_order_reference(html, url) == expected
+    assert extract_order_reference(html, url, REG) == expected
 
 
-@pytest.mark.parametrize("html", [
-    "<p>Tack för din order till oss</p>", "<p>Orderöversikt 0</p>", "<title>Beställning ABC123</title>",
+@pytest.mark.parametrize("html, url", [
+    ("<p>Tack för din order till oss</p>", "https://x/ViewHomepage-Start"),
+    ("<p>Orderöversikt 0</p>", "https://x/"),
+    ("<title>Beställning ABC123</title>", "https://x/"),
+    ("<label>Ert ordernummer</label> <p>ABC123</p>", "https://x/"),            # customer's own number
+    ("<p>Ert ordernummer 98765432</p>", "https://x/"),
+    ("<p>Kundordernummer ABC123</p>", "https://x/"),
+    ("<p>Kundordernummer 98765432</p>", "https://x/"),
+    ("<p>Kund ordernummer 98765432</p>", "https://x/"),
+    ("<p>Ordernummer: ABC123</p>", "https://x/"),                               # equals the reg
+    ("<p>Ordernummer: abc-123</p>", "https://x/"),
+    ("<p>Tack!</p>", "https://x/Confirm?OrderNo=ABC123"),
+    ("<p>Ordernummer: 12</p>", "https://x/"),                                   # implausible shape
+    ("<p>Xordernummer 12345678</p>", "https://x/"),                             # no word boundary
 ])
-def test_extract_order_reference_none(html):
-    assert extract_order_reference(html, "https://x/ViewHomepage-Start") is None
+def test_extract_order_reference_none(html, url):
+    assert extract_order_reference(html, url, REG) is None
+
+
+def test_extract_order_reference_never_from_cart_or_checkout_page():
+    cart = fixture("meca_cart.html").replace("</main>", "<p>Ordernummer 123456789</p></main>")
+    checkout = fixture("meca_checkout.html").replace("</main>", "<p>Ordernummer 123456789</p></main>")
+    assert extract_order_reference(cart, "https://x/ViewOrder-Done", REG) is None
+    assert extract_order_reference(checkout, "https://x/ViewOrder-Done", REG) is None

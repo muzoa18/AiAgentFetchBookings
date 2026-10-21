@@ -64,6 +64,7 @@ class FakePortal:
         self.ref = ref
         self.clear_fails = clear_fails
         self.calls = []
+        self.ceilings, self.cleared_regs = [], []
 
     def login(self):
         self.calls.append("login")
@@ -75,12 +76,14 @@ class FakePortal:
         self.calls.append("read_cart")
         return self.carts.pop(0) if self.carts else CART
 
-    def checkout(self):
+    def checkout(self, *, max_total_sek):
         self.calls.append("checkout")
+        self.ceilings.append(max_total_sek)
         return self.ref
 
-    def clear_cart(self):
+    def clear_cart(self, reg_nr=None):
         self.calls.append("clear_cart")
+        self.cleared_regs.append(reg_nr)
         if self.clear_fails:
             raise RuntimeError("clear broke")
 
@@ -536,6 +539,7 @@ def test_cancel_sets_cancelled_and_clears_buttons(tg, clear_fails, open_fails, t
     assert "checkout" not in factory.portal.calls
     if not open_fails:
         assert factory.portal.calls == ["login", "clear_cart"]
+        assert factory.portal.cleared_regs == ["NXP168"]  # the cart is per vehicle
     assert orders_state.last_update_id() == 5
 
     # Approve tapped after cancel does nothing.

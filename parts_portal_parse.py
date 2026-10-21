@@ -273,11 +273,10 @@ def parse_cart(html: str) -> dict:
     for p in root.find_all("p", cls="cart-side-menu__total"):
         span = p.find("span")
         totals.append(parse_sek(span.text()) if span is not None else None)
-    readable = [t for t in totals if t is not None]
     if not lines:
         total = 0.0
-    else:
-        total = max(readable) if readable else None
+    else:  # a total that is shown but unreadable fails closed, even if another one parses
+        total = max(totals) if totals and None not in totals else None
     return {"lines": lines, "total_sek": total,
             "reg_nr": _heading_reg(root, "Översikt kundvagn")}
 
@@ -307,13 +306,12 @@ def parse_checkout(html: str) -> dict:
     title = title_node.text() if title_node is not None else ""
     summary = root.find(id="summaryTable") or root
     totals = [parse_sek(n.text()) for n in summary.find_all(cls="js-total-tot-sum")]
-    readable = [t for t in totals if t is not None]
     shipping = [n for n in root.find_all("input", name="CheckoutForm_ShippingMethod")
                 if "checked" in n.attrs]
     return {
         "title": title,
         "reg_nr": _heading_reg(root, "Beställning"),
-        "total_sek": max(readable) if readable else None,
+        "total_sek": max(totals) if totals and None not in totals else None,
         "shipping_selected": bool(shipping),
         "has_place_order": root.find("button", cls="checkout-page-place-order__button") is not None,
         "lines": _checkout_lines(root),
@@ -330,23 +328,59 @@ def same_lines(cart_lines: list[dict], checkout_lines: list[dict] | None) -> boo
 
 # ── Order confirmation (structure not yet seen live: defensive) ──────────────
 
-_REF_TEXT = re.compile(
-    r"(?:ordernummer|ordernumret|ordernr|order\s*nr|order\s*number|order\s*no|"
-    r"beställningsnummer|beställningsnr)\.?\s*(?:är)?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9-]{3,})",
-    re.I)
+_REF_LABEL = re.compile(
+    r"\b(?:ordernummer|ordernumret|ordernr|order\s*nr|order\s*number|order\s*no|"
+    r"beställningsnummer|beställningsnr)\b\.?\s*(?:är\s*)?[:#]?\s*", re.I)
+_REF_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,29}(?![A-Za-z0-9-])")
+# The customer's OWN order number ("Ert ordernummer", prefilled with the reg) is never ours.
+_CUSTOMER_WORD = re.compile(r"(?:\b(?:ert|er|kund|kundens|kundorder))\s*$", re.I)
 _REF_PARAMS = ("OrderNo", "OrderNumber", "OrderID", "OrderId", "orderId", "DocumentNo")
 
 
-def extract_order_reference(html: str, url: str) -> str | None:
-    """An order number from the confirmation URL or text; None if none is recognisable."""
+def _plausible_ref(value: str, reg_nr: str | None) -> bool:
+    """4-30 chars, at least 4 digits, and never the vehicle's registration number."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{3,29}", value or ""):
+        return False
+    if len(re.findall(r"\d", value)) < 4:
+        return False
+    norm = re.sub(r"[\s-]", "", value).upper()
+    return not (reg_nr and norm == re.sub(r"[\s-]", "", str(reg_nr)).upper())
+
+
+def page_markers(html: str, reg_nr: str | None) -> dict:
+    """Signs that a page is still the cart or the (unsubmitted) checkout page."""
+    root = parse_html(html)
+    title_node = root.find("title")
+    titles = [title_node.text() if title_node is not None else ""] + \
+        [h1.text() for h1 in root.find_all("h1")]
+    want = f"beställning {reg_nr}".casefold() if reg_nr else "beställning "
+    return {
+        "place_order": root.find("button", cls="checkout-page-place-order__button") is not None,
+        "checkout_title": any(t.casefold().startswith(want) for t in titles),
+        "cart_table": root.find("section", cls="cart-overview-article-table") is not None,
+    }
+
+
+def extract_order_reference(html: str, url: str, reg_nr: str | None) -> str | None:
+    """An order number from a confirmation page's URL or text; None if none is trustworthy.
+
+    Never from a page that is still the cart or checkout; never the customer's own order
+    number ("Ert ordernummer", "Kundordernummer"); never equal to the vehicle reg.
+    """
+    if any(page_markers(html, reg_nr).values()):
+        return None
     query = parse_qs(urlparse(url or "").query)
     for key in _REF_PARAMS:
         for value in query.get(key, []):
-            if re.fullmatch(r"[A-Za-z0-9-]{4,}", value) and re.search(r"\d", value):
+            if _plausible_ref(value, reg_nr):
                 return value
-    for m in _REF_TEXT.finditer(parse_html(html).text()):
-        if re.search(r"\d", m.group(1)):
-            return m.group(1)
+    text = parse_html(html).text()
+    for label in _REF_LABEL.finditer(text):
+        if _CUSTOMER_WORD.search(text[:label.start()]):
+            continue
+        value = _REF_VALUE.match(text, label.end())
+        if value and _plausible_ref(value.group(0), reg_nr):
+            return value.group(0)
     return None
 
 

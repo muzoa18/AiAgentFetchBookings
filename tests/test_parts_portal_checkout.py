@@ -11,6 +11,7 @@ CART = (FIXTURES / "meca_cart.html").read_text(encoding="utf-8")
 EMPTY_CART = (FIXTURES / "meca_cart_empty.html").read_text(encoding="utf-8")
 CHECKOUT = (FIXTURES / "meca_checkout.html").read_text(encoding="utf-8")
 CHECKOUT_URL = "https://pro.meca.se/INTERSHOP/web/WFS/x/ViewData-Start/1?JumpTarget=ViewCheckout-Start"
+SUBMIT_URL = "https://pro.meca.se/INTERSHOP/web/WFS/x/ViewCheckout-SubmitOrder"
 CONFIRM_URL = "https://pro.meca.se/INTERSHOP/web/WFS/x/ViewOrder-Confirmation"
 CONFIRM = "<html><body><h1>Tack för din beställning!</h1><p>Ordernummer: 4500012345</p></body></html>"
 LOGGED_IN = ("<html><head><title>Startsida Testverkstad AB</title></head><body>"
@@ -128,10 +129,13 @@ def test_checkout_clicks_final_button_after_all_checks():
     assert page.clicks == [parts_portal.SEL_GO_ON, parts_portal.SEL_PLACE_ORDER]
 
 
-def test_checkout_without_ceiling_still_runs_all_other_checks():
+def test_ceiling_is_required():
     page = FakePage()
-    assert portal_with(page).checkout() == "4500012345"
-    assert page.clicks[-1] == parts_portal.SEL_PLACE_ORDER
+    with pytest.raises(TypeError):
+        portal_with(page).checkout()
+    with pytest.raises(TypeError):
+        portal_with(page).checkout(300)  # keyword only
+    assert page.clicks == []
 
 
 # ── Pre-checks: any failure means no final click ─────────────────────────────
@@ -232,7 +236,7 @@ def test_no_vehicle_loaded():
     assert page.clicks == []
 
 
-@pytest.mark.parametrize("bad", [float("nan"), -1, "500", True])
+@pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), -1, "500", True])
 def test_bad_ceiling_rejected_before_anything(bad):
     page = FakePage()
     with pytest.raises((PartsPortalError, ValueError)):
@@ -242,10 +246,38 @@ def test_bad_ceiling_rejected_before_anything(bad):
 
 # ── After the final click ────────────────────────────────────────────────────
 
-def test_still_on_checkout_after_click_may_have_ordered():
+def test_still_on_checkout_after_click_raises():
     page = FakePage(after_order=(CHECKOUT_URL, CHECKOUT))
-    with pytest.raises(PartsPortalError, match="order may have been placed"):
+    with pytest.raises(PartsPortalError, match="pro.meca.se|may have been placed"):
         portal_with(page).checkout(max_total_sek=1000)
+
+
+def test_checkout_form_redisplayed_at_new_url_is_not_an_order():
+    # A server-side validation failure re-renders the form at ViewCheckout-SubmitOrder.
+    page = FakePage(after_order=(SUBMIT_URL, CHECKOUT))
+    with pytest.raises(PartsPortalError, match="re-displayed after submit; nothing confirmed"):
+        portal_with(page).checkout(max_total_sek=1000)
+
+
+@pytest.mark.parametrize("html", [
+    CART,                                                                    # cart article table
+    "<html><head><title>Beställning ABC123</title></head><body>Tack</body></html>",
+    "<html><body><h1>Beställning <span>ABC123</span></h1><p>Ordernummer 123456789</p></body></html>",
+    "<html><body><button class='checkout-page-place-order__button'>Skicka beställning</button>"
+    "<p>Ordernummer 123456789</p></body></html>",
+], ids=["cart-table", "checkout-title", "checkout-h1", "place-order-button"])
+def test_checkout_markers_after_click_never_count_as_confirmation(html):
+    page = FakePage(after_order=(SUBMIT_URL, html))
+    with pytest.raises(PartsPortalError, match="order may have been placed|nothing confirmed"):
+        portal_with(page).checkout(max_total_sek=1000)
+
+
+def test_reference_never_equals_the_vehicle_reg():
+    page = FakePage(after_order=(CONFIRM_URL, "<html><body><h1>Tack!</h1>"
+                                              "<p>Ert ordernummer ABC123</p></body></html>"),
+                    overview=(OVERVIEW_BEFORE, OVERVIEW_BEFORE))
+    ref = portal_with(page).checkout(max_total_sek=1000)
+    assert ref.startswith("UNVERIFIED-") and "ABC123" not in ref
 
 
 def test_error_page_after_click_may_have_ordered():

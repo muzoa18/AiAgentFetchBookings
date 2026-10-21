@@ -59,6 +59,7 @@ class FakePortal:
         self.calls = []
         self.added = []
         self.fail_on = None
+        self.ceilings = []
 
     def _record(self, name, *args):
         self.calls.append((name, *args))
@@ -92,7 +93,8 @@ class FakePortal:
                  for c, q in self.added]
         return {"lines": lines, "total_sek": sum(line["price_sek"] for line in lines)}
 
-    def checkout(self):
+    def checkout(self, *, max_total_sek):
+        self.ceilings.append(max_total_sek)
         self._record("checkout")
         return self.ref
 
@@ -531,6 +533,15 @@ def test_execute_order_ordered_message_undeliverable_keeps_ordered(tg):
     assert rec["plan"]["confirmation"] == "ORD-9"
     assert rec["plan"]["notify_failed"] is True
     assert parts_order.order_notify_failed("B1") is True
+
+
+def test_execute_order_passes_the_ceiling_to_checkout(tg, orders_file):
+    portal = FakePortal(ref="ORD-9")
+    plan = _staged_plan(tg, portal)
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+
+    assert portal.ceilings == [10000.0]
 
 
 def test_execute_order_cart_mismatch_no_checkout(tg):

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from parts_portal_parse import (PartsPortalError, current_plate, extract_order_reference,
-                                is_login_page, linked_tab_id, order_tokens, parse_cart,
+                                is_login_page, linked_tab_id, order_tokens, page_markers, parse_cart,
                                 parse_checkout, parse_qty_text, parse_search_results, parse_sek,
                                 same_lines)
 
@@ -52,7 +52,6 @@ SEL_LOGIN_PASS = "#ShopLoginForm_Password"
 SEL_LOGIN_BUTTON = "button[name='login']"
 SEL_LOGOUT = "a[href*='LogoutUser']"
 SEL_REG_INPUT = "input[name='search-value']"
-SEL_REG_SUBMIT = "input[name='search-value'] >> xpath=following::button[@type='submit'][1]"
 SEL_SEARCH = "input[name='SearchTerm']"
 SEL_REMOVE_LINE = "span.js-remove-product-item"
 SEL_GO_ON = "form#bookingForm button.button--primary:has-text('Gå vidare')"
@@ -179,7 +178,8 @@ class PartsPortal:
             raise PartsPortalError("not logged in")
         self._reg, self._last_search = None, None
         self.page.fill(SEL_REG_INPUT, reg)
-        self.page.locator(SEL_REG_SUBMIT).first.click()
+        # Enter, not the submit button: that button is display:none once a vehicle is loaded.
+        self.page.press(SEL_REG_INPUT, "Enter")
         self._settle()
         url = unquote(self.page.url)
         shown = current_plate(self.page.content())
@@ -294,19 +294,19 @@ class PartsPortal:
 
     # ── Checkout (spends money) ──────────────────────────────────────────────
 
-    def checkout(self, max_total_sek: float | None = None) -> str:
+    def checkout(self, *, max_total_sek: float) -> str:
         """Place the order for the loaded vehicle's cart. Returns an order reference.
 
         Every check runs BEFORE the single final click; a failed check raises
-        PartsPortalError and nothing is ordered. After the click: a recognisable order number
-        is returned; if the page left checkout but shows none, the order overview is compared
-        with a snapshot taken before (one new number -> returned), else "UNVERIFIED-<UTC>".
-        If it cannot be told whether the click took effect, raises
-        PartsPortalError("order may have been placed: ...").
+        PartsPortalError and nothing is ordered. `max_total_sek` is required: the HIGHER of the
+        cart and checkout totals must not exceed it.
+
+        After the click, see _confirmation(): a page that still shows the checkout form or the
+        cart raises PartsPortalError; only a page that clearly left checkout yields a
+        reference (or "UNVERIFIED-<UTC>" when none can be found).
         """
-        if max_total_sek is not None and (
-                isinstance(max_total_sek, bool) or not isinstance(max_total_sek, (int, float))
-                or not math.isfinite(max_total_sek) or max_total_sek < 0):
+        if isinstance(max_total_sek, bool) or not isinstance(max_total_sek, (int, float)) \
+                or not math.isfinite(max_total_sek) or max_total_sek < 0:
             raise ValueError(f"invalid max_total_sek {max_total_sek!r}")
         reg = self._require_vehicle()
         before = self._overview_tokens()
@@ -338,7 +338,7 @@ class PartsPortal:
             problem = "checkout lines differ from the cart"
         else:
             highest = max(cart["total_sek"], co["total_sek"])
-            if max_total_sek is not None and highest > max_total_sek:
+            if highest > max_total_sek:
                 problem = (f"total {highest:.2f} SEK exceeds the ceiling "
                            f"{max_total_sek:.2f} SEK")
         if problem:
@@ -358,16 +358,25 @@ class PartsPortal:
             return None
 
     def _confirmation(self, checkout_url: str, before: set[str] | None) -> str:
+        """Decide what the final click did, from the URL AND the page content.
+
+        The form posts to ViewCheckout-SubmitOrder, so a re-rendered checkout (e.g. a server
+        validation error) can sit at a new URL: content markers decide, not the URL alone.
+        """
         url, html = self.page.url, self.page.content()
-        if "ViewCheckout-Start" in url or url == checkout_url:
+        marks = page_markers(html, self._reg)
+        if marks["place_order"] and marks["checkout_title"]:
+            raise PartsPortalError("checkout page re-displayed after submit; nothing confirmed "
+                                   "(check pro.meca.se)")
+        if any(marks.values()) or "ViewCheckout-Start" in url or url == checkout_url:
             raise PartsPortalError("order may have been placed: could not verify confirmation "
-                                   "(still on the checkout page)")
+                                   "(the page still looks like checkout or the cart)")
         text = html.casefold()
         if is_login_page(html) or re.search(r"<title>\s*(fel|error)", text) \
                 or "ett fel har uppstått" in text:
             raise PartsPortalError("order may have been placed: could not verify confirmation "
                                    "(error page after the order click)")
-        ref = extract_order_reference(html, url)
+        ref = extract_order_reference(html, url, self._reg)
         if ref:
             log.info("Order placed for %s: %s", self._reg, ref)
             return ref
