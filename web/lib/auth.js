@@ -1,0 +1,78 @@
+// Session cookie and password check. Pure functions, Node built-ins only.
+//
+// Token format: v1.<expiry ms>.<random nonce>.<HMAC-SHA256(secret, "v1.<expiry>.<nonce>")>
+// The token carries no user data: there is one shared password, so a valid
+// signature plus an unexpired timestamp is the whole session.
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+
+export const COOKIE_NAME = 'dash_session';
+export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+export const MIN_SECRET_LENGTH = 32;
+
+export function assertSecret(secret) {
+  if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) {
+    throw new Error(`SESSION_SECRET must be at least ${MIN_SECRET_LENGTH} characters`);
+  }
+  if (new Set(secret).size < 8) {
+    throw new Error('SESSION_SECRET is too weak (too few distinct characters)');
+  }
+}
+
+function mac(secret, data) {
+  return createHmac('sha256', secret).update(data).digest('base64url');
+}
+
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+export function signSession(secret, now = Date.now()) {
+  assertSecret(secret);
+  const body = `v1.${now + SESSION_TTL_MS}.${randomBytes(12).toString('base64url')}`;
+  return `${body}.${mac(secret, body)}`;
+}
+
+export function verifySession(token, secret, now = Date.now()) {
+  assertSecret(secret);
+  if (typeof token !== 'string' || token.length > 200) return false;
+  const parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== 'v1') return false;
+  const [, exp, nonce, sig] = parts;
+  if (!/^\d{1,16}$/.test(exp) || !/^[\w-]{1,64}$/.test(nonce)) return false;
+  if (!safeEqual(sig, mac(secret, `v1.${exp}.${nonce}`))) return false;
+  const expiry = Number(exp);
+  // An expiry further out than one TTL cannot have been issued by signSession.
+  return expiry > now && expiry <= now + SESSION_TTL_MS;
+}
+
+// Both sides are HMAC'd first so the comparison is fixed-length and timing-safe
+// whatever the input length.
+export function checkPassword(input, expected, secret) {
+  assertSecret(secret);
+  if (typeof input !== 'string' || typeof expected !== 'string' || !expected) return false;
+  if (input.length > 1024) return false;
+  const a = createHmac('sha256', secret).update('pw:' + input).digest();
+  const b = createHmac('sha256', secret).update('pw:' + expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+export function sessionCookie(token) {
+  return `${COOKIE_NAME}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}`;
+}
+
+export function clearedCookie() {
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+}
+
+export function readSessionCookie(req) {
+  const header = req?.headers?.cookie;
+  if (typeof header !== 'string') return null;
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === COOKIE_NAME) return part.slice(i + 1).trim();
+  }
+  return null;
+}

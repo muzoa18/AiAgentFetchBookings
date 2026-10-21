@@ -1,0 +1,14 @@
+{
+  "name": "meca-agent-dashboard",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Read-only status dashboard for the MECA booking agent",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "demo": "node dev-server.js --demo"
+  }
+}
