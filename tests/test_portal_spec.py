@@ -8,8 +8,11 @@ from pathlib import Path
 
 import pytest
 
+import agent
+from parts_order import _wanted
+from parts_order_helpers import parse_qty
 from parts_portal_parse import parse_html
-from portal_scraper import _extract_specification
+from portal_scraper import _extract_detail_page, _extract_specification
 
 FIXTURE = (Path(__file__).parent / "fixtures" / "booking_delar.html").read_text(encoding="utf-8")
 
@@ -42,6 +45,14 @@ class FakePage(FakeEl):
         super().__init__(parse_html(html))
         self.mode = mode
 
+    def inner_text(self, selector=None):
+        return self.node.text()
+
+    def query_selector_all(self, selector):
+        if selector in ("table tr", "td", "th"):
+            return super().query_selector_all(selector)
+        return []  # dt / labels / badges: not part of these pages
+
     def query_selector(self, selector):
         if selector == "mk-specification-detail":
             found = self.node.find("mk-specification-detail") if self.mode == "exact" else None
@@ -54,8 +65,8 @@ class FakePage(FakeEl):
 MODES = ["exact", "broad", None]
 
 
-def spec(html=FIXTURE, mode="exact"):
-    return _extract_specification(FakePage(html, mode))
+def spec(html=FIXTURE, mode="exact", stats=None):
+    return _extract_specification(FakePage(html, mode), stats)
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -142,7 +153,9 @@ def all_values(*sections):
 
 @pytest.mark.parametrize("mode", MODES)
 def test_event_log_rows_never_become_items(mode):
-    services, parts, fluids, total = spec(mode=mode)
+    stats = {}
+    services, parts, fluids, total = spec(mode=mode, stats=stats)
+    assert stats == {"dropped": 0, "fallback": mode != "exact"}
     text = all_values(services, parts, fluids)
     assert not [s for s in SENTINELS if s.casefold() in text.casefold()]
     assert [(f["name"], f["qty"]) for f in fluids] == [
@@ -177,28 +190,141 @@ def test_rows_after_totalt_exklusive_moms_are_not_items():
     assert "Luftfilter" not in [f["name"] for f in fluids]
 
 
-@pytest.mark.parametrize("name,qty", [
-    ("2026-10-18 13:26:30", "1"),        # timestamp as name
-    ("Ny bokning", "1"), ("Notifiering", "1"),
-    ("Händelse: Ny bokning", "1"), ("Händelse: Notifiering", "1"),
-    ("Luftfilter", "Sentinel Staff Name"),  # non-numeric quantity
-    ("Luftfilter", ""),
-])
-@pytest.mark.parametrize("section", ["Delar", "Vätskor / Oljor"])
-def test_item_builder_drops_timestamp_event_and_non_numeric_rows(section, name, qty):
-    html = f"""<table><thead><tr><th>{section}</th><th>OEM No</th><th>Artikel-ID</th><th>Antal</th>
-    <th>Pris</th><th>Totalt</th></tr></thead><tbody>
-    <tr><td>{name}</td><td></td><td></td><td>{qty}</td><td>1,00</td><td>1,00 SEK</td></tr>
-    <tr><td>Tändstift</td><td>A</td><td>B</td><td>4</td><td>1,00</td><td>4,00 SEK</td></tr>
-    </tbody></table>"""
-    _, parts, fluids, _ = spec(html, mode=None)
-    assert [i["name"] for i in parts + fluids] == ["Tändstift"]
+def section(title, rows, ids=True):
+    head = "<th>OEM No</th><th>Artikel-ID</th>" if ids else ""
+    body = "".join(
+        "<tr><td>{}</td>{}<td>{}</td><td>1,00</td><td>1,00 SEK</td></tr>".format(
+            name, "<td>{0}</td><td>{0}</td>".format(code) if ids else "", qty)
+        for name, code, qty in rows)
+    return (f"<thead><tr><th>{title}</th>{head}<th>Antal</th><th>Pris</th><th>Totalt</th></tr></thead>"
+            f"<tbody>{body}</tbody>")
 
 
-@pytest.mark.parametrize("qty", ["1", "4", "3.3", "7,5", "0.5"])
-def test_numeric_quantities_are_kept(qty):
-    html = f"""<table><thead><tr><th>Delar</th><th>OEM No</th><th>Artikel-ID</th><th>Antal</th>
-    <th>Totalt</th></tr></thead><tbody>
-    <tr><td>Luftfilter</td><td>A</td><td>B</td><td>{qty}</td><td>1,00 SEK</td></tr></tbody></table>"""
-    _, parts, _, _ = spec(html, mode=None)
+def in_container(*sections):
+    return "<mk-specification-detail><table>" + "".join(sections) + "</table></mk-specification-detail>"
+
+
+# ── Review round 1: I1 odd quantities kept (container) / permissive (fallback) ──
+
+def test_container_keeps_part_rows_with_odd_quantities_for_parse_qty():
+    html = in_container(section("Delar", [("Luftfilter", "A1", ""), ("Tändstift", "B2", "x4"),
+                                          ("Oljefilter", "C3", "2 st")]))
+    stats = {}
+    _, parts, _, _ = spec(html, mode="exact", stats=stats)
+    assert [(p["name"], p["qty"]) for p in parts] == [("Luftfilter", ""), ("Tändstift", "x4"),
+                                                      ("Oljefilter", "2 st")]
+    assert stats == {"dropped": 0, "fallback": False}
+    assert [parse_qty(p["qty"]) for p in parts] == [1, 4, None]
+    _, reason = _wanted(parts)
+    assert reason == "ogiltigt antal för 'Oljefilter' ('2 st')"  # visible block, never silent
+
+
+def test_container_keeps_rows_whose_name_has_a_date_or_event_word():
+    html = in_container(section("Delar", [("2026-10-18 Bromsbelägg", "A1", "1"),
+                                          ("Notifieringslampa", "B2", "1")]))
+    _, parts, _, _ = spec(html, mode="exact")
+    assert [p["name"] for p in parts] == ["2026-10-18 Bromsbelägg", "Notifieringslampa"]
+
+
+@pytest.mark.parametrize("mode", ["broad", None])
+@pytest.mark.parametrize("qty", ["", "1", "4", "x4", "X 4", "2 st", "1,5", "0.5", "3.3", "7,5"])
+def test_fallback_accepts_parse_qty_style_quantities(mode, qty):
+    html = "<table>" + section("Delar", [("Luftfilter", "A1", qty)]) + "</table>"
+    stats = {}
+    _, parts, _, _ = spec(html, mode=mode, stats=stats)
     assert [p["qty"] for p in parts] == [qty]
+    assert stats == {"dropped": 0, "fallback": True}
+
+
+@pytest.mark.parametrize("mode", ["broad", None])
+@pytest.mark.parametrize("title", ["Delar", "Vätskor / Oljor"])
+def test_fallback_drops_and_counts_suspicious_rows(mode, title):
+    rows = [("Luftfilter", "", "Sentinel Staff Name"), ("2026-10-18 13:26:30", "", "1"),
+            ("Händelse: Ny bokning", "", "1"), ("Användare: Sentinel Staff Name", "", "1"),
+            ("Tändstift", "", "4")]
+    html = "<table>" + section(title, rows) + "</table>"
+    stats = {}
+    _, parts, fluids, _ = spec(html, mode=mode, stats=stats)
+    assert [i["name"] for i in parts + fluids] == ["Tändstift"]
+    assert stats == {"dropped": 4, "fallback": True}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_date_like_part_number_inside_name_is_kept(mode):
+    table = section("Delar", [("Bromsbelägg 0986-49-41 fram", "A1", "1")])
+    html = in_container(table) if mode == "exact" else "<table>" + table + "</table>"
+    _, parts, _, _ = spec(html, mode=mode)
+    assert [p["name"] for p in parts] == ["Bromsbelägg 0986-49-41 fram"]
+
+
+def test_detail_page_exposes_drop_and_fallback_counts():
+    exact = _extract_detail_page(FakePage(FIXTURE, "exact"), "B-1")
+    assert (exact["spec_dropped"], exact["spec_fallback"]) == (0, False)
+    html = "<table>" + section("Delar", [("Luftfilter", "", "Sentinel Staff Name"),
+                                         ("Tändstift", "", "4")]) + "</table>"
+    fallback = _extract_detail_page(FakePage(html, None), "B-2")
+    assert (fallback["spec_dropped"], fallback["spec_fallback"]) == (1, True)
+    assert [p["name"] for p in fallback["parts"]] == ["Tändstift"]
+
+
+BASE = {"booking_type": "Bokning", "booking_nr": "X-1", "parts": [{"name": "Luftfilter", "qty": "1"}]}
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ({}, None),
+    ({"spec_dropped": 0, "spec_fallback": False}, None),
+    ({"spec_dropped": 2, "spec_fallback": False},
+     "Obs: 2 rader i specifikationen kunde inte läsas – kontrollera bokningen i portalen."),
+    ({"spec_dropped": 1, "spec_fallback": True},
+     "Obs: 1 rader i specifikationen kunde inte läsas – kontrollera bokningen i portalen."),
+    ({"spec_dropped": 0, "spec_fallback": True},
+     "Obs: specifikationen lästes i reservläge – kontrollera delarna i portalen."),
+])
+def test_build_message_warns_about_unread_spec_rows(extra, expected):
+    lines = agent.build_message({**BASE, **extra}).split("\n")
+    obs = [line for line in lines if line.startswith("Obs:")]
+    assert obs == ([expected] if expected else [])
+
+
+# ── Review round 1: I2 Tjänster after Delar switches back to services ─────────
+
+def test_tjanster_after_delar_is_service_again():
+    html = in_container(
+        section("Tjänster", [("Byt olja", "F00093", "0.5")]),
+        section("Delar", [("Oljefilter", "1025-F026407142", "1")]),
+        section("Tjänster", [("Byt bromsbelägg", "F00093", "1.2")]),
+        section("Vätskor / Oljor", [("Motorolja", "", "3.3")]),
+        section("Delar", [("Bromsbelägg", "1025-BP1", "1")]),
+        section("Förbrukningsmaterial", [("Förbrukningsmaterial", "", "1")]),
+    )
+    services, parts, fluids, _ = spec(html)
+    assert [s["name"] for s in services] == ["Byt olja", "Byt bromsbelägg", "Förbrukningsmaterial"]
+    assert [(p["name"], p["article_id"]) for p in parts] == [
+        ("Oljefilter", "1025-F026407142"), ("Bromsbelägg", "1025-BP1")]
+    assert [f["name"] for f in fluids] == ["Motorolja"]
+    assert "F00093" not in {p["article_id"] for p in parts} | {p["oem_no"] for p in parts}
+
+
+# ── Review round 1: minors ────────────────────────────────────────────────────
+
+def test_total_only_from_an_amount_cell_and_att_betala_is_final():
+    html = in_container(section("Delar", [("Luftfilter", "A1", "1")])) + """<table><tbody>
+    <tr><td>Summa</td><td>1 234,50 SEK</td><td>se ovan 3</td></tr>
+    <tr><td>Att betala</td><td>7&nbsp;857 SEK</td><td></td></tr>
+    <tr><td>Totalt</td><td>999 SEK</td></tr></tbody></table>"""
+    html = html.replace("</mk-specification-detail>", "") + "</mk-specification-detail>"
+    _, _, _, total = spec(html)
+    assert total == "7 857 SEK"
+
+
+def test_total_skips_non_amount_cells():
+    html = in_container(section("Delar", [("Luftfilter", "A1", "1")])).replace(
+        "</table>", "<tbody><tr><td>Summa</td><td>1 234,50 SEK</td><td>se ovan 3</td></tr></tbody></table>")
+    _, _, _, total = spec(html)
+    assert total == "1 234,50 SEK"
+
+
+def test_empty_specification_logs_a_warning_without_row_text(caplog):
+    with caplog.at_level("WARNING", logger="portal_scraper"):
+        assert spec("<mk-specification-detail><table></table></mk-specification-detail>")[:3] == ([], [], [])
+    assert any("no services, parts or fluids" in r.getMessage() for r in caplog.records)

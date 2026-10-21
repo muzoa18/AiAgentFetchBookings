@@ -481,7 +481,8 @@ def _extract_detail_page(page, booking_id: str) -> dict:
     if email_el:
         driver_email = (email_el.get_attribute("href") or "").replace("mailto:", "").strip()
 
-    services, parts, fluids, total_price = _extract_specification(page)
+    spec_stats = {}
+    services, parts, fluids, total_price = _extract_specification(page, spec_stats)
     booking_type = _detect_booking_type(page, full_text)
 
     result = {
@@ -491,6 +492,8 @@ def _extract_detail_page(page, booking_id: str) -> dict:
         "booked_at": booked_at, "workshop_dt": workshop_dt, "mileage": mileage,
         "booking_msg": booking_msg, "services": services, "parts": parts,
         "fluids": fluids, "total_price": total_price, "raw_text": full_text[:4000],
+        "spec_dropped": spec_stats.get("dropped", 0),
+        "spec_fallback": spec_stats.get("fallback", False),
     }
 
     log.info("  Type    : %s", booking_type)
@@ -521,13 +524,18 @@ SPEC_CONTAINER_SELECTORS = (
     "div:has(h3:has-text('Specifikation')), "
     "*:has(> h2:has-text('Specifikation'))",
 )
-# Boundaries, also enforced row by row in case the container is too broad or missing:
-# no items after "Totalt exklusive moms" (only the total is still read); stop completely at
-# the event log (its heading text, or a header row with the HÄNDELSE and DATUM columns).
+# Boundaries, enforced row by row in every mode: no items after "Totalt exklusive moms"
+# (only the total is still read); stop completely at the event log (its heading text, or a
+# header row with the HÄNDELSE and DATUM columns).
 SPEC_END_TEXT = "totalt exklusive moms"
 LOG_HEADER_WORDS = {"händelse", "datum"}
 TOTAL_PATTERNS = ("att betala", "totalt", "total", "summa")
-_NUMERIC_QTY = re.compile(r"\d+(?:[.,]\d+)?")
+# A total is only ever read from a cell that is a SEK amount: "7 857 SEK", "1 234,50", "199:-".
+_SEK_AMOUNT = re.compile(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[,.:]\d{1,2}|:-)?(?:\s*(?:sek|kr))?", re.I)
+# Fallback mode only (container missing or too broad, so event-log rows could be mixed in):
+# rows are dropped (and counted) when the name starts with a timestamp or an event word, or a
+# part/fluid quantity is not one of the forms parse_qty-style readers accept.
+_FALLBACK_QTY = re.compile(r"(?:x\s*)?\d+(?:[.,]\d+)?(?:\s*st)?", re.I)
 _DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
 _EVENT_NAME = re.compile(r"(?:händelse|ny bokning|notifiering|användare|datum|anteckningar)\b")
 
@@ -540,17 +548,38 @@ def _is_log_header(header_texts) -> bool:
 def _row_total(cells) -> str:
     for cell in reversed(cells):
         t = cell.inner_text().strip()
-        if re.search(r"\d", t) and "%" not in t and "moms" not in t.lower():
+        if _SEK_AMOUNT.fullmatch(t):
             return t
     return ""
 
 
-def _spec_container(page):
+def _spec_container(page) -> tuple:
+    """(container or None, exact): exact = the real specification component was found."""
     for selector in SPEC_CONTAINER_SELECTORS:
         container = page.query_selector(selector)
         if container:
-            return container
-    return None
+            return container, selector == SPEC_CONTAINER_SELECTORS[0]
+    return None, False
+
+
+def _spec_section(label: str, current: str) -> str:
+    """Category named by a section header row, or `current` when it names none."""
+    label = label.lower()
+    if "delar" in label:
+        return "parts"
+    if "vätskor" in label or "oljor" in label:
+        return "fluids"
+    if "tjänster" in label or "förbrukningsmaterial" in label:
+        return "service"  # labour and consumables: never parts
+    if label.startswith("service") and "kontroll" not in label:
+        return "service"
+    return current
+
+
+def _fallback_suspicious(name: str, qty: str, category: str) -> bool:
+    if _DATE_TEXT.match(name) or _EVENT_NAME.match(name.casefold()):
+        return True
+    return category in ("parts", "fluids") and bool(qty) and not _FALLBACK_QTY.fullmatch(qty)
 
 
 def _spec_columns(header_texts) -> dict:
@@ -565,7 +594,7 @@ def _spec_columns(header_texts) -> dict:
     return columns
 
 
-def _extract_specification(page) -> tuple:
+def _extract_specification(page, stats: dict | None = None) -> tuple:
     """
     Extract only from the Specifikation section — stops before Handelselogg.
 
@@ -578,11 +607,17 @@ def _extract_specification(page) -> tuple:
 
     Each section's header row (th cells) names the columns; parts and fluids get
     `oem_no` and `article_id` from the "OEM No" / "Artikel-ID" columns ("" when absent).
+
+    Inside the real specification component every row is kept with its raw quantity text
+    (parse_qty decides downstream, so a bad quantity blocks visibly). Only in fallback mode
+    are suspicious rows dropped. `stats` (optional) receives {"dropped": int, "fallback": bool}.
     """
     services = []
     parts    = []
     fluids   = []
     total    = ""
+    dropped  = 0
+    fallback = False
 
     # Junk patterns to skip — row numbers, log entries, customer names in log
     SKIP_PATTERNS = [
@@ -598,7 +633,8 @@ def _extract_specification(page) -> tuple:
 
     try:
         # Find the Specifikation section container
-        spec_container = _spec_container(page)
+        spec_container, exact = _spec_container(page)
+        fallback = not exact
 
         if spec_container:
             log.info("Found Specifikation container — reading only that section.")
@@ -611,6 +647,7 @@ def _extract_specification(page) -> tuple:
         category = "service"
         in_handelselogg = False
         after_items = False  # past "Totalt exklusive moms": only the total may still be read
+        total_final = False  # "Att betala" read: later rows never change the total
         columns = dict(DEFAULT_SPEC_COLUMNS)
 
         for row in rows:
@@ -631,19 +668,19 @@ def _extract_specification(page) -> tuple:
                 break
             if SPEC_END_TEXT in row_lower:
                 after_items = True
+            is_total_row = bool(cells) and any(p in row_lower for p in TOTAL_PATTERNS)
+            if is_total_row and not total_final:
+                value = _row_total(cells)
+                if value:
+                    total = value
+                    total_final = "att betala" in row_lower
             if after_items:
-                if cells and any(p in row_lower for p in TOTAL_PATTERNS):
-                    total = _row_total(cells) or total
                 continue
 
             # Category header rows (few or no cells, bold text)
             if not cells or len(cells) <= 2:
-                if "delar" in row_lower:
-                    category = "parts"
-                elif "vätskor" in row_lower or "oljor" in row_lower:
-                    category = "fluids"
-                elif row_lower.startswith("service") and "kontroll" not in row_lower:
-                    category = "service"
+                label = headers[0].inner_text() if headers else row_text
+                category = _spec_section(label.strip(), category)
                 if headers:
                     columns = _spec_columns([h.inner_text() for h in headers])
                 continue
@@ -652,9 +689,8 @@ def _extract_specification(page) -> tuple:
             if headers:
                 continue
 
-            # Total row - check multiple patterns
-            if any(pattern in row_lower for pattern in TOTAL_PATTERNS):
-                total = _row_total(cells) or total
+            # Total row - check multiple patterns (already read above)
+            if is_total_row:
                 continue
 
             # Skip moms/tax rows
@@ -674,12 +710,6 @@ def _extract_specification(page) -> tuple:
             if skip:
                 continue
 
-            # Never an item: a date/timestamp or an event-log event name (privacy: the log
-            # carries staff names and must never reach SMS/Telegram/orders.json).
-            if _DATE_TEXT.search(name) or _EVENT_NAME.match(name.casefold()):
-                log.warning("Spec row dropped (looks like an event-log row).")
-                continue
-
             price = ""
             for cell in reversed(cells):
                 t = cell.inner_text().strip()
@@ -693,11 +723,12 @@ def _extract_specification(page) -> tuple:
 
             item = {"name": name, "qty": column("qty"), "price": price}
 
+            # Fallback only: the event log (staff names) may be mixed in, and must never
+            # reach SMS/Telegram/orders.json. Counted, never logged with its text.
+            if fallback and _fallback_suspicious(name, item["qty"], category):
+                dropped += 1
+                continue
             if category in ("parts", "fluids"):
-                if not _NUMERIC_QTY.fullmatch(item["qty"]):
-                    # no row text in the log: a misread row may hold personal data
-                    log.warning("Spec %s row dropped: quantity is not a number.", category)
-                    continue
                 item["article_id"] = column("article_id")
                 item["oem_no"] = column("oem_no")
             if category == "parts":
@@ -709,7 +740,14 @@ def _extract_specification(page) -> tuple:
 
     except Exception as e:
         log.warning("Spec parse error: %s", e)
+        fallback = True  # the specification was not read completely
 
+    if dropped:
+        log.warning("Specification: %d row(s) dropped in fallback mode.", dropped)
+    if not (services or parts or fluids):
+        log.warning("Specification yielded no services, parts or fluids (fallback=%s).", fallback)
+    if stats is not None:
+        stats.update(dropped=dropped, fallback=fallback)
     return services, parts, fluids, total
 
 

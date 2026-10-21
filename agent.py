@@ -364,6 +364,14 @@ def build_message(booking: dict) -> str:
         lines.append("---")
         lines.append(f"Totalt: {total}")
 
+    # Counts only, never row text: unread rows may come from the event log (staff names).
+    dropped = booking.get("spec_dropped")
+    if isinstance(dropped, int) and not isinstance(dropped, bool) and dropped > 0:
+        lines.append(f"Obs: {dropped} rader i specifikationen kunde inte läsas – "
+                     "kontrollera bokningen i portalen.")
+    elif booking.get("spec_fallback"):
+        lines.append("Obs: specifikationen lästes i reservläge – kontrollera delarna i portalen.")
+
     return "\n".join(lines)
 
 

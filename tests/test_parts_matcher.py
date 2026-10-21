@@ -642,7 +642,13 @@ def test_synonyms_after_quantity_and_placement_removal(name, expected):
 
 def test_decomposed_accent_still_matches_synonym():
     decomposed = unicodedata.normalize("NFD", "Kupéfilter")
-    assert search_terms(decomposed)[0] == "kupefilter"
+    assert decomposed != "Kupéfilter"
+    terms = search_terms(decomposed)
+    # NFD and NFC spellings are one term: no separate composed "kupéfilter" duplicate.
+    assert terms == ["kupefilter", decomposed]
+    folded = [unicodedata.normalize("NFC", t).casefold() for t in terms]
+    assert len(set(folded)) == len(folded)
+    assert search_terms(decomposed + " fram x2") == ["kupefilter", "kupéfilter", decomposed + " fram x2"]
 
 
 @pytest.mark.parametrize("name,expected", [
