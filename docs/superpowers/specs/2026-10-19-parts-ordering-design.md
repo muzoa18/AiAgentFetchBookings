@@ -113,6 +113,13 @@ is a mechanic, not a developer: it must be safe by default and adjustable withou
 - **Checkout path:** cart page -> "Gå vidare" -> checkout page ("Beställning <REG>") -> "Skicka beställning" (the order is placed here). The confirmation page has not been seen yet.
 - **First real order is a supervised live test:** the owner follows it and cancels if anything is wrong; the confirmation-page handling is verified and adjusted against it. Rollout stays approve-first.
 
+## Source of truth and the Klar flow (owner-decided 2026-10-21)
+- **The portal is the truth for a `Bokning`:** a booking listed in the "Nya" tab is NOT handled. Local storage (`seen_ids.txt`, `orders.json`) never decides "handled"; `seen_ids` only means "the owner was notified" (log text "Already notified"). Offert/Förfrågan (no Hanterad button) keep local-storage handling for notification de-duplication. (Later projects, owner ideas: calculate and send an offer to the customer; a second Telegram bot to ask the owner questions.)
+- **Notify once** per booking. Every run still works on every unhandled `Bokning`, quietly: no new message unless the outcome changes.
+- **No spare parts** (no non-fluid part lines; fluids are only listed for the owner to prepare): message once, then Hanterad -> Bekräfta immediately, retried each run until it succeeds (failures are reported as today).
+- **Spare parts:** Hanterad is NOT pressed at notification time. The order flow runs as before. A `blocked` booking whose cart was never touched (nothing in the cart, e.g. "no confident match") is **retried automatically** each run (cap 10 tries; message only when the outcome changes: new reason, or staged for approval); blocked-after-cart-touched, failed, cancelled, expired, pending, attempted and ordered bookings are never retried automatically.
+- **Klar:** every resolution message (ordered, blocked, failed, cancelled, expired) carries a **Klar** button. Tapping Klar (processed by the next approve run) presses Hanterad -> Bekräfta in the portal for that booking and closes it; a Klar tap while the order is still `pending` approval is refused ("godkänn eller avbryt först"); a failed Hanterad is reported and the owner can tap again. Nothing is marked Hanterad for a booking with parts without that tap.
+
 ## Left to the builder
 - Part-matching method (the repo already uses the Anthropic API; model choice, prompt and
   confidence threshold are the builder's call, as long as ambiguity fails closed).

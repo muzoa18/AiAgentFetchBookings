@@ -255,3 +255,21 @@ Rules (owner): (1) Pollenfilter = Kupéfilter (searching "pollenfilter" on pro.m
 - **Task 13 Repair agent:** on a failed/blocked order or failed portal step, a bounded agent diagnoses (error, order state, screenshots, page structure) and may fix ONLY data-level things (selectors, search words/synonyms, text patterns in a data file `portal_selectors.json`) automatically after the test suite passes, with a Telegram report and a revert hint; logic changes are proposed as a pull request, never applied unattended; it never places orders and never touches rules/limits/safety code or workflows.
 - **Task 14 Order checker:** after approve/checkout, re-open pro.meca.se Orderöversikt and confirm the order exists and matches (lines, total); record the real confirmation reference; Telegram result.
 - **Task 15 Simple UI (Vercel):** read-only view of bookings/orders with confirm/cancel buttons triggering the approve workflow via the GitHub API; auth and exact scope to be designed with the owner.
+
+
+---
+
+## Task 16: Portal-as-truth loop and the Klar flow (owner-decided 2026-10-21; see the spec section "Source of truth and the Klar flow")
+
+### Task 16a: Portal-as-truth booking loop
+**Files:** Modify `agent.py` (CRLF), `orders_state.py`, `parts_order.py`, tests.
+**Interfaces:** `orders_state`: record gains `cart_touched: bool`, `tries: int`, `detail_url: str`, `handled: bool` (all optional, strict validation kept); `orders_state.restage(booking_id) -> bool` (True only when the record is `blocked`, `cart_touched` is not True, `tries < 10`; resets to a fresh `attempted` with `tries+1`, keeps the id); `parts_order.plan_and_stage` sets `cart_touched=True` once it adds anything to the cart and stores `detail_url` (the booking's detail URL; it contains only the booking id).
+- [ ] Loop per booking in "Nya": Offert/Förfrågan unchanged; `Bokning`: notify once (id not in seen_ids), then: no non-fluid parts -> Hanterad -> Bekräfta each run until success (reporting as today); with parts and no record -> queue + stage as today and NO Hanterad; with a `blocked` record eligible for `restage` -> silent re-stage (message only if reason changes or it becomes pending); other records -> left alone. Remove the `continue` on seen for Bokning; log "Already notified" instead of "Already handled".
+- [ ] Tests (fakes): seen Bokning without parts still in Nya -> Hanterad attempted, no new notification; seen Bokning with blocked/uncart-touched record -> restaged silently, same reason -> no message, new reason -> one message, staged -> approval message; cart_touched blocked -> no retry; tries cap; pending/ordered/failed/cancelled/expired/attempted -> no retry; with-parts booking never gets Hanterad here; Offert/Förfrågan unchanged; the earlier FIX 3 retry for "no orders record" is replaced by this behaviour.
+- [ ] Commit `feat: portal is the truth for Bokningar; notify once, retry blocked orders`.
+
+### Task 16b: Klar button and Klar handling
+**Files:** Modify `parts_order.py`/`parts_order_helpers.py` (resolution messages carry the button), `approve.py` (handle `klar:<id>`; `--check` true when pending OR an outstanding Klar exists), `orders_state.py` (`klar_message_id`, `handled`, `outstanding_klar()`), workflows only if needed, tests.
+**Interfaces:** callback data `klar:<booking_id>` (same strict parsing/auth as approve/cancel: owner private chat + user id + stored message id); Klar handler calls `portal_scraper.mark_booking_handled(config, detail_url)` for the stored `detail_url`; success -> `handled=True`, buttons cleared, short confirmation message; failure -> message "Kunde inte markera ... gör det för hand" and the button stays; status `pending` -> refused ("Godkänn eller avbryt först."); already handled -> "Redan hanterad."
+- [ ] Tests (fakes): each resolution message (ordered, blocked, failed, cancelled, expired) is sent with `send_with_buttons` carrying `klar:<id>` and its message id is stored; Klar tap flows (success, failure, pending refusal, double tap, wrong chat/user/message id, unknown id); `--check` stays stdlib-only and reports true for an outstanding Klar; the MECA portal credentials are available to approve.yml (PORTAL_* already passed).
+- [ ] Commit `feat: Klar button marks the booking Hanterad after the owner's tap`.
