@@ -61,9 +61,22 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
     monkeypatch.setattr(state, "NO_BUTTON_FILE", tmp_path / "no_button_ids.txt")
     monkeypatch.setattr(state, "NO_BUTTON_SEEN_FILE", tmp_path / "no_button_seen_once.txt")
-    rec["buttons"] = []
-    monkeypatch.setattr(notifier, "send_with_buttons",
-                        lambda config, text, buttons: rec["buttons"].append((text, buttons)) or 77)
+    rec["buttons"], rec["klar"], rec["cleared"] = [], [], []
+
+    def fake_buttons(config, text, buttons):
+        # A Klar-only message is a resolution message: delivered like a plain one (Task 16b).
+        if buttons and all(data.startswith("klar:") for _, data in buttons):
+            if not rec["send_ok"]:
+                return None
+            rec["sent"].append(text)
+            rec["klar"].append((text, buttons))
+            return 900 + len(rec["klar"])
+        rec["buttons"].append((text, buttons))
+        return 77
+
+    monkeypatch.setattr(notifier, "send_with_buttons", fake_buttons)
+    monkeypatch.setattr(notifier, "clear_buttons",
+                        lambda config, message_id: rec["cleared"].append(message_id))
     monkeypatch.setattr(agent, "load_rules", lambda: RULES)
     monkeypatch.setattr(agent, "make_claude_picker", lambda api_key: "picker")
 

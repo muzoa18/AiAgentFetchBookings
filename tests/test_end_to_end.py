@@ -1,6 +1,7 @@
 """End to end with fakes: agent stages a parts order, the owner approves it on Telegram,
-approve.py checks it out. Real agent/parts_order/approve/orders_state code; only the
-pro.meca.se portal, the picker, Telegram and config/rules loading are faked."""
+approve.py checks it out, the owner taps Klar and approve.py marks the booking Hanterad.
+Real agent/parts_order/approve/orders_state code; only the pro.meca.se portal, the MECA
+Hanterad step, the picker, Telegram and config/rules loading are faked."""
 import sys
 import types
 
@@ -98,16 +99,25 @@ def world(monkeypatch, tmp_path):
     orders_file = tmp_path / "config" / "orders.json"
     monkeypatch.setattr(orders_state, "ORDERS_FILE", orders_file)
     portal = FakeMecaPortal()
-    rec = {"portal": portal, "sent": [], "buttons": [], "answers": [], "cleared": [],
-           "updates": [], "offsets": [], "picked": [], "orders_file": orders_file}
+    rec = {"portal": portal, "sent": [], "buttons": [], "klar": [], "answers": [], "cleared": [],
+           "updates": [], "offsets": [], "picked": [], "orders_file": orders_file,
+           "hanterad": []}
 
     def send(config, text):
         rec["sent"].append(text)
         return True
 
     def send_with_buttons(config, text, buttons):
+        if buttons and all(data.startswith("klar:") for _, data in buttons):
+            rec["sent"].append(text)  # a resolution message: delivered text, plus a Klar button
+            rec["klar"].append((text, buttons))
+            return 600 + len(rec["klar"])
         rec["buttons"].append((text, buttons))
         return 555
+
+    def mark_handled(config, detail_url):
+        rec["hanterad"].append(detail_url)
+        return True
 
     def get_updates(config, offset=None):
         rec["offsets"].append(offset)
@@ -132,12 +142,16 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(config_loader, "load_config", lambda: CONFIG)
     monkeypatch.setattr(rules, "load_rules", lambda *a, **k: RULES)
     monkeypatch.setattr(approve, "make_portal", lambda config: Session(portal))
+    monkeypatch.setattr(approve, "mark_handled", mark_handled)
     return rec
 
 
-def tap(update_id, message_id=555):
+def tap(update_id, message_id=555, data="approve:B1"):
     return {"update_id": update_id, "chat_id": "42", "user_id": "42",
-            "callback_id": f"cb{update_id}", "data": "approve:B1", "message_id": message_id}
+            "callback_id": f"cb{update_id}", "data": data, "message_id": message_id}
+
+
+DETAIL_URL = "https://portal.example/Booking/Details?BookingID=B1"
 
 
 def test_stage_approve_and_order_end_to_end(world):
@@ -145,11 +159,13 @@ def test_stage_approve_and_order_end_to_end(world):
 
     # ── agent: stage ──
     orders_state.queue("B1")
-    assert agent._order_parts(CONFIG, [BOOKING]) == (1, 0)
+    assert agent._order_parts(CONFIG, [{**BOOKING, "detail_url": DETAIL_URL}]) == (1, 0)
 
     record = orders_state.get("B1")
     assert record["status"] == "pending"
     assert record["message_id"] == 555
+    assert record["detail_url"] == DETAIL_URL
+    assert "klar_message_id" not in record  # waiting for approval: not resolved, no Klar
     assert world["picked"] == [["10000001"]]  # Bosch offered first, alone
     plan = record["plan"]
     assert plan["expected_lines"] == [
@@ -182,14 +198,46 @@ def test_stage_approve_and_order_end_to_end(world):
     assert "- Oljefilter -> Bosch Oljefilter, Filterinsats" in done
     assert orders_state.last_update_id() == 1001
 
-    # ── a second identical tap ──
+    # The "Beställd" message carries the Klar button; the booking is not Hanterad yet.
+    (klar_text, klar_buttons), = world["klar"]
+    assert klar_text == done and klar_buttons == [("Klar", "klar:B1")]
+    assert record["klar_message_id"] == 601
+    assert world["hanterad"] == []
+    assert orders_state.outstanding_klar() == [("B1", record)]
+
+    # ── a second identical Godkänn tap (the Klar is outstanding, so the poller runs) ──
     world["updates"] = [tap(1001), tap(1002)]
-    assert approve.main([]) == 0  # nothing pending: exits before Telegram
-    assert world["offsets"] == [None]
-    assert approve.handle_updates(CONFIG, lambda: Session(portal), RULES) == 0
+    assert approve.main([]) == 0
     assert world["offsets"][-1] == 1002
     assert world["answers"][-1] == ("cb1002", "Redan hanterad.")
     assert portal.calls.count("checkout") == 1
     assert len(world["sent"]) == 1
     assert orders_state.get("B1")["status"] == "ordered"
     assert orders_state.last_update_id() == 1002
+
+    # ── the owner taps Klar: the next poll marks the booking Hanterad ──
+    world["updates"] = [tap(1003, message_id=601, data="klar:B1")]
+    assert approve.main([]) == 0
+    assert world["hanterad"] == [DETAIL_URL]
+    record = orders_state.get("B1")
+    assert record["handled"] is True and record["status"] == "ordered"
+    assert world["answers"][-1] == ("cb1003", "Markerar som Hanterad…")
+    assert world["cleared"] == [555, 601]
+    assert world["sent"][-1] == "Klar: bokning OLRD-3630 är markerad som Hanterad."
+    assert orders_state.outstanding_klar() == []
+    assert portal.calls.count("checkout") == 1
+
+    # ── a second Klar tap: already handled, nothing pressed ──
+    assert approve.handle_updates(CONFIG, lambda: Session(portal), RULES) == 0  # replay
+    world["updates"] = [tap(1004, message_id=601, data="klar:B1")]
+    assert approve.handle_updates(CONFIG, lambda: Session(portal), RULES) == 0
+    assert world["answers"][-1] == ("cb1004", "Redan hanterad.")
+    assert world["hanterad"] == [DETAIL_URL]
+    assert len(world["sent"]) == 2
+    for sentinel in PII:
+        assert sentinel not in world["orders_file"].read_text(encoding="utf-8")
+
+    # Nothing pending and no Klar outstanding: the next poll exits before Telegram.
+    offsets = list(world["offsets"])
+    assert approve.main([]) == 0
+    assert world["offsets"] == offsets

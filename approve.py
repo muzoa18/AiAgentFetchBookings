@@ -3,7 +3,10 @@ approve.py
 ----------
 Telegram approval poller (approve.yml, once a day at 06:00 UTC). Reads the owner's
 Approve/Cancel taps on staged parts orders, checks out or cancels, and expires
-approvals older than 48 h.
+approvals older than 48 h. It also handles Klar taps: every resolution message
+(ordered, blocked, failed, cancelled, expired) carries a Klar button, and a tap
+marks the booking Hanterad in the MECA portal (portal_scraper.mark_booking_handled).
+A booking with parts is never marked Hanterad without that tap.
 
 Fails closed. An order is placed only when ALL of these hold at tap time:
   * it is tapped by the owner in their private chat (config telegram.chat_id
@@ -15,11 +18,17 @@ parts_order.execute_order then re-checks the live cart against the plan and
 the ceiling before checkout, and records "attempted" first, so a crash is
 never re-ordered (agent.py's start-of-run sweep reports it).
 
+A Klar tap is accepted with the same checks (owner, private chat, the booking's
+stored klar_message_id) and only once the order is resolved: never while it is
+"pending" or "attempted". A failed Hanterad keeps the button so the owner can tap
+again.
+
 The Telegram offset (last_update_id) is only advanced after an update was fully
 handled. An update that raised while its booking is still "pending" is left
 unconfirmed and retried on the next poll; nothing after it is processed.
 
-  python approve.py --check   prints has_pending=true|false (stdlib only)
+  python approve.py --check   prints has_pending=true|false (stdlib only); true when an
+                              order awaits approval or a Klar button is outstanding
   python approve.py           handles taps; exit 1 if anything failed
 """
 
@@ -52,11 +61,11 @@ def _is_int(value) -> bool:
 
 
 def _parse(data):
-    """'approve:<id>' / 'cancel:<id>' -> (action, id); anything else -> None."""
+    """'approve:<id>' / 'cancel:<id>' / 'klar:<id>' -> (action, id); anything else -> None."""
     if not isinstance(data, str):
         return None
     action, sep, booking_id = data.partition(":")
-    if not sep or action not in ("approve", "cancel"):
+    if not sep or action not in ("approve", "cancel", "klar"):
         return None
     if not booking_id or booking_id != booking_id.strip() or any(c.isspace() for c in booking_id):
         return None
@@ -123,6 +132,7 @@ def _clear_cart(session: _Portal, reg_nr) -> bool:
 def _expire(config: dict, now: datetime) -> tuple[int, bool]:
     """(number expired, any problem). The cart is left for the owner (spec: Expiry)."""
     import notifier
+    import parts_order
     expired, problem = 0, False
     for booking_id, record in orders_state.pending():
         if not _too_old(record, now):
@@ -138,9 +148,9 @@ def _expire(config: dict, now: datetime) -> tuple[int, bool]:
         log.info("Approval for %s expired.", booking_id)
         if _is_int(record.get("message_id")):
             notifier.clear_buttons(config, record["message_id"])
-        if not notifier.send_message(
-                config, f"Godkännandet för {label} har gått ut (48 h). "
-                        f"Beställ för hand om delarna behövs. {CART_LEFT}"):
+        if not parts_order.send_with_klar(
+                config, booking_id, f"Godkännandet för {label} har gått ut (48 h). "
+                                    f"Beställ för hand om delarna behövs. {CART_LEFT}"):
             log.error("Expiry message for %s was not delivered.", booking_id)
             problem = True
     return expired, problem
@@ -163,9 +173,10 @@ def _approve(config, session, booking_id, record, rules, cb) -> bool:
         portal = session.get()
     except Exception as e:
         orders_state.put(booking_id, "failed")
-        if not notifier.send_message(
-                config, f"Beställning misslyckades för {_label(booking_id, record)}: {e}. "
-                        "Inget beställdes – beställ för hand."):
+        if not parts_order.send_with_klar(
+                config, booking_id,
+                f"Beställning misslyckades för {_label(booking_id, record)}: {e}. "
+                "Inget beställdes – beställ för hand."):
             log.error("Failure message for %s was not delivered.", booking_id)
         return True
     result = parts_order.execute_order(config, portal, booking_id, record["plan"], rules)
@@ -176,19 +187,74 @@ def _approve(config, session, booking_id, record, rules, cb) -> bool:
 def _cancel(config, session, booking_id, record, cb) -> bool:
     """Cancel one staged order. Returns True if the run must exit 1."""
     import notifier
+    import parts_order
     orders_state.put(booking_id, "cancelled")
     notifier.clear_buttons(config, record["message_id"])
     notifier.answer_callback(config, cb, "Avbruten.")
     tail = CART_CLEARED if _clear_cart(session, (record.get("plan") or {}).get("reg_nr")) \
         else CART_MANUAL
     log.info("Order for %s cancelled by the owner.", booking_id)
-    if not notifier.send_message(config, f"Avbruten: {_label(booking_id, record)}. {tail}"):
+    if not parts_order.send_with_klar(config, booking_id,
+                                      f"Avbruten: {_label(booking_id, record)}. {tail}"):
         log.error("Cancel message for %s was not delivered.", booking_id)
         return True
     return False
 
 
-def _handle_one(config, session, rules, update, owner: str) -> tuple[int, bool]:
+def mark_handled(config: dict, detail_url: str):
+    """Press Hanterad -> Bekräfta for one booking (True / False / None = no button)."""
+    from portal_scraper import mark_booking_handled  # lazy: Playwright
+    return mark_booking_handled(config, detail_url)
+
+
+def _klar(config, booking_id, record, cb, mark) -> tuple[int, bool]:
+    """The owner tapped Klar on a resolution message: mark the booking Hanterad.
+
+    (actions taken, run must exit 1). The record was re-read for this tap."""
+    import notifier
+    label = _label(booking_id, record)
+    if record.get("handled") is True:
+        notifier.answer_callback(config, cb, "Redan hanterad.")
+        notifier.clear_buttons(config, record["klar_message_id"])
+        return 0, False
+    if record.get("status") == "pending":
+        notifier.answer_callback(config, cb, "Godkänn eller avbryt beställningen först.")
+        return 0, False
+    if record.get("status") == "attempted":
+        notifier.answer_callback(config, cb, "Beställningen pågår – vänta.")
+        return 0, False
+    url = record.get("detail_url")
+    if not isinstance(url, str) or not url.strip():
+        notifier.answer_callback(config, cb, "Saknar länk – markera bokningen som Hanterad i portalen.")
+        if not notifier.send_message(
+                config, f"Saknar länk till bokning {label} – markera bokningen som Hanterad "
+                        "i portalen."):
+            log.error("Missing-link message for %s was not delivered.", booking_id)
+        return 0, True
+    notifier.answer_callback(config, cb, "Markerar som Hanterad…")
+    try:
+        result = mark(config, url)
+    except Exception:
+        log.exception("Marking %s Hanterad raised.", booking_id)
+        result = False
+    if result is not True:
+        log.error("Could not mark %s Hanterad (result %r); the Klar button stays.",
+                  booking_id, result)
+        if not notifier.send_message(
+                config, f"Kunde inte markera bokning {label} som Hanterad – "
+                        f"gör det för hand: {url}"):
+            log.error("Hanterad failure message for %s was not delivered.", booking_id)
+        return 1, True
+    orders_state.update_fields(booking_id, handled=True)
+    log.info("Booking %s marked Hanterad after the owner's Klar tap.", booking_id)
+    notifier.clear_buttons(config, record["klar_message_id"])
+    if not notifier.send_message(config, f"Klar: bokning {label} är markerad som Hanterad."):
+        log.error("Klar confirmation for %s was not delivered.", booking_id)
+        return 1, True
+    return 1, False
+
+
+def _handle_one(config, session, rules, update, owner: str, mark=None) -> tuple[int, bool]:
     """(actions taken, run must exit 1) for one normalised callback update."""
     import notifier
     if not _from_owner(update, owner):
@@ -204,10 +270,14 @@ def _handle_one(config, session, rules, update, owner: str) -> tuple[int, bool]:
     if record is None:
         notifier.answer_callback(config, cb, "Okänd bokning.")
         return 0, False
-    stored = record.get("message_id")
-    if not _is_int(stored) or update.get("message_id") != stored:
+    # Approve/Cancel live on the approval message, Klar on the latest resolution message.
+    stored = record.get("klar_message_id" if action == "klar" else "message_id")
+    if not _is_int(stored) or not _is_int(update.get("message_id")) \
+            or update.get("message_id") != stored:
         notifier.answer_callback(config, cb, "Knappen är inte längre giltig.")
         return 0, False
+    if action == "klar":
+        return _klar(config, booking_id, record, cb, mark if mark is not None else mark_handled)
     if record.get("status") != "pending":
         notifier.answer_callback(config, cb, "Redan hanterad.")
         return 0, False
@@ -231,7 +301,7 @@ def _still_pending(update) -> bool:
     return record is None or record.get("status") == "pending"
 
 
-def _handle(config: dict, portal_factory, rules) -> tuple[int, bool]:
+def _handle(config: dict, portal_factory, rules, mark=None) -> tuple[int, bool]:
     import notifier
     last = orders_state.last_update_id()
     owner = str(config.get("telegram", {}).get("chat_id") or "")
@@ -241,7 +311,7 @@ def _handle(config: dict, portal_factory, rules) -> tuple[int, bool]:
             session = _Portal(portal_factory, stack)
             for update in notifier.get_updates(config, None if last is None else last + 1):
                 try:
-                    n, bad = _handle_one(config, session, rules, update, owner)
+                    n, bad = _handle_one(config, session, rules, update, owner, mark)
                     actions += n
                     problem = problem or bad
                 except Exception:
@@ -259,9 +329,11 @@ def _handle(config: dict, portal_factory, rules) -> tuple[int, bool]:
     return actions, problem
 
 
-def handle_updates(config: dict, portal_factory, rules) -> int:
-    """Handle the owner's Approve/Cancel taps. Returns the number of actions taken."""
-    return _handle(config, portal_factory, rules)[0]
+def handle_updates(config: dict, portal_factory, rules, mark=None) -> int:
+    """Handle the owner's Approve/Cancel/Klar taps. Returns the number of actions taken.
+
+    `mark(config, detail_url)` presses Hanterad (default: mark_handled)."""
+    return _handle(config, portal_factory, rules, mark)[0]
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -279,7 +351,7 @@ def make_portal(config: dict):
 
 def _check() -> int:
     try:
-        has_pending = bool(orders_state.pending())
+        has_pending = bool(orders_state.pending()) or bool(orders_state.outstanding_klar())
     except Exception as e:
         print(f"Order state unreadable: {e}", file=sys.stderr)
         return 1
@@ -303,8 +375,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])
     try:
-        if not orders_state.pending():
-            log.info("No pending approvals.")
+        if not orders_state.pending() and not orders_state.outstanding_klar():
+            log.info("No pending approvals and no outstanding Klar buttons.")
             return 0
     except Exception:
         log.exception("Order state file unreadable — no approvals handled.")

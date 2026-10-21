@@ -8,6 +8,10 @@ Fails closed: every path ends in a non-"attempted" status in orders_state plus a
 Telegram message (ordered, blocked or failed). A message that cannot be delivered
 turns blocked into "failed" so the run goes red. No exception leaves this module.
 
+Every resolution message (ordered, blocked, failed, give-up; cancelled and expired in
+approve.py) carries a Klar button (send_with_klar). The owner's tap makes approve.py
+mark the booking Hanterad; a booking with parts is never marked Hanterad otherwise.
+
 pro.meca.se keeps one cart PER VEHICLE, so staging requires the loaded vehicle's cart
 to be empty: a second booking for a vehicle whose cart is in use is blocked rather than
 mixed into the same cart.
@@ -33,6 +37,8 @@ from rules import Rules
 log = logging.getLogger(__name__)
 
 GIVE_UP_TEXT = "Försöker inte mer automatiskt för {label} – beställ för hand eller åtgärda orsaken."
+
+KLAR_FALLBACK = "\n(Klar-knappen kunde inte skickas – markera bokningen som Hanterad i portalen.)"
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -90,6 +96,41 @@ def _why(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:200]
 
 
+# ── Klar button ──────────────────────────────────────────────────────────────
+
+def send_with_klar(config: dict, booking_id, text: str) -> bool:
+    """Send a resolution message with a Klar button; True if the owner got the text.
+
+    The new message id is stored as the record's klar_message_id and the buttons of
+    an older Klar message are cleared (best effort). Without a record, or if the
+    button message cannot be sent, a plain message asks the owner to mark the
+    booking Hanterad by hand.
+    """
+    try:
+        record = orders_state.get(booking_id) if isinstance(booking_id, str) else None
+    except Exception:
+        log.exception("Order state unreadable for %r — sending without Klar.", booking_id)
+        record = None
+    mid = None
+    if record is not None:
+        mid = notifier.send_with_buttons(config, text, [("Klar", f"klar:{booking_id}")])
+    if type(mid) is not int or mid < 1:
+        if record is not None:
+            log.error("Klar message for %s could not be sent — sending it plain.", booking_id)
+        return bool(notifier.send_message(config, text + KLAR_FALLBACK))
+    old = record.get("klar_message_id")
+    if type(old) is int and old != mid:
+        try:
+            notifier.clear_buttons(config, old)
+        except Exception:
+            log.exception("Could not clear the old Klar button of %s.", booking_id)
+    try:
+        orders_state.update_fields(booking_id, klar_message_id=mid)
+    except Exception:
+        log.exception("Could not store the Klar message id of %s.", booking_id)
+    return True
+
+
 # ── Status endings (each sends a message) ────────────────────────────────────
 
 def _fail(config: dict, booking_id, label: str, reason: str) -> str:
@@ -97,8 +138,8 @@ def _fail(config: dict, booking_id, label: str, reason: str) -> str:
         orders_state.put(booking_id, "failed")
     except Exception:
         log.exception("Could not record 'failed' for booking %r", booking_id)
-    if not notifier.send_message(
-            config, f"Delbeställning misslyckades för {label}: {reason}. Beställ för hand."):
+    if not send_with_klar(
+            config, booking_id, f"Delbeställning misslyckades för {label}: {reason}. Beställ för hand."):
         log.error("Failure message for %r was not delivered.", booking_id)
     return "failed"
 
@@ -123,7 +164,7 @@ def _block(config: dict, booking: dict, reason: str, fluids: list[dict],
             lines.append("Varukorgen på pro.meca.se innehåller delarna – "
                          "töm den eller beställ därifrån.")
         text = "\n".join(lines + prepare_section(fluids))
-    if notifier.send_message(config, text):
+    if send_with_klar(config, booking_id, text):
         return "blocked"
     log.error("Blocked-order message for %s was not delivered — marking failed.", booking_id)
     orders_state.put(booking_id, "failed")
@@ -139,9 +180,10 @@ def give_up_if_capped(config: dict, booking: dict) -> bool:
     booking_id = booking.get("id")
     record = orders_state.get(booking_id)
     if (not record or record.get("status") != "blocked" or record.get("cart_touched") is True
-            or record.get("tries", 0) < orders_state.MAX_TRIES or record.get("gave_up")):
+            or record.get("tries", 0) < orders_state.MAX_TRIES or record.get("gave_up")
+            or record.get("handled") is True):
         return None
-    if not notifier.send_message(config, GIVE_UP_TEXT.format(label=_label(booking))):
+    if not send_with_klar(config, booking_id, GIVE_UP_TEXT.format(label=_label(booking))):
         log.error("Give-up message for %s was not delivered.", booking_id)
         return False
     orders_state.update_fields(booking_id, gave_up=True)
@@ -298,7 +340,7 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
             # An earlier run may have ordered it already (state push failed) or the owner
             # ordered the cart by hand: never suggest ordering again without checking.
             orders_state.put(booking_id, "failed")
-            if not notifier.send_message(config, EMPTY_CART_TEXT):
+            if not send_with_klar(config, booking_id, EMPTY_CART_TEXT):
                 log.error("Empty-cart message for %s was not delivered.", booking_id)
             return "failed"
         total = cart.get("total_sek")
@@ -308,8 +350,8 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
         problem = problem or cart_problem(cart.get("lines") or [], plan["expected_lines"], rules)
         if problem:
             orders_state.put(booking_id, "failed")
-            if not notifier.send_message(config, f"Beställning stoppad för {label}: {problem}. "
-                                                 "Inget beställdes – beställ för hand."):
+            if not send_with_klar(config, booking_id, f"Beställning stoppad för {label}: {problem}. "
+                                                      "Inget beställdes – beställ för hand."):
                 log.error("Stopped-order message for %s was not delivered.", booking_id)
             return "failed"
 
@@ -332,7 +374,7 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
         else:
             text = (f"Beställning misslyckades för {label}: {_why(e)}. "
                     "Inget beställdes – beställ för hand.")
-        if not notifier.send_message(config, text):
+        if not send_with_klar(config, booking_id, text):
             log.error("Failure message for %s was not delivered.", booking_id)
         return "failed"
 
@@ -340,7 +382,7 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
                      + order_body(plan.get("parts") or [], plan.get("total_sek"),
                                   plan.get("fluids") or []))
     try:
-        delivered = notifier.send_message(config, text)
+        delivered = send_with_klar(config, booking_id, text)
     except Exception:
         log.exception("Sending the ordered message for %s raised.", booking_id)
         delivered = False

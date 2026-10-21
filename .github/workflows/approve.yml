@@ -1,6 +1,7 @@
 name: MECA Approval Poller
 
-# Reads the owner's Telegram Approve/Cancel taps on staged parts orders
+# Reads the owner's Telegram Approve/Cancel taps on staged parts orders, and
+# Klar taps that mark a resolved booking Hanterad in the MECA portal
 # (approve.py). Once a day at 06:00 UTC (08:00 Swedish summer time, 07:00
 # winter time), every day of the week: the owner taps in the evening after the
 # daily booking run and the order is placed the next morning. Every day (incl.
@@ -36,7 +37,8 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Stdlib only: nothing installed yet. Most runs stop here.
+      # Stdlib only: nothing installed yet. Most runs stop here. has_pending is
+      # true for an order awaiting approval or an outstanding Klar button.
       - name: Anything pending?
         id: check
         run: python approve.py --check
@@ -52,7 +54,8 @@ jobs:
       - name: Handle approvals
         if: ${{ steps.check.outputs.has_pending == 'true' }}
         env:
-          # PORTAL_* are not used here, but config_loader requires them.
+          # PORTAL_*: the MECA portal login for a Klar tap (press Hanterad, then confirm);
+          # config_loader requires them anyway.
           PORTAL_USERNAME:       ${{ secrets.PORTAL_USERNAME }}
           PORTAL_PASSWORD:       ${{ secrets.PORTAL_PASSWORD }}
           TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}

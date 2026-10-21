@@ -122,19 +122,35 @@ def orders_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 def tg(monkeypatch):
-    """Fake Telegram: records plain messages and button messages."""
-    rec = {"sent": [], "buttons": [], "message_id": 77, "send_ok": True}
+    """Fake Telegram: records plain messages and button messages.
+
+    A message with only a Klar button (a resolution message) is delivered like a plain
+    message: its text lands in `sent` (and in `klar` with its buttons and message id),
+    and it fails when `send_ok` or `klar_ok` is False. Approval messages land in `buttons`.
+    """
+    rec = {"sent": [], "buttons": [], "klar": [], "cleared": [], "message_id": 77,
+           "send_ok": True, "klar_ok": True, "next_klar": 900}
 
     def fake_send(config, text):
         rec["sent"].append(text)
         return rec["send_ok"]
 
     def fake_buttons(config, text, buttons):
+        if buttons and all(data.startswith("klar:") for _, data in buttons):
+            if not (rec["send_ok"] and rec["klar_ok"]):
+                return None
+            mid = rec["next_klar"]
+            rec["next_klar"] += 1
+            rec["sent"].append(text)
+            rec["klar"].append((text, buttons, mid))
+            return mid
         rec["buttons"].append((text, buttons))
         return rec["message_id"]
 
     monkeypatch.setattr(notifier, "send_message", fake_send)
     monkeypatch.setattr(notifier, "send_with_buttons", fake_buttons)
+    monkeypatch.setattr(notifier, "clear_buttons",
+                        lambda config, message_id: rec["cleared"].append(message_id))
     return rec
 
 
@@ -967,3 +983,190 @@ def test_retry_at_cap_with_undelivered_give_up_is_failed_but_stays_blocked(tg):
     assert "gave_up" not in rec
     tg["send_ok"] = True
     assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
+
+
+# ── Task 16b: resolution messages carry a Klar button ───────────────────────
+
+KLAR = [("Klar", "klar:B1")]
+
+
+def _klar_only(tg, text_part):
+    """Exactly one Klar message was sent, containing text_part; returns its message id."""
+    (text, buttons, mid), = tg["klar"]
+    assert buttons == KLAR
+    assert text_part in text
+    assert tg["sent"] == [text]
+    return mid
+
+
+def test_blocked_message_carries_klar_and_stores_its_id(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    mid = _klar_only(tg, "Delbeställning stoppad för OLRD-3630")
+    assert orders_state.get("B1")["klar_message_id"] == mid == 900
+    assert tg["buttons"] == [] and tg["cleared"] == []
+
+
+def test_blocked_before_portal_carries_klar(tg):
+    booking = {**BOOKING, "reg_nr": ""}
+    assert parts_order.plan_and_stage(CONFIG, booking, UntouchablePortal(), APPROVE,
+                                      confident) == "blocked"
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "registreringsnummer")
+
+
+def test_failed_staging_message_carries_klar(tg):
+    portal = FakePortal()
+    portal.fail_on = "search"
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "failed"
+
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "misslyckades")
+
+
+def test_record_failure_message_carries_klar(tg):
+    orders_state.queue("B1")
+    assert parts_order.record_failure(CONFIG, BOOKING, "portal saknas") == "failed"
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "portal saknas")
+
+
+def test_approval_message_has_no_klar_button(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), APPROVE, confident) == "pending"
+
+    (text, buttons), = tg["buttons"]
+    assert buttons == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+    assert tg["klar"] == [] and tg["sent"] == []
+    assert "klar_message_id" not in orders_state.get("B1")
+
+
+def test_undeliverable_approval_failure_message_carries_klar(tg):
+    tg["message_id"] = None
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), APPROVE, confident) == "failed"
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "godkännandemeddelandet")
+
+
+def test_ordered_message_carries_klar(tg):
+    portal = FakePortal(ref="ORD-9")
+    plan = _staged_plan(tg, portal)
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+
+    mid = _klar_only(tg, "Beställd: OLRD-3630")
+    rec = orders_state.get("B1")
+    assert rec["klar_message_id"] == mid
+    assert rec["message_id"] == 77               # the approval message id is untouched
+    assert parts_order.order_notify_failed("B1") is False
+
+
+def test_auto_mode_ordered_message_carries_klar(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), AUTO, confident) == "ordered"
+    assert tg["buttons"] == []
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "Beställd")
+
+
+@pytest.mark.parametrize("break_it,text", [
+    (lambda p: setattr(p, "fail_on", "checkout"), "kan ha lagts"),
+    (lambda p: setattr(p, "fail_on", "login"), "Inget beställdes"),
+    (lambda p: setattr(p, "carts", [{"lines": [], "total_sek": 0.0}]), "Varukorgen på pro.meca.se är tom"),
+    (lambda p: setattr(p, "cart", _cart(500.0)), "Beställning stoppad för OLRD-3630"),
+])
+def test_execute_order_failure_messages_carry_klar(tg, break_it, text):
+    portal = FakePortal()
+    plan = _staged_plan(tg, portal)
+    break_it(portal)
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "failed"
+
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, text)
+
+
+def test_klar_send_failure_falls_back_to_a_plain_message(tg):
+    tg["klar_ok"] = False
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"   # still delivered
+
+    assert tg["klar"] == []
+    (text,) = tg["sent"]
+    assert text.startswith("Delbeställning stoppad för OLRD-3630")
+    assert text.endswith("\n(Klar-knappen kunde inte skickas – markera bokningen som "
+                         "Hanterad i portalen.)")
+    assert "klar_message_id" not in orders_state.get("B1")
+
+
+def test_klar_and_plain_both_failing_is_failed_as_before(tg):
+    tg["send_ok"] = False
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "failed"
+    assert orders_state.get("B1")["status"] == "failed"
+    assert "klar_message_id" not in orders_state.get("B1")
+
+
+def test_ordered_with_klar_failing_but_plain_delivered_is_not_notify_failed(tg):
+    portal = FakePortal(ref="ORD-9")
+    plan = _staged_plan(tg, portal)
+    tg["klar_ok"] = False
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+
+    assert parts_order.order_notify_failed("B1") is False
+    assert "Klar-knappen kunde inte skickas" in tg["sent"][-1]
+
+
+def test_new_resolution_message_clears_the_old_klar_buttons(tg):
+    _blocked_then_restaged("varukorgen är inte tom")
+    orders_state.update_fields("B1", klar_message_id=500)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"   # new reason -> new message
+
+    assert tg["cleared"] == [500]
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, AIR_REASON)
+
+
+def test_quiet_same_reason_retry_keeps_the_old_klar(tg):
+    _blocked_then_restaged(AIR_REASON)
+    orders_state.update_fields("B1", klar_message_id=500)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    assert tg["sent"] == [] and tg["klar"] == [] and tg["buttons"] == [] and tg["cleared"] == []
+    assert orders_state.get("B1")["klar_message_id"] == 500
+
+
+def test_give_up_message_carries_klar_and_replaces_the_old_one(tg):
+    orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES, klar_message_id=500)
+
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
+
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, "Försöker inte mer")
+    assert tg["cleared"] == [500]
+
+
+def test_give_up_skipped_for_a_handled_record(tg):
+    orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES, handled=True)
+
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is None
+    assert tg["sent"] == []
+
+
+def test_send_with_klar_without_a_record_sends_plain(tg):
+    assert parts_order.send_with_klar(CONFIG, "B404", "Hej") is True
+    assert tg["klar"] == []
+    assert tg["sent"] == ["Hej\n(Klar-knappen kunde inte skickas – markera bokningen som "
+                          "Hanterad i portalen.)"]
+
+
+def test_send_with_klar_survives_a_failing_clear(tg, monkeypatch):
+    orders_state.put("B1", "blocked")
+    orders_state.update_fields("B1", klar_message_id=500)
+
+    def broken(config, message_id):
+        raise RuntimeError("telegram hiccup")
+
+    monkeypatch.setattr(notifier, "clear_buttons", broken)
+    assert parts_order.send_with_klar(CONFIG, "B1", "Ny text") is True
+    assert orders_state.get("B1")["klar_message_id"] == 900

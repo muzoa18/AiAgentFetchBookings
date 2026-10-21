@@ -389,3 +389,62 @@ def test_new_record_marked_untouched_is_restaged_for_any_reason():
     orders_state.put("B1", "blocked", plan={"reason": "varukorgen är inte tom"})
     orders_state.update_fields("B1", cart_touched=False)
     assert orders_state.restage("B1") is True
+
+
+# ── Klar (Task 16b) ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value", [1, 555, 2**40])
+def test_klar_message_id_loads(orders_file, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, "klar_message_id": value}})
+    assert orders_state.get("B1")["klar_message_id"] == value
+
+
+@pytest.mark.parametrize("value", [True, False, "555", 5.0, None, 0, -3, [5]])
+def test_bad_klar_message_id_raises(orders_file, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, "klar_message_id": value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+@pytest.mark.parametrize("value", [True, "5", 0, -1, 1.0])
+def test_update_fields_rejects_bad_klar_message_id(orders_file, value):
+    orders_state.put("B1", "blocked")
+    before = orders_file.read_bytes()
+    with pytest.raises(ValueError):
+        orders_state.update_fields("B1", klar_message_id=value)
+    assert orders_file.read_bytes() == before
+
+
+def test_klar_message_id_is_kept_by_put_and_restage():
+    orders_state.put("B1", "blocked", plan={"reason": "r"})
+    orders_state.update_fields("B1", klar_message_id=900, cart_touched=False)
+    orders_state.put("B1", "blocked", plan={"reason": "r2"})
+    assert orders_state.get("B1")["klar_message_id"] == 900
+    assert orders_state.restage("B1") is True
+    assert orders_state.get("B1")["klar_message_id"] == 900
+
+
+def test_outstanding_klar_lists_unhandled_records_with_a_klar_button():
+    orders_state.put("B3", "ordered")
+    orders_state.update_fields("B3", klar_message_id=3)
+    orders_state.put("B1", "blocked")
+    orders_state.update_fields("B1", klar_message_id=1, handled=False)
+    orders_state.put("B2", "cancelled")
+    orders_state.update_fields("B2", klar_message_id=2, handled=True)
+    orders_state.put("B4", "failed")  # no Klar button: nothing to wait for
+    orders_state.put("B5", "pending", message_id=8)
+
+    assert [bid for bid, _ in orders_state.outstanding_klar()] == ["B1", "B3"]
+    assert orders_state.outstanding_klar()[0][1]["klar_message_id"] == 1
+
+
+def test_outstanding_klar_empty_without_file(orders_file):
+    assert orders_state.outstanding_klar() == []
+    assert not orders_file.exists()
+
+
+def test_restage_refuses_a_handled_record():
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'X'"})
+    orders_state.update_fields("B1", cart_touched=False, handled=True)
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == "blocked"

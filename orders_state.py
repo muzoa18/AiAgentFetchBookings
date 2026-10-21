@@ -9,7 +9,8 @@ Stored as config/orders.json (committed back to the repo by the workflows):
     {"last_update_id": int | null,
      "bookings": {"<booking_id>": {"status", "plan", "message_id", "updated_at",
                                    optional: "cart_touched", "tries", "detail_url",
-                                   "handled", "last_reason", "gave_up"}}}
+                                   "handled", "last_reason", "gave_up",
+                                   "klar_message_id"}}}
 
 Optional fields (absent in older records) are kept by put()/begin() and set with
 update_fields(). Unknown record keys are rejected. Never store customer data here.
@@ -42,6 +43,7 @@ OPTIONAL_FIELDS = {
     "handled": bool,        # marked Hanterad in the portal (Klar flow, Task 16b)
     "last_reason": str,     # block reason before the latest re-stage (short, no customer data)
     "gave_up": bool,        # the "no more automatic tries" message was sent
+    "klar_message_id": int,  # Telegram message carrying the booking's current Klar button
 }
 MAX_TRIES = 10
 REASON_MAX = 200
@@ -94,6 +96,8 @@ def _field_problem(key: str, value) -> str | None:
         return f"{key!r} is not {want.__name__}"
     if key == "tries" and value < 0:
         return "'tries' is negative"
+    if key == "klar_message_id" and value < 1:
+        return "'klar_message_id' is not positive"
     return None
 
 
@@ -220,7 +224,8 @@ def begin(booking_id: str) -> bool:
 def restage(booking_id: str) -> bool:
     """Re-queue a 'blocked' order for one more automatic staging attempt.
 
-    Only when the cart was never touched and fewer than MAX_TRIES retries were made.
+    Only when the cart was never touched, fewer than MAX_TRIES retries were made and
+    the booking was not marked Hanterad (Klar).
     A legacy record without a 'cart_touched' key qualifies only for PRE_CART_REASONS.
     The record becomes the queued marker (begin() then starts it as usual) with
     tries + 1 and the previous block reason kept as 'last_reason'.
@@ -229,7 +234,7 @@ def restage(booking_id: str) -> bool:
     data = _load()
     record = data["bookings"].get(booking_id)
     if (record is None or record.get("status") != "blocked"
-            or record.get("cart_touched") is True
+            or record.get("cart_touched") is True or record.get("handled") is True
             or record.get("tries", 0) >= MAX_TRIES):
         return False
     plan = record.get("plan")
@@ -262,6 +267,14 @@ def pending() -> list[tuple[str, dict]]:
     bookings = _load()["bookings"]
     return [(bid, bookings[bid]) for bid in sorted(bookings)
             if bookings[bid].get("status") == "pending"]
+
+
+def outstanding_klar() -> list[tuple[str, dict]]:
+    """Records whose Klar button is out and not yet acted on (not marked Hanterad)."""
+    bookings = _load()["bookings"]
+    return [(bid, bookings[bid]) for bid in sorted(bookings)
+            if type(bookings[bid].get("klar_message_id")) is int
+            and bookings[bid].get("handled") is not True]
 
 
 def last_update_id() -> int | None:

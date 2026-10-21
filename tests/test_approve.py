@@ -128,7 +128,7 @@ def orders_file(tmp_path, monkeypatch):
 def tg(monkeypatch):
     """Fake Telegram: records every call; `updates` is what get_updates returns."""
     rec = {"sent": [], "answers": [], "cleared": [], "offsets": [], "updates": [],
-           "send_ok": True}
+           "send_ok": True, "klar": [], "klar_ok": True, "next_klar": 900}
 
     def fake_send(config, text):
         rec["sent"].append(text)
@@ -144,14 +144,40 @@ def tg(monkeypatch):
     def fake_clear(config, message_id):
         rec["cleared"].append(message_id)
 
-    def no_buttons(config, text, buttons):
-        raise AssertionError("the poller never sends new buttons")
+    def klar_only(config, text, buttons):
+        """Resolution messages carry one Klar button; the poller sends no other buttons."""
+        if not (len(buttons) == 1 and buttons[0][0] == "Klar"
+                and buttons[0][1].startswith("klar:")):
+            raise AssertionError("the poller only ever sends Klar buttons")
+        if not (rec["send_ok"] and rec["klar_ok"]):
+            return None
+        mid = rec["next_klar"]
+        rec["next_klar"] += 1
+        rec["sent"].append(text)
+        rec["klar"].append((text, buttons, mid))
+        return mid
 
     monkeypatch.setattr(notifier, "send_message", fake_send)
     monkeypatch.setattr(notifier, "get_updates", fake_get_updates)
     monkeypatch.setattr(notifier, "answer_callback", fake_answer)
     monkeypatch.setattr(notifier, "clear_buttons", fake_clear)
-    monkeypatch.setattr(notifier, "send_with_buttons", no_buttons)
+    monkeypatch.setattr(notifier, "send_with_buttons", klar_only)
+    return rec
+
+
+@pytest.fixture(autouse=True)
+def hanterad(monkeypatch):
+    """Fake portal_scraper.mark_booking_handled (approve.mark_handled). Set `result` to
+    True/False/None or an exception; unset means it must not be called."""
+    rec = {"calls": [], "result": AssertionError("Hanterad must not be pressed")}
+
+    def fake_mark(config, detail_url):
+        rec["calls"].append(detail_url)
+        if isinstance(rec["result"], BaseException):
+            raise rec["result"]
+        return rec["result"]
+
+    monkeypatch.setattr(approve, "mark_handled", fake_mark, raising=False)
     return rec
 
 
@@ -606,6 +632,398 @@ def test_expiry_message_undelivered_still_expires_and_exits_1(tg, run_main):
 
     assert run_main(PortalFactory(allowed=False)) == 1
     assert status() == "expired"
+
+
+# ── Task 16b: Klar on cancelled / expired / failed messages ──────────────────
+
+KLAR = [("Klar", "klar:B1")]
+URL = "https://portal.example/Booking/Details?BookingID=B1"
+
+
+def test_cancel_message_carries_klar(tg):
+    stage()
+    tg["updates"] = [tap(5, data="cancel:B1")]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(), APPROVE) == 1
+
+    (text, buttons, mid), = tg["klar"]
+    assert buttons == KLAR and text.startswith("Avbruten: OLRD-3630.")
+    assert tg["sent"] == [text]
+    assert orders_state.get("B1")["klar_message_id"] == mid
+    assert tg["cleared"] == [77]  # only the approval buttons
+
+
+def test_expiry_message_carries_klar(tg):
+    stage(updated_at=T0)
+
+    assert approve.expire_stale(CONFIG, T0 + timedelta(hours=49)) == 1
+
+    (text, buttons, mid), = tg["klar"]
+    assert buttons == KLAR and "har gått ut" in text
+    assert orders_state.get("B1")["klar_message_id"] == mid
+
+
+def test_expiry_klar_failure_falls_back_to_plain_and_is_still_delivered(tg, run_main):
+    stage(updated_at=datetime.now(timezone.utc) - timedelta(hours=49))
+    tg["klar_ok"] = False
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert tg["klar"] == []
+    (text,) = tg["sent"]
+    assert "har gått ut" in text
+    assert text.endswith("(Klar-knappen kunde inte skickas – markera bokningen som "
+                         "Hanterad i portalen.)")
+    assert "klar_message_id" not in orders_state.get("B1")
+
+
+def test_portal_open_failure_message_carries_klar(tg, run_main):
+    stage()
+    tg["updates"] = [tap(5)]
+
+    assert run_main(PortalFactory(open_fails=True)) == 1
+
+    (text, buttons, mid), = tg["klar"]
+    assert buttons == KLAR and "Inget beställdes" in text
+    assert orders_state.get("B1")["klar_message_id"] == mid
+
+
+def test_ordered_message_from_the_poller_carries_klar(tg):
+    stage()
+    tg["updates"] = [tap(5)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(), APPROVE) == 1
+
+    (text, buttons, mid), = tg["klar"]
+    assert buttons == KLAR and text.startswith("Beställd: OLRD-3630")
+    assert orders_state.get("B1")["klar_message_id"] == mid
+
+
+# ── Task 16b: Klar taps ──────────────────────────────────────────────────────
+
+def resolved(booking_id="B1", status_="ordered", klar=900, detail_url=URL, **fields):
+    """A resolved record with an outstanding Klar button (message id `klar`)."""
+    stage(booking_id)
+    orders_state.put(booking_id, status_)
+    extra = {"klar_message_id": klar, **fields}
+    if detail_url is not None:
+        extra["detail_url"] = detail_url
+    orders_state.update_fields(booking_id, **extra)
+
+
+def klar_tap(update_id, booking_id="B1", message_id=900, **kw):
+    return tap(update_id, data=f"klar:{booking_id}", message_id=message_id, **kw)
+
+
+DONE = "Klar: bokning OLRD-3630 är markerad som Hanterad."
+NOT_DONE = f"Kunde inte markera bokning OLRD-3630 som Hanterad – gör det för hand: {URL}"
+
+
+@pytest.mark.parametrize("status_", ["ordered", "blocked", "failed", "cancelled", "expired"])
+def test_klar_tap_marks_hanterad(tg, hanterad, run_main, status_):
+    resolved(status_=status_)
+    hanterad["result"] = True
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert hanterad["calls"] == [URL]
+    rec = orders_state.get("B1")
+    assert rec["handled"] is True and rec["status"] == status_
+    assert tg["answers"] == [("cb5", "Markerar som Hanterad…")]
+    assert tg["cleared"] == [900]
+    assert tg["sent"] == [DONE] and tg["klar"] == []
+    assert orders_state.outstanding_klar() == []
+    assert orders_state.last_update_id() == 5
+
+
+@pytest.mark.parametrize("result", [False, None, RuntimeError("browser died")])
+def test_klar_hanterad_failure_keeps_the_button_and_exits_1(tg, hanterad, run_main, result):
+    resolved()
+    hanterad["result"] = result
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 1
+
+    assert hanterad["calls"] == [URL]
+    assert tg["sent"] == [NOT_DONE]
+    assert tg["cleared"] == []
+    rec = orders_state.get("B1")
+    assert rec.get("handled") is not True and rec["klar_message_id"] == 900
+    assert [b for b, _ in orders_state.outstanding_klar()] == ["B1"]
+    assert orders_state.last_update_id() == 5
+
+    # The owner taps the same button again; this time it works.
+    hanterad["result"] = True
+    tg["updates"] = [klar_tap(6)]
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert orders_state.get("B1")["handled"] is True
+    assert tg["sent"][-1] == DONE
+
+
+def test_klar_confirmation_undelivered_exits_1_but_stays_handled(tg, hanterad, run_main):
+    resolved()
+    hanterad["result"] = True
+    tg["send_ok"] = False
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 1
+    assert orders_state.get("B1")["handled"] is True
+
+
+@pytest.mark.parametrize("status_,answer", [
+    ("pending", "Godkänn eller avbryt beställningen först."),
+    ("attempted", "Beställningen pågår – vänta."),
+])
+def test_klar_refused_while_the_order_is_open(tg, hanterad, status_, answer):
+    resolved(status_=status_)
+    tg["updates"] = [klar_tap(5)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", answer)]
+    assert tg["sent"] == [] and tg["cleared"] == []
+    assert orders_state.get("B1")["status"] == status_
+    assert "handled" not in orders_state.get("B1")
+
+
+def test_klar_on_already_handled_booking(tg, hanterad):
+    resolved(handled=True)
+    tg["updates"] = [klar_tap(5)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Redan hanterad.")]
+    assert tg["cleared"] == [900]
+    assert tg["sent"] == []
+
+
+def test_klar_without_detail_url_asks_for_manual_handling(tg, hanterad, run_main):
+    resolved(detail_url=None)
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 1
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Saknar länk – markera bokningen som Hanterad i portalen.")]
+    (text,) = tg["sent"]
+    assert "OLRD-3630" in text and "Hanterad i portalen" in text
+    assert orders_state.get("B1").get("handled") is not True
+
+
+@pytest.mark.parametrize("message_id", [77, 12, None, "900"])
+def test_klar_stale_message_id_is_refused(tg, hanterad, message_id):
+    resolved()  # approval message 77, Klar message 900
+    tg["updates"] = [klar_tap(5, message_id=message_id)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Knappen är inte längre giltig.")]
+    assert orders_state.last_update_id() == 5
+
+
+def test_klar_without_a_stored_klar_message_is_refused(tg, hanterad):
+    stage()
+    orders_state.put("B1", "ordered")
+    tg["updates"] = [klar_tap(5, message_id=77)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Knappen är inte längre giltig.")]
+
+
+def test_approve_tap_on_the_klar_message_is_refused(tg, hanterad):
+    stage()
+    orders_state.update_fields("B1", klar_message_id=900)
+    tg["updates"] = [tap(5, data="approve:B1", message_id=900)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+    assert tg["answers"] == [("cb5", "Knappen är inte längre giltig.")]
+    assert status() == "pending"
+
+
+@pytest.mark.parametrize("configured,chat,user", [
+    ("-1001234", "-1001234", "42"),
+    ("-1001234", "-1001234", "-1001234"),
+    ("42", "42", "43"),
+    ("42", "42", ""),
+    ("42", "42", None),
+    ("42", "999", "42"),
+    ("abc", "abc", "abc"),
+])
+def test_klar_only_from_the_owner_in_private_chat(tg, hanterad, configured, chat, user):
+    resolved()
+    tg["updates"] = [klar_tap(5, chat_id=chat, user_id=user)]
+    config = {"telegram": {"bot_token": "123:ABC", "chat_id": configured}}
+
+    assert approve.handle_updates(config, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [] and tg["sent"] == [] and tg["cleared"] == []
+    assert orders_state.last_update_id() == 5
+
+
+@pytest.mark.parametrize("data", ["klar", "klar:", "KLAR:B1", "Klar:B1", "klar: B1", "klar:B1 ",
+                                  "klar:B 1"])
+def test_klar_malformed_data(tg, hanterad, data):
+    resolved()
+    tg["updates"] = [tap(5, data=data, message_id=900)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Okänd åtgärd.")]
+
+
+def test_klar_unknown_booking(tg, hanterad):
+    resolved()
+    tg["updates"] = [klar_tap(5, booking_id="B404")]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Okänd bokning.")]
+
+
+def test_klar_double_tap_and_replay(tg, hanterad, run_main):
+    resolved()
+    hanterad["result"] = True
+    tg["updates"] = [klar_tap(5), klar_tap(6)]
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert hanterad["calls"] == [URL]
+    assert tg["answers"] == [("cb5", "Markerar som Hanterad…"), ("cb6", "Redan hanterad.")]
+    assert tg["sent"] == [DONE]
+
+    # The same tap delivered again later: handled, nothing pressed.
+    tg["updates"] = [klar_tap(7)]
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 0
+    assert hanterad["calls"] == [URL]
+    assert tg["answers"][-1] == ("cb7", "Redan hanterad.")
+
+
+def test_klar_for_a_blocked_record_due_for_quiet_restage(tg, hanterad):
+    resolved(status_="blocked", cart_touched=False)
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'Luftfilter'",
+                                            "booking_id": "B1", "booking_nr": "OLRD-3630"})
+    hanterad["result"] = True
+    tg["updates"] = [klar_tap(5)]
+
+    assert approve.handle_updates(CONFIG, PortalFactory(allowed=False), APPROVE) == 1
+
+    assert hanterad["calls"] == [URL]
+    assert orders_state.get("B1")["handled"] is True
+    assert tg["sent"] == [DONE]
+    assert orders_state.restage("B1") is False  # a handled booking is never re-staged
+
+
+def test_klar_and_approve_in_one_poll(tg, hanterad):
+    resolved("B1")
+    stage("B2", message_id=78, booking_nr="OLRD-2")
+    hanterad["result"] = True
+    factory = PortalFactory()
+    tg["updates"] = [klar_tap(5), tap(6, data="approve:B2", message_id=78)]
+
+    assert approve.handle_updates(CONFIG, factory, APPROVE) == 2
+
+    assert orders_state.get("B1")["handled"] is True
+    assert status("B2") == "ordered"
+    assert factory.opened == 1  # the parts portal is opened only for the approval
+    assert orders_state.last_update_id() == 6
+
+
+def test_klar_exception_is_isolated_and_offset_advances(tg, hanterad, monkeypatch):
+    resolved("B1")
+    stage("B2", message_id=78, booking_nr="OLRD-2")
+    hanterad["result"] = True
+    real_update = orders_state.update_fields
+
+    def broken(booking_id, **fields):
+        if fields.get("handled"):
+            raise RuntimeError("disk full")
+        return real_update(booking_id, **fields)
+
+    monkeypatch.setattr(orders_state, "update_fields", broken)
+    tg["updates"] = [klar_tap(5), tap(6, data="cancel:B2", message_id=78)]
+
+    actions, problem = approve._handle(CONFIG, PortalFactory(), APPROVE)
+
+    assert problem is True
+    assert status("B2") == "cancelled"  # the later update was still handled
+    assert orders_state.last_update_id() == 6
+
+
+# ── Task 16b: --check and the early exit with an outstanding Klar ────────────
+
+def test_check_true_for_outstanding_klar_false_after_handled(monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    resolved()
+
+    assert approve.main(["--check"]) == 0
+    assert "has_pending=true" in capsys.readouterr().out
+
+    orders_state.update_fields("B1", handled=True)
+    assert approve.main(["--check"]) == 0
+    assert "has_pending=false" in capsys.readouterr().out
+
+
+def test_check_with_only_an_outstanding_klar_is_stdlib_only(tmp_path):
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "orders.json").write_text(json.dumps(
+        {"last_update_id": None, "bookings": {"B1": {
+            "status": "ordered", "plan": None, "message_id": 77, "klar_message_id": 900,
+            "updated_at": T0.isoformat()}}}), encoding="utf-8")
+    code = (
+        "import sys, approve\n"
+        "rc = approve.main(['--check'])\n"
+        "heavy = [m for m in ('playwright', 'anthropic', 'yaml', 'notifier', 'rules',\n"
+        "         'parts_order', 'config_loader', 'parts_portal', 'portal_scraper')\n"
+        "         if m in sys.modules]\n"
+        "print('HEAVY', heavy)\n"
+        "sys.exit(rc)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    env.pop("GITHUB_OUTPUT", None)
+    out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "has_pending=true" in out.stdout
+    assert "HEAVY []" in out.stdout
+
+
+def test_main_exits_early_when_only_handled_klar_records_exist(monkeypatch):
+    resolved(handled=True)
+
+    def forbidden(*a, **k):
+        raise AssertionError("must not be called")
+
+    for name in ("send_message", "get_updates", "answer_callback", "clear_buttons"):
+        monkeypatch.setattr(notifier, name, forbidden)
+    monkeypatch.setattr(config_loader, "load_config", forbidden)
+
+    assert approve.main([]) == 0
+
+
+def test_main_polls_when_only_a_klar_is_outstanding(tg, run_main):
+    resolved()
+    tg["updates"] = []
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert tg["offsets"] == [None]
+
+
+def test_approve_module_does_not_import_portal_scraper_at_top_level():
+    text = (REPO / "approve.py").read_text(encoding="utf-8")
+    top = [line for line in text.splitlines() if line.startswith(("import ", "from "))]
+    assert top == ["import argparse", "import logging", "import os", "import sys",
+                   "from contextlib import ExitStack",
+                   "from datetime import datetime, timedelta, timezone",
+                   "import orders_state  # stdlib only: everything heavy is imported lazily below"]
 
 
 # ── workflows ────────────────────────────────────────────────────────────────
