@@ -326,3 +326,66 @@ def test_ordered_but_unnotified_makes_exit_code_1(env, monkeypatch):
 
     assert agent.run() == 1
     assert env["logged"]["orders_failed"] == 1
+
+
+# ── Failed MECA portal login ─────────────────────────────────────────────────
+
+def _login_fails(env, monkeypatch, reason="Invalid user name or password."):
+    from portal_scraper import PortalLoginError
+
+    def fake_fetch(config):
+        env.setdefault("events", []).append("fetch")
+        raise PortalLoginError(reason)
+
+    monkeypatch.setattr(agent, "fetch_bookings", fake_fetch)
+
+
+def test_failed_login_alerts_once_and_exits_1(env, monkeypatch):
+    _login_fails(env, monkeypatch)
+
+    assert agent.run() == 1
+
+    alerts = [t for t in env["sent"] if "MECA-inloggningen misslyckades" in t]
+    assert len(alerts) == 1 and len(env["sent"]) == 1
+    assert "PORTAL_USERNAME/PORTAL_PASSWORD" in alerts[0]
+    assert "Orsak: Invalid user name or password." in alerts[0]
+    assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
+                             "orders_staged": 0, "orders_failed": 0, "login_failed": True}
+    assert env["saved"] is None          # seen_ids untouched
+    assert env["staged"] == [] and env["handled"] == []
+
+
+def test_failed_login_without_reason_says_okand(env, monkeypatch):
+    _login_fails(env, monkeypatch, reason="")
+
+    assert agent.run() == 1
+    assert env["sent"][0].endswith("Orsak: okänd")
+
+
+def test_failed_login_undeliverable_alert_still_exits_1(env, monkeypatch):
+    _login_fails(env, monkeypatch)
+    env["send_ok"] = False
+
+    assert agent.run() == 1
+    assert env["logged"]["login_failed"] is True
+
+
+def test_sweep_runs_before_fetch_even_when_login_fails(env, monkeypatch):
+    orders_state.queue("B9")
+    _login_fails(env, monkeypatch)
+
+    assert agent.run() == 1
+
+    assert env["sent"][0] == "Delbeställning för B9 kördes aldrig (jobbet avbröts). Beställ för hand."
+    assert "MECA-inloggningen misslyckades" in env["sent"][1]
+    assert orders_state.get("B9")["status"] == "failed"
+    assert env["logged"]["orders_failed"] == 1
+    assert env["logged"]["login_failed"] is True
+
+
+def test_empty_result_still_means_no_new_bookings(env, caplog):
+    caplog.set_level("INFO")
+    assert agent.run() == 0
+    assert "No new bookings found" in caplog.text
+    assert "login_failed" not in env["logged"]
+    assert env["sent"] == []

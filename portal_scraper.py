@@ -33,6 +33,101 @@ LOGIN_SELECTORS = {
 }
 
 
+# Present only once logged in: links into the booking area, or a logout link.
+LOGGED_IN_MARKERS = [
+    "a[href*='Booking']", "a[href*='booking']",
+    "a[href*='Logout']", "a[href*='LogOut']", "a[href*='LogOff']", "a[href*='logout']",
+]
+
+LOGIN_ERROR_SELECTORS = [
+    ".validation-summary-errors", ".field-validation-error", ".alert", ".error", "[role=alert]",
+]
+LOGIN_ERROR_WORDS = re.compile(
+    r"\b(invalid|incorrect|wrong|locked|captcha|verify|fel|ogiltig|låst)", re.IGNORECASE
+)
+
+
+class PortalLoginError(Exception):
+    """The MECA portal did not accept the login. Never retried: bad attempts can lock the account."""
+
+
+def _visible(page, selector: str) -> bool:
+    try:
+        el = page.query_selector(selector)
+        return bool(el and el.is_visible())
+    except Exception:
+        return False
+
+
+def _logged_in(page) -> bool:
+    """
+    True only if the page is past the login form.
+
+    A visible password input means the login form is (still) showing. The URL
+    alone proves nothing: the login URL is the site root, which is also where
+    a rejected login lands. On that URL some logged-in marker must be present
+    too, so an unknown interstitial (captcha, verification) counts as failure.
+    """
+    password_selectors = ["input[type='password']"] + LOGIN_SELECTORS["password"]
+    if any(_visible(page, sel) for sel in password_selectors):
+        return False
+    url = (page.url or "").split("#")[0].split("?")[0].rstrip("/")
+    if url == PORTAL_LOGIN_URL.rstrip("/"):
+        return any(_visible(page, sel) for sel in LOGGED_IN_MARKERS)
+    return True
+
+
+def _login_error_text(page, username: str = "", password: str = "") -> str:
+    """Best-effort short error text shown on the login page; credentials redacted; "" if none."""
+    found = ""
+    for sel in LOGIN_ERROR_SELECTORS:
+        try:
+            for el in page.query_selector_all(sel):
+                if el.is_visible():
+                    text = " ".join((el.inner_text() or "").split())
+                    if text:
+                        found = text
+                        break
+        except Exception:
+            continue
+        if found:
+            break
+    if not found:
+        try:
+            body = page.inner_text("body") or ""
+        except Exception:
+            body = ""
+        for line in body.splitlines():
+            line = " ".join(line.split())
+            if line and LOGIN_ERROR_WORDS.search(line):
+                found = line
+                break
+    for secret in (password, username):
+        if secret:
+            found = re.sub(re.escape(secret), "***", found, flags=re.IGNORECASE)
+    return found[:200]
+
+
+def _require_login(page, username: str, password: str, stage: str) -> None:
+    """Raise PortalLoginError (after a screenshot and an ERROR log) unless logged in."""
+    if _logged_in(page):
+        return
+    _login_failed_screenshot(page)
+    error_text = _login_error_text(page, username, password)
+    log.error("MECA login not accepted (%s). URL: %s. Portal message: %s",
+              stage, page.url, error_text or "(none)")
+    reason = "inloggningsformuläret visas fortfarande / login form still showing"
+    raise PortalLoginError(f"{reason}: {error_text}" if error_text else reason)
+
+
+def _login_failed_screenshot(page) -> None:
+    try:
+        Path("logs").mkdir(exist_ok=True)
+        page.screenshot(path="logs/login_failed.png")
+    except Exception as e:
+        log.warning("Could not save logs/login_failed.png: %s", e)
+
+
 def fetch_bookings(config: dict) -> list[dict]:
     if not PLAYWRIGHT_AVAILABLE:
         log.error("Playwright not available.")
@@ -58,8 +153,8 @@ def fetch_bookings(config: dict) -> list[dict]:
 
             if not _fill_login(page, username, password):
                 log.error("Login form not found.")
-                page.screenshot(path="logs/login_failed.png")
-                return []
+                _login_failed_screenshot(page)
+                raise PortalLoginError("login form not found")
 
             try:
                 page.wait_for_url(
@@ -69,7 +164,9 @@ def fetch_bookings(config: dict) -> list[dict]:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
-            log.info("Logged in. URL: %s", page.url)
+            # Never retried: repeated bad attempts can lock the account.
+            _require_login(page, username, password, "after login")
+            log.info("Logged in (verified). URL: %s", page.url)
 
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
@@ -78,6 +175,7 @@ def fetch_bookings(config: dict) -> list[dict]:
                 page.wait_for_load_state("networkidle")
             else:
                 log.info("Already on booking list.")
+            _require_login(page, username, password, "booking list")
 
             # ── Step 3: Dismiss cookie popup ──────────────────────────────────
             _dismiss_cookies(page)
@@ -160,6 +258,8 @@ def fetch_bookings(config: dict) -> list[dict]:
                 """)
                 page.wait_for_timeout(1500)
 
+        except PortalLoginError:
+            raise
         except PWTimeout:
             log.error("Timeout.")
         except Exception as exc:
@@ -580,7 +680,9 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             # Login
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
             page.wait_for_load_state("networkidle")
-            _fill_login(page, username, password)
+            if not _fill_login(page, username, password):
+                log.error("Hanterad step: login form not found — not marking.")
+                return False
             try:
                 page.wait_for_url(
                     lambda url: url != PORTAL_LOGIN_URL,
@@ -589,13 +691,20 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
+            if not _logged_in(page):
+                log.error("Hanterad step: MECA login not accepted — not marking. Portal message: %s",
+                          _login_error_text(page, username, password) or "(none)")
+                return False
             _dismiss_cookies(page)
-            log.info("Logged in for Hanterad step.")
+            log.info("Logged in for Hanterad step (verified).")
 
             # Navigate directly to the booking detail page
             log.info("Opening booking detail: %s", detail_url)
             page.goto(detail_url, timeout=20_000)
             page.wait_for_load_state("networkidle", timeout=15_000)
+            if not _logged_in(page):
+                log.error("Hanterad step: detail page shows the login form — not marking.")
+                return False
             _dismiss_cookies(page)
 
             # Wait for page JS to fully initialise before interacting

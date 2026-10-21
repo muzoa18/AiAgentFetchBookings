@@ -39,7 +39,7 @@ from notifier import send_message
 from parts_matcher import make_claude_picker
 from parts_order import needs_portal, order_notify_failed, plan_and_stage, record_failure
 from rules import load_rules
-from portal_scraper import fetch_bookings, mark_booking_handled
+from portal_scraper import PortalLoginError, fetch_bookings, mark_booking_handled
 from run_logger import log_run
 from state import load_seen_ids, save_seen_ids
 
@@ -53,6 +53,10 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+LOGIN_FAILED_TEXT = ("MECA-inloggningen misslyckades – inga bokningar hämtades. "
+                     "Kontrollera portal.username/portal.password i config/config.yaml (lokalt) "
+                     "eller GitHub-secrets PORTAL_USERNAME/PORTAL_PASSWORD. Orsak: ")
 
 
 def run() -> int:
@@ -70,7 +74,17 @@ def run() -> int:
 
     # ── Fetch all new bookings from the portal Nya tab ────────────────────────
     log.info("Fetching new bookings from MECA portal ...")
-    bookings = fetch_bookings(config)
+    try:
+        bookings = fetch_bookings(config)
+    except PortalLoginError as e:
+        reason = str(e) or "okänd"
+        log.error("MECA login failed — no bookings fetched. Reason: %s", reason)
+        if not send_message(config, LOGIN_FAILED_TEXT + reason):
+            log.error("Login-failure message was not delivered.")
+        log_run("booking_agent", {"bookings_found": 0, "notified": 0, "notify_failed": 0,
+                                  "orders_staged": 0, "orders_failed": swept_failed,
+                                  "login_failed": True})
+        return 1
 
     if not bookings:
         log.info("No new bookings found on the Nya tab. Exiting.")
