@@ -25,7 +25,22 @@ SKIP_TEXT_TAGS = {"script", "style", "template"}
 
 
 class PartsPortalError(Exception):
-    """pro.meca.se did not behave as expected; nothing beyond the failing step was done."""
+    """pro.meca.se did not behave as expected; nothing beyond the failing step was done.
+
+    `code` names the kind of failure for callers (never shown raw to the owner):
+    not_linked, in_cart, cart_update, vehicle_lost, login; None = other."""
+
+    def __init__(self, message: str = "", code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class PartsPortalPartialAdd(PartsPortalError):
+    """add_to_cart failed after `steps_done` "+" clicks: the cart may hold part of the quantity."""
+
+    def __init__(self, message: str, steps_done: int, code: str = "cart_update"):
+        super().__init__(message, code)
+        self.steps_done = steps_done
 
 
 # ── Minimal DOM ──────────────────────────────────────────────────────────────

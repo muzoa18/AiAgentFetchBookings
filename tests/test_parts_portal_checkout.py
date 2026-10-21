@@ -364,7 +364,7 @@ class AddEl:
         return self.page.count(self.selector)
 
     def get_attribute(self, name):
-        return "tab-section__btn tab-section__btn--open"
+        return "tab-section__btn" + (" tab-section__btn--open" if self.page.tab_open else "")
 
     def locator(self, sub):
         return AddEl(self.page, f"{self.selector} {sub}")
@@ -376,17 +376,35 @@ class AddEl:
         return f"{self.page.qty.get(self._sku(), 0)} st"
 
     def click(self, **_):
+        if self.selector.endswith("> a.js-search-result-tab-trigger"):
+            self.page.tab_clicks += 1
+            self.page.tab_open = True
+            return
         assert "qty-wrapper__increase" in self.selector
+        assert self.page.tab_open, "the linked tab must be open before adding"
         sku = self._sku()
-        self.page.qty[sku] = self.page.qty.get(sku, 0) + 1
+        self.page.clicks_made += 1
+        n = self.page.clicks_made
+        if n == self.page.click_fails_at:
+            self.page.clicks_made -= 1
+            raise RuntimeError("SECRET-PAGE-TEXT click intercepted")
+        self.page.last_ok = n != self.page.bad_response_at
+        if self.page.last_ok and n != self.page.stuck_at:
+            self.page.qty[sku] = self.page.qty.get(sku, 0) + 1
 
 
 class _Response:
-    ok = True
+    def __init__(self, ok):
+        self.ok = ok
 
 
 class _Expect:
-    value = _Response()
+    def __init__(self, page):
+        self.page = page
+
+    @property
+    def value(self):
+        return _Response(self.page.last_ok)
 
     def __enter__(self):
         return self
@@ -403,6 +421,10 @@ class AddPage:
         self.term = None
         self.searches = []
         self.qty = dict(in_cart or {})
+        self.tab_open, self.tab_clicks = True, 0
+        self.clicks_made, self.last_ok = 0, True
+        self.click_fails_at = self.bad_response_at = self.stuck_at = None
+        self.close_tab_on_search = False
 
     def fill(self, selector, value):
         assert selector == parts_portal.SEL_SEARCH
@@ -411,6 +433,8 @@ class AddPage:
     def press(self, selector, key):
         self.term = self._typed
         self.searches.append(self.term)
+        if self.close_tab_on_search:
+            self.tab_open = False
 
     def wait_for_load_state(self, *_, **__):
         pass
@@ -429,7 +453,7 @@ class AddPage:
                        for sku in self.catalogue.get(self.term, ())))
 
     def expect_response(self, *_, **__):
-        return _Expect()
+        return _Expect(self)
 
 
 @pytest.fixture
@@ -494,3 +518,118 @@ def test_add_to_cart_part_already_in_cart_raises(add_page):
     (cand,) = portal.search("Oljefilter")
     with pytest.raises(PartsPortalError, match="already in the cart"):
         portal.add_to_cart(cand, 1)
+
+
+
+def test_re_search_reopens_the_linked_tab(add_page):
+    page, portal = add_page({"Kupéfilter": ["k1"], "Tändstift": ["t1"]})
+    (kupe,) = portal.search("Kupéfilter")
+    portal.search("Tändstift")
+    page.close_tab_on_search = True          # after the re-run the linked tab is collapsed
+
+    portal.add_to_cart(kupe, 1)
+
+    assert page.searches[-1] == "Kupéfilter"
+    assert page.tab_clicks == 1
+    assert page.qty == {"k1": 1}
+
+
+# ── Error codes; partial adds carry steps_done ───────────────────────────────
+
+from parts_portal_parse import PartsPortalPartialAdd  # noqa: E402
+
+
+def _err(portal, candidate, qty):
+    with pytest.raises(PartsPortalError) as info:
+        portal.add_to_cart(candidate, qty)
+    return info.value
+
+
+def test_not_linked_has_a_code(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]})
+    portal.search("Oljefilter")
+    err = _err(portal, {"url_or_id": "p9", "search_term": "Oljefilter"}, 1)
+    assert err.code == "not_linked" and not isinstance(err, PartsPortalPartialAdd)
+
+
+def test_already_in_cart_has_a_code(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]}, in_cart={"p1": 1})
+    (cand,) = portal.search("Oljefilter")
+    err = _err(portal, cand, 1)
+    assert err.code == "in_cart" and not isinstance(err, PartsPortalPartialAdd)
+
+
+def test_click_failing_at_step_2_of_2_reports_one_step_done(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.click_fails_at = 2
+
+    err = _err(portal, cand, 2)
+
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert (err.code, err.steps_done) == ("cart_update", 1)
+    assert page.qty == {"t1": 1}
+
+
+def test_bad_response_at_step_1_after_the_click_reports_one_step_done(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.bad_response_at = 1
+
+    err = _err(portal, cand, 2)
+
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert (err.code, err.steps_done) == ("cart_update", 1)
+
+
+def test_click_failing_before_any_step_reports_zero_steps(add_page):
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.click_fails_at = 1
+
+    err = _err(portal, cand, 2)
+
+    assert err.code == "cart_update" and err.steps_done == 0
+
+
+def test_quantity_not_reached_reports_the_steps_clicked(add_page, monkeypatch):
+    monkeypatch.setattr(parts_portal, "QTY_TIMEOUT_S", 0)
+    page, portal = add_page({"Tändstift": ["t1"]})
+    (cand,) = portal.search("Tändstift")
+    page.stuck_at = 2
+
+    err = _err(portal, cand, 2)
+
+    assert isinstance(err, PartsPortalPartialAdd)
+    assert (err.code, err.steps_done) == ("cart_update", 2)
+
+
+def test_vehicle_lost_while_re_searching_has_a_code(add_page, monkeypatch):
+    page, portal = add_page({"Oljefilter": ["p1"], "Luftfilter": ["p2"]})
+    (cand,) = portal.search("Oljefilter")
+    portal.search("Luftfilter")
+    monkeypatch.setattr(parts_portal, "current_plate", lambda html: "OTHER1")
+    assert _err(portal, cand, 1).code == "vehicle_lost"
+
+
+def test_no_vehicle_loaded_has_the_vehicle_code():
+    portal = portal_with(FakePage(), reg=None)
+    assert _err(portal, {"url_or_id": "p1"}, 1).code == "vehicle_lost"
+
+
+def test_login_failure_has_the_login_code():
+    page = FakePage(home=LOGIN_FORM)
+    portal = portal_with(page)
+    portal._logged_in = False
+
+    def submit(selector):
+        page.clicks.append(selector)
+        page.url, page.html = parts_portal.START_URL, LOGIN_FORM
+    page.click = submit
+    with pytest.raises(PartsPortalError) as info:
+        portal.login()
+    assert info.value.code == "login"
+
+
+def test_plain_portal_error_has_no_code():
+    assert PartsPortalError("x").code is None

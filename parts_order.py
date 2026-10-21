@@ -35,8 +35,9 @@ from datetime import datetime, timezone
 import notifier
 import orders_state
 from parts_matcher import choose, is_fluid, search_terms
-from parts_order_helpers import (build_summary, cart_problem, clean_fluids, order_body,
-                                 owner_reason, parse_qty, prepare_section, total_problem)
+from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
+                                 order_body, owner_reason, parse_qty, prepare_section,
+                                 total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,11 @@ KLAR_FALLBACK = "\n(Klar-knappen kunde inte skickas – markera bokningen som Ha
 PARTIAL_REASON = "kunde inte lägga alla delar i varukorgen"
 PARTIAL_PROMISE = ("Delarna som lades till ligger kvar orörda i varukorgen på pro.meca.se – "
                    "komplettera för hand.")
+PARTIAL_PROMISE_CHECK = ("Det som redan ligger i varukorgen är orört – kontrollera antalet "
+                         "innan du lägger till mer.")
 CART_UNTOUCHED = "Det som redan ligger i varukorgen är orört."
+# After these the session cannot add anything more: the remaining parts are not tried.
+STOP_CODES = ("vehicle_lost", "login")
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -303,20 +308,28 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if matched:
         # Persisted before the first add: a later block or failure must not be retried.
         orders_state.update_fields(booking_id, cart_touched=True)
-    added, not_added = [], []
-    for name, candidate, qty in matched:
-        # Parts are independent: one that cannot be added never stops (or undoes) the others.
+    added, not_added, partly, untried = [], [], [], []
+    for i, (name, candidate, qty) in enumerate(matched):
+        # Parts are independent: one that cannot be added never stops (or undoes) the others,
+        # unless the session itself is gone (vehicle or login lost).
         try:
             portal.add_to_cart(candidate, qty)
         except Exception as e:
             log.warning("Could not add %r (%s) for %s to the cart: %s",
                         name, candidate.get("url_or_id"), booking_id, _why(e))
-            not_added.append((name, owner_reason(e)))
+            steps = getattr(e, "steps_done", 0)
+            if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+                partly.append((name, steps, qty, owner_reason(e)))  # "+" was already clicked
+            else:
+                not_added.append((name, owner_reason(e)))
+            if error_code(e) in STOP_CODES:
+                untried = [n for n, _, _ in matched[i + 1:]]
+                break
         else:
             added.append((candidate, qty))
-    if not_added:
+    if not_added or partly:
         return block(PARTIAL_REASON, cart_touched=True,
-                     text=_partial_text(label, added, not_added, fluids))
+                     text=_partial_text(label, added, not_added, partly, untried, fluids))
 
     # What the cart must contain comes from our choices, never from the cart itself.
     expected = [{"title": c.get("title"), "qty": qty, "url_or_id": c.get("url_or_id")}
@@ -358,15 +371,26 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     return "pending"
 
 
-def _partial_text(label: str, added: list, not_added: list, fluids: list[dict]) -> str:
+def _partial_text(label: str, added: list, not_added: list, partly: list, untried: list,
+                  fluids: list[dict]) -> str:
     if added:
-        first = (f"Delbeställning för {label}: i varukorgen: "
-                 + ", ".join(f"{c.get('title')} x{qty}" for c, qty in added) + ".")
+        lines = [f"Delbeställning för {label}: i varukorgen: "
+                 + ", ".join(f"{c.get('title')} x{qty}" for c, qty in added) + "."]
+    elif partly:
+        lines = [f"Delbeställning för {label}: ingen del lades helt i varukorgen."]
     else:
-        first = f"Delbeställning för {label}: Inget lades i varukorgen."
-    failed = "; ".join(f"{name} ({reason})" for name, reason in not_added)
-    return "\n".join([first, f"Kunde inte läggas till: {failed}.", PARTIAL_PROMISE]
-                     + prepare_section(fluids))
+        lines = [f"Delbeställning för {label}: Inget lades i varukorgen."]
+    if not_added:
+        lines.append("Kunde inte läggas till: "
+                     + "; ".join(f"{name} ({reason})" for name, reason in not_added) + ".")
+    if partly:
+        lines.append("Kan ligga delvis i varukorgen – kontrollera antalet: " + "; ".join(
+            f"{name} (lade {steps} av {qty}, {reason})" for name, steps, qty, reason in partly)
+            + ".")
+    if untried:
+        lines.append("Inte försökt: " + ", ".join(untried) + ".")
+    lines.append(PARTIAL_PROMISE_CHECK if partly else PARTIAL_PROMISE)
+    return "\n".join(lines + prepare_section(fluids))
 
 
 # ── Execution (auto mode here, approve mode from the poller) ─────────────────

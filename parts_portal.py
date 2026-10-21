@@ -26,12 +26,12 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
-from parts_portal_parse import (PartsPortalError, current_plate, extract_order_reference,
+from parts_portal_parse import (PartsPortalError, PartsPortalPartialAdd, current_plate, extract_order_reference,
                                 is_login_page, linked_tab_id, order_tokens, page_markers, parse_cart,
                                 parse_checkout, parse_qty_text, parse_search_results, parse_sek,
                                 same_lines)
 
-__all__ = ["PartsPortal", "PartsPortalError", "parse_sek", "parse_search_results", "parse_cart",
+__all__ = ["PartsPortal", "PartsPortalError", "PartsPortalPartialAdd", "parse_sek", "parse_search_results", "parse_cart",
            "parse_checkout", "extract_order_reference"]
 
 log = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ class PartsPortal:
         html = self.page.content()
         if is_login_page(html):
             self._logged_in, self._reg = False, None
-            raise PartsPortalError("pro.meca.se session expired (login form shown)")
+            raise PartsPortalError("pro.meca.se session expired (login form shown)", "login")
         return html
 
     def _count(self, selector: str) -> int:
@@ -141,7 +141,7 @@ class PartsPortal:
 
     def _require_vehicle(self) -> str:
         if not self._reg:
-            raise PartsPortalError("no vehicle loaded (call load_vehicle first)")
+            raise PartsPortalError("no vehicle loaded (call load_vehicle first)", "vehicle_lost")
         return self._reg
 
     # ── Session ──────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ class PartsPortal:
         self.page.locator(SEL_LOGIN_BUTTON).first.click()
         self._settle()
         if self._count(SEL_LOGIN_USER) > 0 or self._count(SEL_LOGOUT) == 0:
-            raise PartsPortalError("login to pro.meca.se failed (still on the login form)")
+            raise PartsPortalError("login to pro.meca.se failed (still on the login form)", "login")
         self._logged_in = True
         log.info("Logged in to pro.meca.se.")
 
@@ -175,7 +175,7 @@ class PartsPortal:
         if not re.fullmatch(r"[A-Z0-9]{2,8}", reg):
             raise PartsPortalError(f"invalid registration number {reg_nr!r}")
         if not self._logged_in:
-            raise PartsPortalError("not logged in")
+            raise PartsPortalError("not logged in", "login")
         self._reg, self._last_search = None, None
         self.page.fill(SEL_REG_INPUT, reg)
         # Enter, not the submit button: that button is display:none once a vehicle is loaded.
@@ -198,7 +198,8 @@ class PartsPortal:
         self._settle()
         html = self.page.content()
         if current_plate(html) != reg:
-            raise PartsPortalError(f"vehicle {reg} is no longer loaded after searching")
+            raise PartsPortalError(f"vehicle {reg} is no longer loaded after searching",
+                                   "vehicle_lost")
         self._last_search = term
         return html
 
@@ -238,11 +239,12 @@ class PartsPortal:
             # search: repeat the search that found this candidate (fallback: the last one).
             again = str(candidate.get("search_term") or "").strip() or self._last_search
             if not again:
-                raise PartsPortalError(f"part {sku} is not on the current page and no search to repeat")
+                raise PartsPortalError(f"part {sku} is not on the current page and no search to repeat",
+                                       "not_linked")
             self._run_search(again)
             tab_sel, form_sel = self._quick_form(sku)
             if not form_sel or self._count(form_sel) == 0:
-                raise PartsPortalError(f"part {sku} not found among linked parts")
+                raise PartsPortalError(f"part {sku} not found among linked parts", "not_linked")
         trigger = self.page.locator(f"{tab_sel} > a.js-search-result-tab-trigger").first
         if "tab-section__btn--open" not in (trigger.get_attribute("class") or ""):
             trigger.click()
@@ -250,7 +252,9 @@ class PartsPortal:
         form = self.page.locator(form_sel).first
         qty_input = form.locator("input.js-change-quantity-quick")
         if parse_qty_text(qty_input.input_value()) != 0:
-            raise PartsPortalError(f"part {sku} is already in the cart ({qty_input.input_value()!r})")
+            raise PartsPortalError(f"part {sku} is already in the cart ({qty_input.input_value()!r})",
+                                   "in_cart")
+        clicks = 0  # "+" clicks made: the cart may already hold that many (PartsPortalPartialAdd)
         for n in range(1, qty + 1):
             # The site debounces "+" (~0.5 s) and then POSTs ViewCart-ChangeProductQuantity; the
             # input changes client-side at once, so only that response proves the server update.
@@ -258,20 +262,25 @@ class PartsPortal:
                 with self.page.expect_response(_is_qty_update,
                                                timeout=QTY_TIMEOUT_S * 1000) as update:
                     form.locator("a.qty-wrapper__increase").click()
+                    clicks = n
                 ok = update.value.ok
             except Exception as e:
-                raise PartsPortalError(f"no cart update seen for {sku} (step {n}): {e}") from e
+                raise PartsPortalPartialAdd(f"no cart update seen for {sku} (step {n}): {e}",
+                                            steps_done=clicks) from e
             if not ok:
-                raise PartsPortalError(f"cart update for {sku} failed (step {n})")
+                raise PartsPortalPartialAdd(f"cart update for {sku} failed (step {n})",
+                                            steps_done=clicks)
             deadline = time.monotonic() + QTY_TIMEOUT_S
             while parse_qty_text(qty_input.input_value()) != n:
                 if time.monotonic() > deadline:
-                    raise PartsPortalError(f"quantity of {sku} did not reach {n}")
+                    raise PartsPortalPartialAdd(f"quantity of {sku} did not reach {n}",
+                                                steps_done=clicks)
                 self.page.wait_for_timeout(250)
             self._settle()
         final = parse_qty_text(qty_input.input_value())
         if final != qty:
-            raise PartsPortalError(f"quantity of {sku} is {final!r}, expected {qty}")
+            raise PartsPortalPartialAdd(f"quantity of {sku} is {final!r}, expected {qty}",
+                                        steps_done=clicks)
         log.info("Added %s x%d to the cart for %s.", sku, qty, self._reg)
 
     def _cart(self) -> dict:

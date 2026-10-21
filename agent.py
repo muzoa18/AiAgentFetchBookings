@@ -372,11 +372,15 @@ def _missing_ordering_settings(config: dict) -> list[str]:
     return missing
 
 
+class _SetupError(RuntimeError):
+    """A setup problem with a fixed Swedish text (setting names only): safe for the owner."""
+
+
 def _open_ordering_tools(config: dict, stack: ExitStack) -> tuple:
     """(portal, picker), opened once per run. Raises with a short reason on any problem."""
     missing = _missing_ordering_settings(config)
     if missing:
-        raise RuntimeError("inställning saknas: " + ", ".join(missing))
+        raise _SetupError("inställning saknas: " + ", ".join(missing))
     picker = make_claude_picker(config["anthropic"]["api_key"])
     from parts_portal import PartsPortal  # lazy: Task 6 module, may be missing
     portal = stack.enter_context(PartsPortal(config))
@@ -409,10 +413,13 @@ def _order_parts(config: dict, bookings: list[dict]) -> tuple[int, int]:
                         if tools is None and setup_error is None:
                             try:
                                 tools = _open_ordering_tools(config, stack)
-                            except Exception as e:
+                            except _SetupError as e:
                                 log.exception("Could not start parts ordering.")
-                                setup_error = ("kunde inte starta beställningen "
-                                               f"({type(e).__name__}: {e})")[:200]
+                                setup_error = f"kunde inte starta beställningen ({e})"[:200]
+                            except Exception:
+                                # The raw text (page text, internals) goes to the log only.
+                                log.exception("Could not start parts ordering.")
+                                setup_error = "kunde inte starta beställningen"
                         if setup_error:
                             status = record_failure(config, booking, setup_error)
                         else:

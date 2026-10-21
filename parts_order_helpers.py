@@ -15,27 +15,42 @@ from rules import Rules
 PREPARE_HEADER = "Förbered (finns på lager):"
 
 TECHNICAL = "tekniskt fel (se loggen)"
-# PartsPortalError message fragments -> short Swedish text for the owner. The raw
-# exception text (page text, English internals) only ever goes to the log.
-_PORTAL_REASONS = (
-    (("not found among linked parts", "not on the current page"),
-     "delen finns inte bland delarna som passar bilen"),
-    (("already in the cart",), "delen låg redan i varukorgen"),
-    (("no cart update seen", "did not reach", "cart update for", "quantity of"),
-     "varukorgen uppdaterades inte"),
-    (("no longer loaded",), "fordonet försvann från sidan"),
-    (("login", "not logged in"), "inloggningen på pro.meca.se misslyckades"),
+# PartsPortalError.code -> short Swedish text for the owner. The raw exception text
+# (page text, English internals) only ever goes to the log.
+OWNER_REASONS = {
+    "not_linked": "delen finns inte bland delarna som passar bilen",
+    "in_cart": "delen låg redan i varukorgen",
+    "cart_update": "varukorgen uppdaterades inte",
+    "vehicle_lost": "fordonet försvann från sidan",
+    "login": "inloggningen på pro.meca.se misslyckades",
+}
+# Fallback only, for a PartsPortalError raised without a code.
+_FALLBACK_CODES = (
+    (("not found among linked parts", "not on the current page"), "not_linked"),
+    (("already in the cart",), "in_cart"),
+    (("no cart update seen", "did not reach", "cart update for", "quantity of"), "cart_update"),
+    (("no longer loaded",), "vehicle_lost"),
+    (("login", "not logged in"), "login"),
 )
+
+
+def error_code(exc: BaseException) -> str | None:
+    """The PartsPortalError code (or, for one without a code, a guess from its text)."""
+    if not isinstance(exc, PartsPortalError):
+        return None
+    code = getattr(exc, "code", None)
+    if code:
+        return code
+    text = str(exc)
+    for fragments, guess in _FALLBACK_CODES:
+        if any(f in text for f in fragments):
+            return guess
+    return None
 
 
 def owner_reason(exc: BaseException) -> str:
     """A short Swedish summary of a failure, safe to show the owner."""
-    if isinstance(exc, PartsPortalError):
-        text = str(exc)
-        for fragments, reason in _PORTAL_REASONS:
-            if any(f in text for f in fragments):
-                return reason
-    return TECHNICAL
+    return OWNER_REASONS.get(error_code(exc), TECHNICAL)
 
 
 def parse_qty(raw) -> int | None:

@@ -1193,7 +1193,7 @@ def test_search_term_tag_is_not_persisted_or_shown(tg, orders_file):
 # ── Fix wave: parts already in the cart stay when a later part fails ─────────
 
 from parts_order_helpers import owner_reason          # noqa: E402
-from parts_portal_parse import PartsPortalError       # noqa: E402
+from parts_portal_parse import PartsPortalError, PartsPortalPartialAdd  # noqa: E402
 
 FIVE = ["Kupéfilter", "Oljefilter", "Oljepluggspackning", "Luftfilter", "Tändstift"]
 FIVE_CATALOGUE = {name: [{"title": f"Bosch {name}", "brand": "Bosch", "price_sek": 100.0,
@@ -1272,8 +1272,9 @@ def test_all_parts_fail(tg):
     errors = [PartsPortalError("part s1 not found among linked parts"),
               PartsPortalError("part s2 is already in the cart ('1 st')"),
               PartsPortalError("no cart update seen for s3 (step 1): Timeout 15000ms"),
-              PartsPortalError("vehicle ABC123 is no longer loaded after searching"),
-              RuntimeError("SECRET-PAGE-TEXT boom")]
+              RuntimeError("SECRET-PAGE-TEXT boom"),
+              # last: a lost vehicle stops the loop (review M3), so nothing is left untried
+              PartsPortalError("vehicle ABC123 is no longer loaded after searching")]
     portal = NoClearPortal(fail={f"s{i}": e for i, e in enumerate(errors, 1)})
 
     assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
@@ -1283,8 +1284,8 @@ def test_all_parts_fail(tg):
         "Kupéfilter (delen finns inte bland delarna som passar bilen)",
         "Oljefilter (delen låg redan i varukorgen)",
         "Oljepluggspackning (varukorgen uppdaterades inte)",
-        "Luftfilter (fordonet försvann från sidan)",
-        "Tändstift (tekniskt fel (se loggen))"])))
+        "Luftfilter (tekniskt fel (se loggen))",
+        "Tändstift (fordonet försvann från sidan)"])))
 
 
 def test_already_in_cart_refusal_is_a_failed_part(tg):
@@ -1365,6 +1366,15 @@ def test_over_ceiling_after_adding_keeps_the_cart_and_says_so(tg):
     (PartsPortalError("cart page is for 'X', expected Y"), "tekniskt fel (se loggen)"),
     (RuntimeError("not found among linked parts"), "tekniskt fel (se loggen)"),
     (ValueError("SECRET-PAGE-TEXT"), "tekniskt fel (se loggen)"),
+    # error codes win over the text (the substring match is only a fallback)
+    (PartsPortalError("SECRET-PAGE-TEXT", "not_linked"), "delen finns inte bland delarna som passar bilen"),
+    (PartsPortalError("SECRET-PAGE-TEXT", "in_cart"), "delen låg redan i varukorgen"),
+    (PartsPortalError("SECRET-PAGE-TEXT", "cart_update"), "varukorgen uppdaterades inte"),
+    (PartsPortalError("SECRET-PAGE-TEXT", "vehicle_lost"), "fordonet försvann från sidan"),
+    (PartsPortalError("SECRET-PAGE-TEXT", "login"), "inloggningen på pro.meca.se misslyckades"),
+    (PartsPortalError("part p1 not found among linked parts", "in_cart"), "delen låg redan i varukorgen"),
+    (PartsPortalError("SECRET-PAGE-TEXT", "surprise"), "tekniskt fel (se loggen)"),
+    (PartsPortalPartialAdd("SECRET-PAGE-TEXT", steps_done=1), "varukorgen uppdaterades inte"),
 ])
 def test_owner_reason_mapping(exc, expected):
     assert owner_reason(exc) == expected
@@ -1449,3 +1459,90 @@ def test_block_whose_klar_id_cannot_be_stored_is_failed(tg, monkeypatch):
     monkeypatch.setattr(orders_state, "update_fields", broken)
     assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
                                       confident) == "failed"
+
+
+
+# ── Review: truthful partial-cart message; stop when the vehicle/login is lost ─
+
+PARTIAL_PROMISE_CHECK = ("Det som redan ligger i varukorgen är orört – kontrollera antalet "
+                         "innan du lägger till mer.")
+
+
+def test_partly_added_part_is_listed_as_maybe_in_the_cart(tg):
+    portal = NoClearPortal(fail={"s5": PartsPortalPartialAdd(
+        "SECRET-PAGE-TEXT no cart update seen for s5 (step 2)", steps_done=1)})
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_partial(tg, portal, "\n".join([
+        "Delbeställning för OLRD-3630: i varukorgen: Bosch Kupéfilter x1, Bosch Oljefilter x1, "
+        "Bosch Oljepluggspackning x1, Bosch Luftfilter x1.",
+        "Kan ligga delvis i varukorgen – kontrollera antalet: Tändstift "
+        "(lade 1 av 2, varukorgen uppdaterades inte).",
+        PARTIAL_PROMISE_CHECK,
+        "Förbered (finns på lager):", "- Olja 5W30 x5"]))
+
+
+def test_failure_before_any_click_stays_in_the_normal_list(tg):
+    portal = NoClearPortal(fail={"s5": PartsPortalPartialAdd("click intercepted", steps_done=0)})
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    (text,) = tg["sent"]
+    assert "Kunde inte läggas till: Tändstift (varukorgen uppdaterades inte)." in text
+    assert "Kan ligga delvis" not in text
+    assert PROMISE in text
+
+
+def test_normal_and_partial_failures_together(tg):
+    portal = NoClearPortal(fail={
+        "s1": PartsPortalError("x", "not_linked"),
+        "s5": PartsPortalPartialAdd("x", steps_done=2, code="cart_update")})
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_partial(tg, portal, "\n".join([
+        "Delbeställning för OLRD-3630: i varukorgen: Bosch Oljefilter x1, "
+        "Bosch Oljepluggspackning x1, Bosch Luftfilter x1.",
+        "Kunde inte läggas till: Kupéfilter (delen finns inte bland delarna som passar bilen).",
+        "Kan ligga delvis i varukorgen – kontrollera antalet: Tändstift "
+        "(lade 2 av 2, varukorgen uppdaterades inte).",
+        PARTIAL_PROMISE_CHECK,
+        "Förbered (finns på lager):", "- Olja 5W30 x5"]))
+
+
+def test_only_a_partial_part_says_nothing_was_fully_added(tg):
+    booking = {**FIVE_BOOKING, "parts": [{"name": "Tändstift", "qty": "2"}]}
+    portal = NoClearPortal(fail={"s5": PartsPortalPartialAdd("x", steps_done=1)})
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "blocked"
+
+    (text,) = tg["sent"]
+    assert text.startswith("Delbeställning för OLRD-3630: ingen del lades helt i varukorgen.\n")
+    assert "Inget lades i varukorgen" not in text
+
+
+@pytest.mark.parametrize("code,reason", [("vehicle_lost", "fordonet försvann från sidan"),
+                                         ("login", "inloggningen på pro.meca.se misslyckades")])
+def test_lost_vehicle_or_login_stops_adding(tg, code, reason):
+    portal = NoClearPortal(fail={"s2": PartsPortalError("SECRET-PAGE-TEXT", code)})
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert [c[1] for c in portal.calls if c[0] == "add_to_cart"] == ["s1", "s2"]
+    _assert_partial(tg, portal, "\n".join([
+        "Delbeställning för OLRD-3630: i varukorgen: Bosch Kupéfilter x1.",
+        f"Kunde inte läggas till: Oljefilter ({reason}).",
+        "Inte försökt: Oljepluggspackning, Luftfilter, Tändstift.",
+        PROMISE,
+        "Förbered (finns på lager):", "- Olja 5W30 x5"]))
+
+
+def test_lost_vehicle_detected_by_text_fallback_also_stops(tg):
+    portal = NoClearPortal(fail={"s1": PartsPortalError("vehicle X is no longer loaded")})
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert [c[1] for c in portal.calls if c[0] == "add_to_cart"] == ["s1"]
+    assert "Inte försökt: Oljefilter, Oljepluggspackning, Luftfilter, Tändstift." in tg["sent"][0]
+    assert "Inget lades i varukorgen." in tg["sent"][0]

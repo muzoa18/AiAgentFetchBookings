@@ -970,3 +970,35 @@ def test_legacy_blocked_record_restaged_only_for_pre_cart_reasons(env, reason, r
     assert agent.run() == 0
 
     assert bool(env["staged"]) is restaged
+
+
+# ── Review I2: no raw exception text from agent.py ───────────────────────────
+
+def test_ordering_setup_error_text_never_reaches_telegram(env, monkeypatch, caplog):
+    class Exploding:
+        def __init__(self, config):
+            raise RuntimeError("SECRET-PAGE-TEXT chromium crashed")
+
+    monkeypatch.setitem(sys.modules, "parts_portal", types.SimpleNamespace(PartsPortal=Exploding))
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 1
+
+    assert orders_state.get("B1")["status"] == "failed"
+    failures = [t for t in env["sent"] if "misslyckades" in t]
+    assert failures == ["Delbeställning misslyckades för OLRD-3630: kunde inte starta "
+                        "beställningen. Beställ för hand."]
+    assert all("SECRET-PAGE-TEXT" not in t and "RuntimeError" not in t for t in env["sent"])
+    assert "SECRET-PAGE-TEXT" in caplog.text
+
+
+def test_missing_settings_keep_their_fixed_swedish_reason(env, monkeypatch):
+    monkeypatch.setattr(agent, "load_config",
+                        lambda: {**CONFIG, "anthropic": {"api_key": ""}})
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 1
+
+    (failure,) = [t for t in env["sent"] if "misslyckades" in t]
+    assert "kunde inte starta beställningen (inställning saknas: anthropic.api_key)" in failure
+    assert "RuntimeError" not in failure
