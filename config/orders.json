@@ -1,0 +1,108 @@
+{
+  "bookings": {
+    "UNKW-9240": {
+      "cart_touched": true,
+      "detail_url": "https://meca.promeisterportal.com/Booking/BookingInfo?BookingID=1882928",
+      "message_id": 15,
+      "plan": {
+        "booking_id": "UNKW-9240",
+        "booking_nr": "UNKW-9240",
+        "created_at": "2026-10-21T20:03:22.582523+00:00",
+        "expected_lines": [
+          {
+            "qty": 1,
+            "title": "Kupéfilter Bosch",
+            "url_or_id": "10087157"
+          },
+          {
+            "qty": 1,
+            "title": "Bosch Oljefilter,",
+            "url_or_id": "14044685"
+          },
+          {
+            "qty": 1,
+            "title": "Oljepluggspackning, 14 mm Febi",
+            "url_or_id": "10103415"
+          },
+          {
+            "qty": 1,
+            "title": "Luftfilter Blue Print",
+            "url_or_id": "10078959"
+          },
+          {
+            "qty": 4,
+            "title": "Bosch Tändstift,",
+            "url_or_id": "12305014"
+          }
+        ],
+        "fluids": [
+          {
+            "name": "Bromsvätska",
+            "qty": "1"
+          },
+          {
+            "name": "Motorolja",
+            "qty": "3.3"
+          },
+          {
+            "name": "Frostskyddsvätska",
+            "qty": "7.5"
+          }
+        ],
+        "parts": [
+          {
+            "brand": "",
+            "in_stock": false,
+            "name": "Pollenfilter",
+            "price_sek": 400.0,
+            "qty": 1,
+            "title": "Kupéfilter Bosch",
+            "url_or_id": "10087157"
+          },
+          {
+            "brand": "",
+            "in_stock": true,
+            "name": "Oljefilter",
+            "price_sek": 132.5,
+            "qty": 1,
+            "title": "Bosch Oljefilter,",
+            "url_or_id": "14044685"
+          },
+          {
+            "brand": "",
+            "in_stock": true,
+            "name": "Oljepluggspackning",
+            "price_sek": 8.63,
+            "qty": 1,
+            "title": "Oljepluggspackning, 14 mm Febi",
+            "url_or_id": "10103415"
+          },
+          {
+            "brand": "",
+            "in_stock": true,
+            "name": "Luftfilter",
+            "price_sek": 180.0,
+            "qty": 1,
+            "title": "Luftfilter Blue Print",
+            "url_or_id": "10078959"
+          },
+          {
+            "brand": "",
+            "in_stock": true,
+            "name": "Tändstift",
+            "price_sek": 192.5,
+            "qty": 4,
+            "title": "Bosch Tändstift,",
+            "url_or_id": "12305014"
+          }
+        ],
+        "reg_nr": "AJZ167",
+        "total_sek": 1491.13
+      },
+      "status": "pending",
+      "updated_at": "2026-10-21T20:03:23.110066+00:00",
+      "vehicle_model": "KIARIO (III)(2014)"
+    }
+  },
+  "last_update_id": null
+}

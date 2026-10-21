@@ -130,3 +130,4 @@
 {"timestamp": "2026-10-13T08:58:16.211204", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-10-13T17:00:35.555370", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-10-14T17:00:34.765082", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
+{"timestamp": "2026-10-21T20:03:23.157844", "agent": "booking_agent", "bookings_found": 1, "notified": 1, "notify_failed": 0, "orders_staged": 1, "orders_failed": 0, "handled_failed": 0, "login_failed": false}
