@@ -209,3 +209,20 @@
 - [ ] **Step 2:** Update the docs to describe Telegram, the rules file, the two workflows, and the new secrets.
 - [ ] **Step 3: Run** `pytest -v` and `python -m py_compile *.py` — Expected: all pass, no output from py_compile.
 - [ ] **Step 4: Commit** `chore: remove SMS and Gmail, update docs and improve.py lists`.
+
+---
+
+### Task 6b: Adapt matching and planning to the live site (added 2026-10-21 after recon)
+
+**Files:**
+- Modify: `parts_matcher.py`, `parts_order.py` (search-term normalisation only), `tests/test_parts_matcher.py`, `tests/test_parts_order.py`
+
+**Interfaces:**
+- Consumes: Task 6 candidates `{"title","brand","price_sek","url_or_id","article_nr","in_stock","placement"}` (brand is usually `""`; the brand is part of the title; `placement` e.g. `"fram vä"`).
+- Produces: `rank_candidates` ranks preferred brands by brand OR title; `choose` enforces axle/side placement and fails closed on non-Latin letters; `search_terms(line_name: str) -> list[str]` (normalised term first, original name as fallback).
+
+- [ ] **Step 1: Write failing tests**: preferred brand found in title ranks first; axle (fram/bak) and side (vä/hö) must match when the booking line names them, unknown placement dropped when the line names one, mixed-axle candidates with a line naming none -> no pick; candidate title/brand with non-Latin letters dropped; `search_terms("Bromsskivor fram x2")` starts with `"bromsskiva"`-style singular without placement words and ends with the original name; plan_and_stage tries the fallback term when the first returns no candidates.
+- [ ] **Step 2: Run, expect FAIL.**
+- [ ] **Step 3: Implement** in `parts_matcher.py` / `parts_order.py` (term loop only).
+- [ ] **Step 4: Run full suite, expect PASS.**
+- [ ] **Step 5: Commit** `feat: placement, title-brand and search-term handling for pro.meca.se`.
