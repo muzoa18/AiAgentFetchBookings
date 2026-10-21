@@ -105,3 +105,9 @@ Secrets live only in GitHub Secrets or the gitignored `config/config.yaml`.
 ## Logs monitored by improve.py
 - `logs/run_history.jsonl`: structured per-run summary (the main signal, tracked in git).
 - `logs/agent.log`: only exists inside a CI run (gitignored), so it is usually absent.
+
+## Parts vocabulary and lookup rules (owner-confirmed 2026-10-21)
+- **Pollenfilter = Kupéfilter.** Searching "pollenfilter" on pro.meca.se returns NOTHING; "kupéfilter" returns the linked parts. Treat both words (and "kupefilter") as the same part and search "kupéfilter".
+- **Artikel-ID.** On the booking page the "Delar" table has the columns name, OEM No, Artikel-ID, Antal, Beställda, Pris, Rabatt, Totalt (e.g. `Pollenfilter | 1025-PC40293 | 1025-PC40293 | 1`). The Artikel-ID is the pro.meca.se "Art. Nr" (searching it finds exactly that article, in the extra "Artikelnummer" tab and in "Kopplade reservdelar" when it fits the car). Fluids/oils ("Vätskor / Oljor") have no Artikel-ID.
+- The Artikel-ID is **usually a ProMeister part**: ProMeister is never ordered, so use it as the REFERENCE (its title and "Produktinformation" such as filter type and dimensions) and find a similar linked part from another brand (Bosch preferred). It is not always ProMeister (the oil filter on the same booking was a Bosch `1025-F026407142`).
+- Searches are only trusted from the "Kopplade reservdelar" tab (parts linked to the vehicle).
