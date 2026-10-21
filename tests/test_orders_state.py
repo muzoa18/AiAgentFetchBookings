@@ -238,3 +238,122 @@ def test_by_status_sorted_and_validated():
     assert orders_state.by_status("ordered") == []
     with pytest.raises(ValueError):
         orders_state.by_status("bogus")
+
+
+# ── Task 16a: optional record fields, update_fields, restage ─────────────────
+
+def _write(orders_file, records):
+    orders_file.parent.mkdir(parents=True, exist_ok=True)
+    orders_file.write_text(json.dumps({"bookings": records, "last_update_id": None}),
+                           encoding="utf-8")
+
+
+OLD_RECORD = {"status": "blocked", "plan": {"reason": "ingen säker träff för 'Pollenfilter'"},
+              "message_id": None, "updated_at": "2026-10-21T09:25:58+00:00"}
+
+
+def test_old_records_without_new_fields_still_load(orders_file):
+    _write(orders_file, {"B1": OLD_RECORD})
+    assert orders_state.get("B1") == OLD_RECORD
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cart_touched", True), ("tries", 3), ("detail_url", "http://x/1"), ("handled", False),
+    ("last_reason", "ingen träff"), ("gave_up", True)])
+def test_valid_optional_fields_load(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    assert orders_state.get("B1")[field] == value
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cart_touched", 1), ("cart_touched", "true"), ("tries", True), ("tries", "3"),
+    ("tries", -1), ("tries", 1.0), ("detail_url", 5), ("handled", None), ("last_reason", ["x"]),
+    ("gave_up", 0), ("surprise", 1)])
+def test_bad_optional_field_or_unknown_key_raises(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+def test_update_fields_sets_whitelisted_fields_and_keeps_record():
+    orders_state.put("B1", "pending", plan={"a": 1}, message_id=9)
+    orders_state.update_fields("B1", cart_touched=True, detail_url="http://x/B1")
+    rec = orders_state.get("B1")
+    assert (rec["status"], rec["plan"], rec["message_id"]) == ("pending", {"a": 1}, 9)
+    assert rec["cart_touched"] is True and rec["detail_url"] == "http://x/B1"
+
+
+@pytest.mark.parametrize("fields", [{"status": "ordered"}, {"plan": {}}, {"bogus": 1},
+                                    {"tries": True}, {"cart_touched": "yes"}, {"tries": -2}])
+def test_update_fields_rejects_unknown_or_badly_typed(fields, orders_file):
+    orders_state.put("B1", "blocked")
+    before = orders_file.read_bytes()
+    with pytest.raises((ValueError, TypeError)):
+        orders_state.update_fields("B1", **fields)
+    assert orders_file.read_bytes() == before
+
+
+def test_update_fields_without_record_raises(orders_file):
+    with pytest.raises(KeyError):
+        orders_state.update_fields("B1", cart_touched=True)
+    assert not orders_file.exists()
+
+
+def test_put_and_begin_keep_optional_fields():
+    orders_state.queue("B1")
+    orders_state.update_fields("B1", detail_url="http://x/B1", tries=2, last_reason="r")
+    assert orders_state.begin("B1") is True
+    orders_state.put("B1", "blocked", plan={"reason": "r2"})
+    rec = orders_state.get("B1")
+    assert (rec["detail_url"], rec["tries"], rec["last_reason"]) == ("http://x/B1", 2, "r")
+
+
+def test_restage_blocked_untouched_record():
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'Pollenfilter'"})
+    orders_state.update_fields("B1", detail_url="http://x/B1")
+    assert orders_state.restage("B1") is True
+    rec = orders_state.get("B1")
+    assert orders_state.is_queued(rec)
+    assert rec["tries"] == 1
+    assert rec["last_reason"] == "ingen säker träff för 'Pollenfilter'"
+    assert rec["detail_url"] == "http://x/B1"
+    assert orders_state.restage("B1") is False  # queued, not blocked
+    assert orders_state.begin("B1") is True       # normal begin() path still works
+    assert orders_state.get("B1")["tries"] == 1
+
+
+def test_restage_counts_tries_up_to_the_cap():
+    orders_state.put("B1", "blocked", plan={"reason": "x"})
+    for n in range(1, orders_state.MAX_TRIES + 1):
+        assert orders_state.restage("B1") is True
+        assert orders_state.get("B1")["tries"] == n
+        orders_state.put("B1", "blocked", plan={"reason": "x"})
+    assert orders_state.MAX_TRIES == 10
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == "blocked"
+
+
+def test_restage_refuses_cart_touched():
+    orders_state.put("B1", "blocked", plan={"reason": "x"})
+    orders_state.update_fields("B1", cart_touched=True)
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == "blocked"
+
+
+@pytest.mark.parametrize("status", ["attempted", "pending", "ordered", "failed", "cancelled",
+                                    "expired"])
+def test_restage_refuses_other_statuses(status):
+    orders_state.put("B1", status, plan={"reason": "x"})
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == status
+
+
+def test_restage_without_record_is_false(orders_file):
+    assert orders_state.restage("B1") is False
+    assert not orders_file.exists()
+
+
+def test_restage_last_reason_is_short():
+    orders_state.put("B1", "blocked", plan={"reason": "x" * 1000})
+    assert orders_state.restage("B1") is True
+    assert len(orders_state.get("B1")["last_reason"]) <= 200

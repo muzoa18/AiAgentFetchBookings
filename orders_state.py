@@ -7,7 +7,12 @@ and drives the Telegram approval flow.
 Stored as config/orders.json (committed back to the repo by the workflows):
 
     {"last_update_id": int | null,
-     "bookings": {"<booking_id>": {"status", "plan", "message_id", "updated_at"}}}
+     "bookings": {"<booking_id>": {"status", "plan", "message_id", "updated_at",
+                                   optional: "cart_touched", "tries", "detail_url",
+                                   "handled", "last_reason", "gave_up"}}}
+
+Optional fields (absent in older records) are kept by put()/begin() and set with
+update_fields(). Unknown record keys are rejected. Never store customer data here.
 
 Single-writer assumption: bookings.yml and approve.yml share one concurrency
 group, so there is never a concurrent writer. No file locking is used.
@@ -27,6 +32,19 @@ ORDERS_FILE = Path("config/orders.json")
 
 Status = Literal["attempted", "pending", "ordered", "blocked", "failed", "cancelled", "expired"]
 STATUSES = get_args(Status)
+
+BASE_FIELDS = ("status", "plan", "message_id", "updated_at")
+# Optional per-record fields and their exact types (bool is not int).
+OPTIONAL_FIELDS = {
+    "cart_touched": bool,   # parts_order added something to the pro.meca.se cart
+    "tries": int,           # automatic re-stagings of a blocked order (restage())
+    "detail_url": str,      # the booking's portal detail URL (holds only the booking id)
+    "handled": bool,        # marked Hanterad in the portal (Klar flow, Task 16b)
+    "last_reason": str,     # block reason before the latest re-stage (short, no customer data)
+    "gave_up": bool,        # the "no more automatic tries" message was sent
+}
+MAX_TRIES = 10
+REASON_MAX = 200
 
 
 def _load() -> dict:
@@ -56,6 +74,29 @@ def _validate(data) -> None:
     for bid, rec in data["bookings"].items():
         if not isinstance(rec, dict):
             raise bad(f"record for booking {bid!r} is not an object")
+        for key, value in rec.items():
+            if key in BASE_FIELDS:
+                continue
+            problem = _field_problem(key, value)
+            if problem:
+                raise bad(f"record for booking {bid!r}: {problem}")
+
+
+def _field_problem(key: str, value) -> str | None:
+    """Why an optional field is unacceptable, or None."""
+    if key not in OPTIONAL_FIELDS:
+        return f"unknown key {key!r}"
+    want = OPTIONAL_FIELDS[key]
+    if type(value) is not want:  # exact: bool is not int
+        return f"{key!r} is not {want.__name__}"
+    if key == "tries" and value < 0:
+        return "'tries' is negative"
+    return None
+
+
+def _extras(record: dict | None) -> dict:
+    """The optional fields of a record, to carry over when it is rewritten."""
+    return {k: v for k, v in (record or {}).items() if k in OPTIONAL_FIELDS}
 
 
 def _check_id(booking_id) -> None:
@@ -96,11 +137,30 @@ def put(booking_id: str, status: Status, plan: dict | None = None,
     data = _load()
     old = data["bookings"].get(booking_id) or {}
     data["bookings"][booking_id] = {
+        **_extras(old),
         "status": status,
         "plan": plan if plan is not None else old.get("plan"),
         "message_id": message_id if message_id is not None else old.get("message_id"),
         "updated_at": _now(),
     }
+    _save(data)
+
+
+def update_fields(booking_id: str, **fields) -> None:
+    """Set optional fields (OPTIONAL_FIELDS only, exact types) on an existing record.
+
+    Status, plan, message_id and updated_at are untouched. KeyError if no record exists.
+    """
+    _check_id(booking_id)
+    for key, value in fields.items():
+        problem = _field_problem(key, value)
+        if problem:
+            raise ValueError(f"update_fields({booking_id!r}): {problem}")
+    data = _load()
+    record = data["bookings"].get(booking_id)
+    if record is None:
+        raise KeyError(booking_id)
+    record.update(fields)
     _save(data)
 
 
@@ -147,8 +207,37 @@ def begin(booking_id: str) -> bool:
     if record is not None and not is_queued(record):
         return False
     data["bookings"][booking_id] = {
+        **_extras(record),
         "status": "attempted", "plan": None, "message_id": None, "updated_at": _now(),
     }
+    _save(data)
+    return True
+
+
+def restage(booking_id: str) -> bool:
+    """Re-queue a 'blocked' order for one more automatic staging attempt.
+
+    Only when the cart was never touched and fewer than MAX_TRIES retries were made.
+    The record becomes the queued marker (begin() then starts it as usual) with
+    tries + 1 and the previous block reason kept as 'last_reason'.
+    """
+    _check_id(booking_id)
+    data = _load()
+    record = data["bookings"].get(booking_id)
+    if (record is None or record.get("status") != "blocked"
+            or record.get("cart_touched") is True
+            or record.get("tries", 0) >= MAX_TRIES):
+        return False
+    new = {
+        **_extras(record),
+        "status": "attempted", "plan": dict(QUEUED_PLAN), "message_id": None,
+        "updated_at": _now(), "tries": record.get("tries", 0) + 1,
+    }
+    plan = record.get("plan")
+    reason = plan.get("reason") if isinstance(plan, dict) else None
+    if isinstance(reason, str):
+        new["last_reason"] = reason[:REASON_MAX]
+    data["bookings"][booking_id] = new
     _save(data)
     return True
 

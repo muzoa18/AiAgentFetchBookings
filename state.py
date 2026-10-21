@@ -28,3 +28,20 @@ def save_seen_ids(seen_ids: set):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text("\n".join(sorted(seen_ids)), encoding="utf-8")
     log.debug("Saved %d seen booking ID(s).", len(seen_ids))
+
+
+# Bokningar whose type was only guessed and that showed no Hanterad button: agent.py
+# handles them like Offert/Förfrågan from then on (notified once, never marked Hanterad).
+NO_BUTTON_FILE = Path("config/no_button_ids.txt")
+
+
+def load_no_button_ids() -> set:
+    if not NO_BUTTON_FILE.exists():
+        return set()
+    lines = NO_BUTTON_FILE.read_text(encoding="utf-8").splitlines()
+    return {line.strip() for line in lines if line.strip()}
+
+
+def save_no_button_ids(ids: set):
+    NO_BUTTON_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NO_BUTTON_FILE.write_text("\n".join(sorted(ids)), encoding="utf-8")

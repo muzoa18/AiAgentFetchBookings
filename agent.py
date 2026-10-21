@@ -5,19 +5,28 @@ Workflow (runs once a day on GitHub Actions; see .github/workflows/):
 
   1. Log in to MECA ProMeister portal
   2. Open /Booking/Index → click Nya tab
-  3. For each new booking, open detail page and extract info
-  4. Send a Telegram message with booking details to the owner's chat
-  5. Click Hanterad → Bekräfta for confirmed Bokningar
-  6. Förfrågan/Offert bookings: notified and logged — no Hanterad (button doesn't exist)
-  7. Notified Bokningar with parts/fluids: stage a pro.meca.se parts order for
-     Telegram approval (parts_order.py). Runs after the loop so the parts
-     portal's browser never overlaps the MECA portal's Hanterad browser.
+  3. For each listed booking, open detail page and extract info
+  4. Send a Telegram message with booking details to the owner's chat — ONCE per
+     booking: seen_ids only means "the owner was notified".
+  5. Förfrågan/Offert (no Hanterad button): local storage decides — notified once,
+     then only a PENDING warning in the log while still listed.
+  6. Bokning — the PORTAL is the truth: listed on the Nya tab = not handled, so it
+     is worked on every run, quietly (no new message unless the outcome changes):
+     - no parts (fluids only counts as no parts): Hanterad → Bekräfta every run
+       until it succeeds; no order record.
+     - with parts: never marked Hanterad here (the Klar flow does that). No order
+       record -> queue + stage a pro.meca.se order for Telegram approval
+       (parts_order.py); a 'blocked' record whose cart was never touched is
+       re-staged (orders_state.restage, at most MAX_TRIES times); any other record
+       is left alone. Staging runs after the loop so the parts portal's browser
+       never overlaps the MECA portal's Hanterad browser.
+     - type only guessed by the scraper and no Hanterad button: handled like
+       Offert/Förfrågan from then on (config/no_button_ids.txt).
 
-If a Telegram message fails, the booking stays unseen (retried next run),
-Hanterad is skipped and run() returns exit code 1. A Bokning whose Hanterad
-does not succeed is reported to the owner and makes run() return 1; a seen
-Bokning still on the Nya tab with no order record gets one Hanterad retry. A parts order ending
-"failed" (or an invalid rules file) also makes run() return 1.
+If a Telegram message fails, the booking stays unseen (retried next run), nothing
+else is done for it and run() returns exit code 1. A Hanterad that does not succeed
+is reported to the owner and makes run() return 1. A parts order ending "failed"
+(or an invalid rules file) also makes run() return 1.
 
 Crash recovery: a booking is queued in config/orders.json right after its
 notify succeeds (before seen_ids is saved). At the start of the next run any
@@ -31,6 +40,7 @@ Config:         env vars / GitHub Secrets (see config_loader.py + README)
 
 import logging
 import sys
+from collections import Counter
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
@@ -39,11 +49,12 @@ import orders_state
 from config_loader import load_config
 from notifier import send_message
 from parts_matcher import make_claude_picker
-from parts_order import needs_portal, order_notify_failed, plan_and_stage, record_failure
+from parts_order import (give_up_if_capped, needs_portal, order_notify_failed, plan_and_stage,
+                         record_failure, split_lines)
 from rules import load_rules
 from portal_scraper import PortalLoginError, fetch_bookings, mark_booking_handled
 from run_logger import log_run
-from state import load_seen_ids, save_seen_ids
+from state import load_no_button_ids, load_seen_ids, save_no_button_ids, save_seen_ids
 
 Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
@@ -61,6 +72,23 @@ LOGIN_FAILED_TEXT = ("MECA-inloggningen misslyckades – inga bokningar hämtade
                      "eller GitHub-secrets PORTAL_USERNAME/PORTAL_PASSWORD. Orsak: ")
 
 
+OFFER_TYPES = ("Förfrågan", "Offert")
+
+
+def _log_summary(bookings_found: int, counts: Counter, orders_staged: int, orders_failed: int,
+                 login_failed: bool = False) -> None:
+    """One log_run entry; the same keys on every path."""
+    log_run("booking_agent", {
+        "bookings_found": bookings_found,
+        "notified":       counts["notified"],
+        "notify_failed":  counts["notify_failed"],
+        "orders_staged":  orders_staged,
+        "orders_failed":  orders_failed,
+        "handled_failed": counts["handled_failed"],
+        "login_failed":   login_failed,
+    })
+
+
 def run() -> int:
     log.info("=" * 55)
     log.info("MECA Agent starting — %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -72,7 +100,9 @@ def run() -> int:
     swept_failed = _sweep_stale_orders(config)
 
     seen_ids = load_seen_ids()
-    log.info("Previously handled bookings: %d", len(seen_ids))
+    no_button = load_no_button_ids()
+    log.info("Previously notified bookings: %d", len(seen_ids))
+    counts = Counter()
 
     # ── Fetch all new bookings from the portal Nya tab ────────────────────────
     log.info("Fetching new bookings from MECA portal ...")
@@ -83,112 +113,150 @@ def run() -> int:
         log.error("MECA login failed — no bookings fetched. Reason: %s", reason)
         if not send_message(config, LOGIN_FAILED_TEXT + reason):
             log.error("Login-failure message was not delivered.")
-        log_run("booking_agent", {"bookings_found": 0, "notified": 0, "notify_failed": 0,
-                                  "orders_staged": 0, "orders_failed": swept_failed,
-                                  "login_failed": True})
+        _log_summary(0, counts, 0, swept_failed, login_failed=True)
         return 1
 
     if not bookings:
         log.info("No new bookings found on the Nya tab. Exiting.")
-        log_run("booking_agent", {"bookings_found": 0, "notified": 0, "notify_failed": 0,
-                                  "orders_staged": 0, "orders_failed": swept_failed})
+        _log_summary(0, counts, 0, swept_failed)
         return 1 if swept_failed else 0
 
-    log.info("Found %d new booking(s) to process.", len(bookings))
-    new_count      = 0
-    notify_failed  = 0
-    handled_failed = 0
-    to_order       = []
+    log.info("Found %d booking(s) on the Nya tab.", len(bookings))
+    to_order = []
+    no_button_before = set(no_button)
 
     for booking in bookings:
-        booking_id   = booking.get("id", "unknown")
-        detail_url   = booking.get("detail_url", "")
-        booking_type = booking.get("booking_type", "Bokning")
+        try:
+            _process_booking(config, booking, seen_ids, no_button, to_order, counts)
+        except Exception:
+            log.exception("Processing %s raised — continuing with the next booking.",
+                          booking.get("id", "unknown"))
+            counts["errors"] += 1
 
-        if booking_id in seen_ids:
-            if booking_type in ("Förfrågan", "Offert"):
-                log.warning(
-                    "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
-                    booking_type, booking_id, detail_url
-                )
-            elif booking_type == "Bokning" and detail_url and _no_order_record(booking_id):
-                # Still on the Nya tab although notified earlier: an earlier Hanterad
-                # failed. Retry once; no re-notify, nothing re-queued.
-                log.info("Already notified: %s — still listed, retrying Hanterad.", booking_id)
-                if not _mark_handled(config, booking, retry=True):
-                    handled_failed += 1
-            else:
-                log.info("Already handled: %s — skipping.", booking_id)
-            continue
-
-        # ── Send Telegram message ─────────────────────────────────────────────
-        message = build_message(booking)
-
-        log.info("Sending Telegram message for %s (%s) ...", booking_id, booking_type)
-        log.info("─── Message Preview ───────────────────────────")
-        for line in message.splitlines():
-            log.info("  %s", line)
-        log.info("───────────────────────────────────────────────")
-
-        if not send_message(config, message):
-            # Leave the id unseen so the next run retries; skip Hanterad.
-            log.error("Telegram notification failed for %s — skipping Hanterad.", booking_id)
-            log.error("Notification failure details: %s", booking)
-            notify_failed += 1
-            continue
-
-        log.info("Notification sent successfully for %s.", booking_id)
-        seen_ids.add(booking_id)
-        new_count += 1
-
-        # ── Mark Hanterad (Bokning only — Förfrågan/Offert have no button) ───
-        if booking_type != "Bokning":
-            continue
-
-        if booking.get("parts") or booking.get("fluids"):
-            try:
-                orders_state.queue(booking.get("id"))
-            except Exception:
-                log.exception("Could not queue %s for parts ordering.", booking_id)
-            to_order.append(booking)
-
-        if not detail_url:
-            log.warning("No detail URL for %s.", booking_id)
-            continue
-
-        if not _mark_handled(config, booking):
-            handled_failed += 1
-
+    # Queued records (orders_state.queue/restage) are written before seen_ids.
     save_seen_ids(seen_ids)
+    if no_button != no_button_before:
+        save_no_button_ids(no_button)
 
     orders_staged, orders_failed = _order_parts(config, to_order)
     orders_failed += swept_failed
 
     log.info("Done. Sent %d new notification(s), %d failed. Orders staged %d, failed %d. "
-             "Hanterad failed %d.",
-             new_count, notify_failed, orders_staged, orders_failed, handled_failed)
-    log_run("booking_agent", {
-        "bookings_found": len(bookings),
-        "notified":       new_count,
-        "notify_failed":  notify_failed,
-        "orders_staged":  orders_staged,
-        "orders_failed":  orders_failed,
-        "handled_failed": handled_failed,
-    })
-    return 1 if notify_failed or orders_failed or handled_failed else 0
+             "Hanterad failed %d. Booking errors %d.",
+             counts["notified"], counts["notify_failed"], orders_staged, orders_failed,
+             counts["handled_failed"], counts["errors"])
+    _log_summary(len(bookings), counts, orders_staged, orders_failed)
+    failed = (counts["notify_failed"] or orders_failed or counts["handled_failed"]
+              or counts["errors"])
+    return 1 if failed else 0
 
 
-def _no_order_record(booking_id: str) -> bool:
-    """True only when the ordering flow has no record of this booking (it then owns it)."""
-    try:
-        return orders_state.get(booking_id) is None
-    except Exception:
-        log.exception("Order state unreadable — not retrying Hanterad for %s.", booking_id)
+def _process_booking(config: dict, booking: dict, seen_ids: set, no_button: set,
+                     to_order: list, counts: Counter) -> None:
+    """Decide what this run does for one booking listed on the Nya tab."""
+    booking_id   = booking.get("id", "unknown")
+    detail_url   = booking.get("detail_url", "")
+    booking_type = booking.get("booking_type", "Bokning")
+    seen         = booking_id in seen_ids
+
+    if booking_type != "Bokning" or booking_id in no_button:
+        # No Hanterad button: local storage decides (notify once, then only warn).
+        if seen:
+            log.warning(
+                "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
+                booking_type, booking_id, detail_url
+            )
+            return
+        _notify(config, booking, seen_ids, counts)
+        return
+
+    # Bokning: the portal is the truth — listed on the Nya tab means not handled.
+    if seen:
+        log.info("Already notified: %s — still listed on the Nya tab.", booking_id)
+    elif not _notify(config, booking, seen_ids, counts):
+        return
+
+    order_lines, _ = split_lines(booking)
+    if order_lines:
+        _plan_parts_order(config, booking, seen, to_order)
+        return
+
+    # No parts (fluids are only listed for the owner to prepare): Hanterad now.
+    if not detail_url:
+        log.warning("No detail URL for %s.", booking_id)
+        return
+    handled = _mark_handled(config, booking, retry=seen)
+    if handled is None:
+        no_button.add(booking_id)
+    elif handled is False:
+        counts["handled_failed"] += 1
+
+
+def _notify(config: dict, booking: dict, seen_ids: set, counts: Counter) -> bool:
+    """Send the one notification for a booking; on success it becomes seen."""
+    booking_id   = booking.get("id", "unknown")
+    message = build_message(booking)
+
+    log.info("Sending Telegram message for %s (%s) ...", booking_id,
+             booking.get("booking_type", "Bokning"))
+    log.info("─── Message Preview ───────────────────────────")
+    for line in message.splitlines():
+        log.info("  %s", line)
+    log.info("───────────────────────────────────────────────")
+
+    if not send_message(config, message):
+        # Leave the id unseen so the next run retries; nothing else is done for it.
+        log.error("Telegram notification failed for %s — skipping it this run.", booking_id)
+        log.error("Notification failure details: %s", booking)
+        counts["notify_failed"] += 1
         return False
 
+    log.info("Notification sent successfully for %s.", booking_id)
+    seen_ids.add(booking_id)
+    counts["notified"] += 1
+    return True
 
-def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool:
-    """Click Hanterad for a Bokning; anything but True is reported to the owner. Returns success."""
+
+def _plan_parts_order(config: dict, booking: dict, seen: bool, to_order: list) -> None:
+    """A Bokning with parts: queue it, quietly re-stage a blocked order, or leave it alone."""
+    booking_id = booking.get("id")
+    try:
+        record = orders_state.get(booking_id)
+    except Exception:
+        log.exception("Order state unreadable for %s.", booking_id)
+        if not seen:
+            to_order.append(booking)  # plan_and_stage reports the state problem
+        return
+
+    if record is None:
+        try:
+            orders_state.queue(booking_id)
+        except Exception:
+            log.exception("Could not queue %s for parts ordering.", booking_id)
+        to_order.append(booking)
+        return
+
+    status = record.get("status")
+    if status == "blocked":
+        if orders_state.restage(booking_id):
+            log.info("Blocked order for %s re-staged quietly (try %d).",
+                     booking_id, orders_state.get(booking_id).get("tries", 0))
+            to_order.append(booking)
+            return
+        try:
+            give_up_if_capped(config, booking)
+        except Exception:
+            log.exception("Give-up check failed for %s.", booking_id)
+    log.info("Parts order for %s is '%s' — left alone.", booking_id, status)
+
+
+def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool | None:
+    """Click Hanterad for a Bokning without parts.
+
+    True = marked. None = no Hanterad button on a booking whose type was only guessed:
+    treated as Offert/Förfrågan (logged, not reported). Anything else is reported to
+    the owner and returns False.
+    """
     booking_id = booking.get("id", "unknown")
     detail_url = booking.get("detail_url", "")
     log.info("Marking %s as Hanterad%s ...", booking_id, " (retry)" if retry else "")
@@ -203,6 +271,11 @@ def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool:
         log.info("Booking %s CONFIRMED as Hanterad%s.", booking_id, " (retry)" if retry else "")
         log.info("=" * 50)
         return True
+
+    if handled_ok is None and booking.get("booking_type_guess") is True:
+        log.info("No Hanterad button on %s and its type was only guessed — treating it as "
+                 "Offert/Förfrågan from now on.", booking_id)
+        return None
 
     log.warning("Could not mark %s as Hanterad (%s). Handle manually at: %s",
                 booking_id, handled_ok, detail_url)

@@ -6,6 +6,7 @@ import pytest
 import agent
 import notifier
 import orders_state
+import state
 from rules import Rules
 
 CONFIG = {
@@ -58,6 +59,10 @@ def env(monkeypatch, tmp_path):
            "staged": [], "order_status": "pending", "portal_opened": 0, "portal_closed": 0}
 
     monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
+    monkeypatch.setattr(state, "NO_BUTTON_FILE", tmp_path / "no_button_ids.txt")
+    rec["buttons"] = []
+    monkeypatch.setattr(notifier, "send_with_buttons",
+                        lambda config, text, buttons: rec["buttons"].append((text, buttons)) or 77)
     monkeypatch.setattr(agent, "load_rules", lambda: RULES)
     monkeypatch.setattr(agent, "make_claude_picker", lambda api_key: "picker")
 
@@ -115,11 +120,12 @@ def test_notify_failure_does_not_mark_seen(env):
     assert "B1" not in (env["saved"] or set())
     assert env["handled"] == []
     assert env["logged"] == {"bookings_found": 1, "notified": 0, "notify_failed": 1,
-                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0}
+                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
+                             "login_failed": False}
 
 
 def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
-    env["bookings"] = [_booking("B1"), _booking("F1", "Förfrågan"), _booking("O1", "Offert")]
+    env["bookings"] = [_no_parts("B1"), _booking("F1", "Förfrågan"), _booking("O1", "Offert")]
 
     assert agent.run() == 0
 
@@ -127,7 +133,8 @@ def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
     assert len(env["sent"]) == 3
     assert env["handled"] == ["http://x/B1"]
     assert env["logged"] == {"bookings_found": 3, "notified": 3, "notify_failed": 0,
-                             "orders_staged": 1, "orders_failed": 0, "handled_failed": 0}
+                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
+                             "login_failed": False}
 
 
 def test_already_seen_booking_is_not_resent(env):
@@ -137,14 +144,16 @@ def test_already_seen_booking_is_not_resent(env):
     assert agent.run() == 0
 
     assert env["sent"] == []
-    # still on the Nya tab and no orders record -> one silent Hanterad retry, no re-notify
-    assert env["handled"] == ["http://x/B1"]
+    # still on the Nya tab with parts and no orders record -> staged, never Hanterad here
+    assert env["handled"] == []
+    assert [s[0] for s in env["staged"]] == ["B1"]
 
 
 def test_no_bookings_returns_zero_and_logs(env):
     assert agent.run() == 0
     assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
-                             "orders_staged": 0, "orders_failed": 0}
+                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
+                             "login_failed": False}
 
 
 # ── Parts ordering hook ──────────────────────────────────────────────────────
@@ -170,8 +179,9 @@ def test_portal_never_opened_when_nothing_needs_ordering(env, monkeypatch):
 
     assert env["portal_opened"] == 0
     assert orders_state.get("B1") is None
-    assert orders_state.get("B2")["status"] == "blocked"
-    assert any("Olja 5W30 x5" in t for t in env["sent"])
+    assert orders_state.get("B2") is None   # fluids only = no parts: no order record
+    assert env["handled"] == ["http://x/B1", "http://x/B2"]
+    assert any("Olja 5W30 x5" in t for t in env["sent"])   # listed in the notification
 
 
 def test_failed_order_makes_exit_code_1(env):
@@ -209,7 +219,7 @@ def test_mark_booking_handled_raising_does_not_skip_save(env, monkeypatch):
         raise RuntimeError("browser crashed")
 
     monkeypatch.setattr(agent, "mark_booking_handled", boom)
-    env["bookings"] = [_booking("B1"), _booking("B2")]
+    env["bookings"] = [_no_parts("B1"), _no_parts("B2")]
 
     assert agent.run() == 1   # a failed Hanterad is reported, never silent
 
@@ -303,9 +313,9 @@ def test_normal_run_queues_before_staging_and_sweep_skips_own_records(env, monke
     assert not any("Delbeställning för" in t for t in env["sent"])
 
 
-def test_queue_happens_even_if_hanterad_raises(env, monkeypatch):
+def test_bokning_with_parts_is_queued_and_never_marked_hanterad(env, monkeypatch):
     def boom(config, url):
-        raise RuntimeError("browser crashed")
+        raise AssertionError("Hanterad must not be pressed for a booking with parts")
 
     monkeypatch.setattr(agent, "mark_booking_handled", boom)
     seen = []
@@ -313,7 +323,7 @@ def test_queue_happens_even_if_hanterad_raises(env, monkeypatch):
                         lambda c, b, p, r, k: seen.append(orders_state.get(b["id"])) or "pending")
     env["bookings"] = [_booking("B1")]
 
-    assert agent.run() == 1   # the Hanterad failure is reported
+    assert agent.run() == 0
     assert seen[0]["plan"] == {"queued": True}
 
 
@@ -352,7 +362,8 @@ def test_failed_login_alerts_once_and_exits_1(env, monkeypatch):
     assert "PORTAL_USERNAME/PORTAL_PASSWORD" in alerts[0]
     assert "Orsak: Invalid user name or password." in alerts[0]
     assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
-                             "orders_staged": 0, "orders_failed": 0, "login_failed": True}
+                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
+                             "login_failed": True}
     assert env["saved"] is None          # seen_ids untouched
     assert env["staged"] == [] and env["handled"] == []
 
@@ -389,7 +400,7 @@ def test_empty_result_still_means_no_new_bookings(env, caplog):
     caplog.set_level("INFO")
     assert agent.run() == 0
     assert "No new bookings found" in caplog.text
-    assert "login_failed" not in env["logged"]
+    assert env["logged"]["login_failed"] is False
     assert env["sent"] == []
 
 
@@ -511,3 +522,293 @@ def test_seen_forfragan_offert_are_not_retried(env):
 
     assert agent.run() == 0
     assert env["handled"] == [] and env["sent"] == []
+
+
+# ── Task 16a: the portal is the truth for Bokningar ──────────────────────────
+
+LOG_KEYS = {"bookings_found", "notified", "notify_failed", "orders_staged", "orders_failed",
+            "handled_failed", "login_failed"}
+GIVE_UP = "Försöker inte mer automatiskt för OLRD-3630 – beställ för hand eller åtgärda orsaken."
+
+
+def test_seen_bokning_logs_already_notified_not_already_handled(env, caplog):
+    caplog.set_level("INFO")
+    env["seen"] = {"B1", "B2"}
+    env["bookings"] = [_no_parts("B1"), _booking("B2")]
+
+    agent.run()
+
+    assert "Already notified: B1" in caplog.text
+    assert "Already notified: B2" in caplog.text
+    assert "Already handled" not in caplog.text
+
+
+def test_unseen_no_parts_bokning_notified_once_then_hanterad(env, monkeypatch):
+    events = []
+    monkeypatch.setattr(agent, "send_message",
+                        lambda config, text: events.append(("sent", text)) or True)
+    monkeypatch.setattr(agent, "mark_booking_handled",
+                        lambda config, url: events.append(("handled", url)) or True)
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 0
+
+    assert [e[0] for e in events] == ["sent", "handled"]
+    assert events[0][1].startswith("Ny Bokning - OLRD-3630")
+    assert env["saved"] == {"B1"}
+    assert orders_state.get("B1") is None
+    assert env["staged"] == []
+
+
+def test_seen_no_parts_bokning_is_retried_every_run_until_it_succeeds(env, monkeypatch):
+    _handled_returns(env, monkeypatch, False)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 1
+    assert agent.run() == 1
+    _handled_returns(env, monkeypatch, True)
+    env["sent"].clear()
+    assert agent.run() == 0
+
+    assert env["handled"] == ["http://x/B1"] * 3
+    assert env["sent"] == []          # success: no message, never a re-notification
+
+
+def test_fluids_only_bokning_is_not_queued_and_gets_hanterad(env):
+    env["bookings"] = [{**_booking("B1"), "parts": [{"name": "Motorolja 5W-30", "qty": "4"}],
+                        "fluids": [{"name": "Spolarvätska", "qty": "1"}]}]
+
+    assert agent.run() == 0
+
+    assert orders_state.get("B1") is None
+    assert env["staged"] == []
+    assert env["handled"] == ["http://x/B1"]
+    assert len(env["sent"]) == 1      # the notification only (it lists the fluids)
+
+
+RECORD_STATES = ["attempted", "pending", "ordered", "failed", "cancelled", "expired", "blocked"]
+
+
+@pytest.mark.parametrize("seen", [False, True])
+@pytest.mark.parametrize("status", [None] + RECORD_STATES)
+def test_bokning_with_parts_never_gets_hanterad(env, seen, status):
+    if status:
+        orders_state.put("B1", status, plan={"reason": "x"})
+    if seen:
+        env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    agent.run()
+
+    assert env["handled"] == []
+
+
+def test_seen_with_parts_and_no_record_is_queued_and_staged(env, monkeypatch):
+    at_stage = []
+    monkeypatch.setattr(agent, "plan_and_stage",
+                        lambda c, b, p, r, k: at_stage.append(orders_state.get(b["id"])) or "pending")
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+
+    assert at_stage[0]["plan"] == {"queued": True}
+    assert env["sent"] == []
+
+
+def test_seen_with_parts_blocked_untouched_is_restaged(env, monkeypatch):
+    at_stage = []
+    monkeypatch.setattr(agent, "plan_and_stage",
+                        lambda c, b, p, r, k: at_stage.append(orders_state.get(b["id"])) or "blocked")
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'Pollenfilter'"})
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+
+    (rec,) = at_stage
+    assert orders_state.is_queued(rec)
+    assert rec["tries"] == 1
+    assert rec["last_reason"] == "ingen säker träff för 'Pollenfilter'"
+    assert env["sent"] == [] and env["handled"] == []
+
+
+def test_blocked_with_cart_touched_is_not_retried(env):
+    orders_state.put("B1", "blocked", plan={"reason": "varukorgen stämmer inte"})
+    orders_state.update_fields("B1", cart_touched=True)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+
+    assert env["staged"] == [] and env["sent"] == [] and env["handled"] == []
+    assert orders_state.get("B1")["status"] == "blocked"
+
+
+@pytest.mark.parametrize("status", ["attempted", "pending", "ordered", "failed", "cancelled",
+                                    "expired"])
+def test_other_order_records_are_left_alone(env, status):
+    orders_state.put("B1", status, plan={"booking_id": "B1"})
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    agent.run()
+
+    assert env["staged"] == [] and env["handled"] == []
+    # an "attempted" record is swept (reported + failed) at the start of the run, as before
+    assert all("Delbeställning för B1" in t for t in env["sent"])
+    if status != "attempted":
+        assert env["sent"] == []
+        assert orders_state.get("B1")["status"] == status
+
+
+def test_blocked_out_of_tries_sends_one_give_up_message_ever(env):
+    orders_state.put("B1", "blocked", plan={"reason": "x"})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+    assert agent.run() == 0
+
+    assert env["sent"] == [GIVE_UP]
+    assert env["staged"] == []
+
+
+def test_guessed_type_without_button_becomes_offert_like(env, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    _handled_returns(env, monkeypatch, None)
+    env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": True}]
+
+    assert agent.run() == 0
+
+    assert len(env["sent"]) == 1      # the notification; no failure message
+    assert env["logged"]["handled_failed"] == 0
+    assert env["handled"] == ["http://x/B1"]
+    assert "B1" in state.load_no_button_ids()
+
+    # next run: seen + on the no-button list -> Offert/Förfrågan handling (PENDING only)
+    env["seen"] = env["saved"]
+    env["sent"].clear()
+    assert agent.run() == 0
+    assert env["handled"] == ["http://x/B1"]   # no new attempt
+    assert env["sent"] == []
+    assert "PENDING Bokning B1" in caplog.text
+
+
+def test_not_guessed_type_without_button_is_still_a_failure(env, monkeypatch):
+    _handled_returns(env, monkeypatch, None)
+    env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": False}]
+
+    assert agent.run() == 1
+
+    assert env["sent"][1:] == [HANDLED_FAILED.format("B1")]
+    assert env["logged"]["handled_failed"] == 1
+    assert "B1" not in state.load_no_button_ids()
+
+
+@pytest.mark.parametrize("result", [False, RuntimeError("browser crashed")])
+def test_guessed_type_real_failure_is_still_reported(env, monkeypatch, result):
+    _handled_returns(env, monkeypatch, result)
+    env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": True}]
+
+    assert agent.run() == 1
+    assert env["sent"][1:] == [HANDLED_FAILED.format("B1")]
+    assert "B1" not in state.load_no_button_ids()
+
+
+def test_one_broken_booking_does_not_stop_the_others(env):
+    env["bookings"] = [{**_booking("B0"), "parts": 5}, _no_parts("B1")]
+
+    assert agent.run() == 1      # the broken booking is not silent
+
+    assert env["handled"] == ["http://x/B1"]
+    assert env["saved"] == {"B1"}   # B0 broke while building its message: not notified
+
+
+def test_log_run_keys_are_identical_in_every_path(env, monkeypatch):
+    keys = []
+    env["bookings"] = []
+    agent.run()
+    keys.append(set(env["logged"]))
+    env["bookings"] = [_booking("B1"), _no_parts("B2"), _booking("F1", "Förfrågan")]
+    agent.run()
+    keys.append(set(env["logged"]))
+    _login_fails(env, monkeypatch)
+    agent.run()
+    keys.append(set(env["logged"]))
+    assert keys == [LOG_KEYS] * 3
+
+
+# ── Task 16a: quiet retry end to end through the real plan_and_stage ─────────
+
+class _Portal:
+    """Minimal pro.meca.se fake: one search result per known term, cart = what was added."""
+
+    def __init__(self, catalogue):
+        self.catalogue, self.added = catalogue, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def login(self):
+        pass
+
+    def load_vehicle(self, reg_nr):
+        pass
+
+    def search(self, term):
+        return list(self.catalogue.get(term, []))
+
+    def add_to_cart(self, candidate, qty):
+        self.added.append((candidate, qty))
+
+    def read_cart(self):
+        lines = [{"title": c["title"], "qty": q, "price_sek": c["price_sek"] * q,
+                  "url_or_id": c["url_or_id"]} for c, q in self.added]
+        return {"lines": lines, "total_sek": sum(x["price_sek"] for x in lines)}
+
+
+OIL = {"title": "Bosch Oljefilter P7001", "brand": "Bosch", "price_sek": 120.0, "url_or_id": "p1"}
+AIR = {"title": "Bosch Luftfilter S0123", "brand": "Bosch", "price_sek": 250.0, "url_or_id": "p2"}
+
+
+@pytest.fixture
+def real_stage(env, monkeypatch):
+    import parts_order
+    monkeypatch.setattr(agent, "plan_and_stage", parts_order.plan_and_stage)
+    monkeypatch.setattr(agent, "make_claude_picker", lambda api_key: lambda line, ranked: (0, 0.95))
+
+    def use(catalogue):
+        monkeypatch.setitem(sys.modules, "parts_portal",
+                            types.SimpleNamespace(PartsPortal=lambda config: _Portal(catalogue)))
+    return use
+
+
+@pytest.mark.parametrize("old_reason,catalogue,messages,buttons", [
+    ("ingen säker träff för 'Luftfilter'", {"Oljefilter": [OIL]}, 0, 0),
+    ("varukorgen är inte tom", {"Oljefilter": [OIL]}, 1, 0),
+    ("ingen säker träff för 'Luftfilter'", {"Oljefilter": [OIL], "Luftfilter": [AIR]}, 0, 1),
+])
+def test_blocked_order_quiet_retry(env, real_stage, old_reason, catalogue, messages, buttons):
+    real_stage(catalogue)
+    orders_state.put("B1", "blocked", plan={"reason": old_reason, "booking_id": "B1"})
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+
+    assert len(env["sent"]) == messages
+    assert len(env["buttons"]) == buttons
+    assert env["handled"] == []
+    rec = orders_state.get("B1")
+    assert rec["tries"] == 1
+    assert rec["status"] == ("pending" if buttons else "blocked")
+    assert rec["detail_url"] == "http://x/B1"
+    text = orders_state.ORDERS_FILE.read_text(encoding="utf-8")
+    for sentinel in ("Mamadou Sowe", "+46739133124"):
+        assert sentinel not in text

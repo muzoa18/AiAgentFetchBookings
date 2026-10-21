@@ -14,6 +14,10 @@ mixed into the same cart.
 
 Customer data (name, phone, email, booking message) is never persisted: the plan
 only holds what approval needs (orders.json is committed to git).
+
+A 'blocked' order whose cart was never touched is re-staged by agent.py through
+orders_state.restage(). Such a quiet retry sends no message when it blocks again for
+the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
 """
 
 import logging
@@ -27,6 +31,8 @@ from parts_order_helpers import (build_summary, cart_problem, clean_fluids, orde
 from rules import Rules
 
 log = logging.getLogger(__name__)
+
+GIVE_UP_TEXT = "Försöker inte mer automatiskt för {label} – beställ för hand eller åtgärda orsaken."
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -98,12 +104,18 @@ def _fail(config: dict, booking_id, label: str, reason: str) -> str:
 
 
 def _block(config: dict, booking: dict, reason: str, fluids: list[dict],
-           cart_touched: bool = False, text: str | None = None) -> str:
+           cart_touched: bool = False, text: str | None = None,
+           quiet_reason: str | None = None) -> str:
+    """Record 'blocked' and message the owner, unless this is a quiet retry
+    (quiet_reason = the previous block reason) that blocked for the same reason."""
     booking_id = booking["id"]
     orders_state.put(booking_id, "blocked", plan={
         "reason": reason, "booking_id": booking_id, "booking_nr": booking.get("booking_nr"),
         "reg_nr": booking.get("reg_nr"), "fluids": fluids,
     })
+    if quiet_reason is not None and reason[:orders_state.REASON_MAX] == quiet_reason:
+        log.info("Retry of %s blocked again for the same reason — no new message.", booking_id)
+        return "blocked"
     if text is None:
         lines = [f"Delbeställning stoppad för {_label(booking)}: {reason}. "
                  "Inget beställdes – beställ för hand."]
@@ -116,6 +128,23 @@ def _block(config: dict, booking: dict, reason: str, fluids: list[dict],
     log.error("Blocked-order message for %s was not delivered — marking failed.", booking_id)
     orders_state.put(booking_id, "failed")
     return "failed"
+
+
+def give_up_if_capped(config: dict, booking: dict) -> bool:
+    """Send the one give-up message for a blocked, untouched order out of retries.
+
+    Returns True only when the message was sent now (then flagged 'gave_up').
+    """
+    booking_id = booking.get("id")
+    record = orders_state.get(booking_id)
+    if (not record or record.get("status") != "blocked" or record.get("cart_touched") is True
+            or record.get("tries", 0) < orders_state.MAX_TRIES or record.get("gave_up")):
+        return False
+    if not notifier.send_message(config, GIVE_UP_TEXT.format(label=_label(booking))):
+        log.error("Give-up message for %s was not delivered.", booking_id)
+        return False
+    orders_state.update_fields(booking_id, gave_up=True)
+    return True
 
 
 def record_failure(config: dict, booking: dict, reason: str) -> str:
@@ -146,29 +175,45 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
             log.exception("Cannot read order state for %r", booking_id)
             return "failed"
     try:
-        return _stage(config, booking, portal, rules, picker)
+        status = _stage(config, booking, portal, rules, picker)
     except Exception as e:
         log.exception("Parts ordering failed for %s", booking_id)
         return _fail(config, booking_id, label, _why(e))
+    if status == "blocked":
+        try:
+            give_up_if_capped(config, booking)
+        except Exception:
+            log.exception("Give-up check failed for %s", booking_id)
+    return status
 
 
 def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     booking_id, label = booking["id"], _label(booking)
+    record = orders_state.get(booking_id) or {}
+    # A quiet retry (orders_state.restage) remembers the reason the last attempt blocked.
+    quiet_reason = record.get("last_reason") if record.get("tries") else None
+    detail_url = booking.get("detail_url")
+    if isinstance(detail_url, str) and detail_url.strip():
+        orders_state.update_fields(booking_id, detail_url=detail_url.strip())
     order_lines, fluids = split_lines(booking)
+
+    def block(reason: str, **kw) -> str:
+        return _block(config, booking, reason, fluids, quiet_reason=quiet_reason, **kw)
+
     if not order_lines:
-        return _block(config, booking, "inga delar att beställa", fluids, text="\n".join(
+        return block("inga delar att beställa", text="\n".join(
             [f"Inga delar att beställa för {label}."] + prepare_section(fluids)))
     reg_nr = str(booking.get("reg_nr") or "").strip()
     if not reg_nr:
-        return _block(config, booking, "registreringsnummer saknas", fluids)
+        return block("registreringsnummer saknas")
     wanted, reason = _wanted(order_lines)
     if reason:
-        return _block(config, booking, reason, fluids)
+        return block(reason)
 
     portal.login()
     portal.load_vehicle(reg_nr)
     if (portal.read_cart() or {}).get("lines"):
-        return _block(config, booking, "varukorgen är inte tom", fluids, text=(
+        return block("varukorgen är inte tom", text=(
             "Varukorgen på pro.meca.se är inte tom (annan väntande beställning?). "
             f"Hantera {label} för hand."))
 
@@ -180,8 +225,11 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
             if candidate is not None:
                 break
         if candidate is None:
-            return _block(config, booking, f"ingen säker träff för '{name}'", fluids)
+            return block(f"ingen säker träff för '{name}'")
         matched.append((name, candidate, qty))
+    if matched:
+        # Persisted before the first add: a later block or failure must not be retried.
+        orders_state.update_fields(booking_id, cart_touched=True)
     for _, candidate, qty in matched:
         portal.add_to_cart(candidate, qty)
 
@@ -192,7 +240,7 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     problem = total_problem(cart.get("total_sek"), rules.ceiling_sek) \
         or cart_problem(cart.get("lines") or [], expected, rules)
     if problem:
-        return _block(config, booking, problem, fluids, cart_touched=True)
+        return block(problem, cart_touched=True)
 
     parts = [{"name": name, "title": c.get("title"), "brand": c.get("brand"),
               "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id"),

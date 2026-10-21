@@ -328,3 +328,19 @@ def test_empty_specification_logs_a_warning_without_row_text(caplog):
     with caplog.at_level("WARNING", logger="portal_scraper"):
         assert spec("<mk-specification-detail><table></table></mk-specification-detail>")[:3] == ([], [], [])
     assert any("no services, parts or fluids" in r.getMessage() for r in caplog.records)
+
+
+# ── Task 16a: a defaulted booking type is flagged as a guess ─────────────────
+
+def test_defaulted_booking_type_is_flagged_as_a_guess():
+    detail = _extract_detail_page(FakePage(FIXTURE, "exact"), "B-1")
+    assert detail["booking_type"] == "Bokning"
+    assert detail["booking_type_guess"] is True
+
+
+def test_detected_booking_type_is_not_a_guess():
+    html = FIXTURE.replace("</body>", "<p>Offert</p></body>") if "</body>" in FIXTURE \
+        else FIXTURE + "<p>Offert</p>"
+    detail = _extract_detail_page(FakePage(html, "exact"), "B-1")
+    assert detail["booking_type"] == "Offert"
+    assert detail["booking_type_guess"] is False

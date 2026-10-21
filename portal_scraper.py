@@ -483,10 +483,13 @@ def _extract_detail_page(page, booking_id: str) -> dict:
 
     spec_stats = {}
     services, parts, fluids, total_price = _extract_specification(page, spec_stats)
-    booking_type = _detect_booking_type(page, full_text)
+    booking_type, type_guessed = _detect_booking_type(page, full_text)
 
     result = {
         "id": booking_id, "booking_nr": booking_nr, "booking_type": booking_type,
+        # True when no type was found and 'Bokning' was assumed (agent.py then treats a
+        # missing Hanterad button as "no button", like Offert/Förfrågan).
+        "booking_type_guess": type_guessed,
         "reg_nr": reg_nr, "vehicle": vehicle, "driver_name": driver_name,
         "driver_phone": driver_phone, "driver_email": driver_email,
         "booked_at": booked_at, "workshop_dt": workshop_dt, "mileage": mileage,
@@ -751,7 +754,8 @@ def _extract_specification(page, stats: dict | None = None) -> tuple:
     return services, parts, fluids, total
 
 
-def _detect_booking_type(page, full_text: str) -> str:
+def _detect_booking_type(page, full_text: str) -> tuple[str, bool]:
+    """(booking type, guessed): guessed is True only for the 'Bokning' default."""
     text_lower = full_text.lower()
     for sel in [".badge", "[class*='status']", "h1", "h2"]:
         try:
@@ -759,23 +763,23 @@ def _detect_booking_type(page, full_text: str) -> str:
                 t = (el.inner_text() or "").lower()
                 if "förfrågan" in t: 
                     log.info("Detected type 'Förfrågan' from element text: %s", t[:50])
-                    return "Förfrågan"
+                    return "Förfrågan", False
                 if "offert" in t: 
                     log.info("Detected type 'Offert' from element text: %s", t[:50])
-                    return "Offert"
+                    return "Offert", False
                 if "bokning" in t: 
                     log.info("Detected type 'Bokning' from element text: %s", t[:50])
-                    return "Bokning"
+                    return "Bokning", False
         except Exception:
             log.warning("Silenced exception in %s", __name__)
     if "förfrågan" in text_lower: 
         log.info("Detected type 'Förfrågan' from full text")
-        return "Förfrågan"
+        return "Förfrågan", False
     if "offert" in text_lower: 
         log.info("Detected type 'Offert' from full text")
-        return "Offert"
+        return "Offert", False
     log.info("Defaulting to type 'Bokning'")
-    return "Bokning"
+    return "Bokning", True
 
 
 

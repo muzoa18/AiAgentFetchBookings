@@ -770,3 +770,183 @@ def test_approval_and_ordered_messages_show_line_names_and_stock(tg, orders_file
     assert "OBS: 0 i lager" in done
     assert len(text) < 4096 and len(done) < 4096
     _assert_no_pii(orders_file)
+
+
+# ── Task 16a: cart_touched, detail_url, quiet re-stage of blocked orders ─────
+
+NO_AIR = {**CATALOGUE, "Luftfilter": []}
+AIR_REASON = "ingen säker träff för 'Luftfilter'"
+GIVE_UP = ("Försöker inte mer automatiskt för OLRD-3630 – "
+           "beställ för hand eller åtgärda orsaken.")
+
+
+def _blocked_then_restaged(reason, tries=0):
+    orders_state.put("B1", "blocked", plan={"reason": reason, "booking_id": "B1"})
+    if tries:
+        orders_state.update_fields("B1", tries=tries)
+    assert orders_state.restage("B1") is True
+
+
+def test_cart_touched_is_persisted_before_a_later_block(tg):
+    wrong = _cart(490.0, [{"title": "Okänt filter A", "qty": 2, "price_sek": 240.0},
+                          {"title": "Okänt filter B", "qty": 1, "price_sek": 250.0}])
+    portal = FakePortal(cart=wrong)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert orders_state.get("B1")["cart_touched"] is True
+
+
+def test_cart_touched_is_persisted_before_a_later_failure(tg):
+    class BreaksAfterAdd(FakePortal):
+        def read_cart(self):
+            if self.added:
+                raise RuntimeError("cart page broke")
+            return super().read_cart()
+
+    portal = BreaksAfterAdd()
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "failed"
+
+    rec = orders_state.get("B1")
+    assert rec["status"] == "failed"
+    assert rec["cart_touched"] is True
+
+
+def test_cart_touched_set_when_first_add_is_called(tg):
+    seen = []
+
+    class Spy(FakePortal):
+        def add_to_cart(self, candidate, qty):
+            seen.append(orders_state.get("B1").get("cart_touched"))
+            super().add_to_cart(candidate, qty)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, Spy(), APPROVE, confident) == "pending"
+    assert seen == [True, True]
+    assert orders_state.get("B1")["cart_touched"] is True
+
+
+def test_cart_not_touched_when_blocked_before_adding(tg):
+    portal = FakePortal(catalogue=NO_AIR)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert "cart_touched" not in orders_state.get("B1")
+
+
+def test_detail_url_is_stored_without_customer_data(tg, orders_file):
+    booking = {**BOOKING, "detail_url": "https://portal.example/Booking/Details?BookingID=123"}
+
+    assert parts_order.plan_and_stage(CONFIG, booking, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    assert orders_state.get("B1")["detail_url"] == booking["detail_url"]
+    _assert_no_pii(orders_file)
+
+
+def test_first_block_still_messages(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+    assert len(tg["sent"]) == 1
+
+
+def test_quiet_retry_same_reason_sends_nothing(tg, orders_file):
+    _blocked_then_restaged(AIR_REASON)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    assert tg["sent"] == [] and tg["buttons"] == []
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"
+    assert rec["tries"] == 1
+    assert rec["plan"]["reason"] == AIR_REASON
+    _assert_no_pii(orders_file)
+
+
+def test_quiet_retry_new_reason_sends_one_blocked_message(tg):
+    _blocked_then_restaged("varukorgen är inte tom")
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    assert len(tg["sent"]) == 1
+    assert AIR_REASON in tg["sent"][0]
+    assert orders_state.get("B1")["tries"] == 1
+
+
+def test_quiet_retry_that_stages_sends_the_approval_message(tg):
+    _blocked_then_restaged(AIR_REASON)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), APPROVE, confident) == "pending"
+
+    assert tg["sent"] == []
+    (text, buttons), = tg["buttons"]
+    assert buttons == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+    rec = orders_state.get("B1")
+    assert rec["status"] == "pending" and rec["tries"] == 1
+
+
+def test_quiet_retry_that_fails_is_reported(tg):
+    _blocked_then_restaged(AIR_REASON)
+    portal = FakePortal()
+    portal.fail_on = "search"
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "failed"
+
+    assert len(tg["sent"]) == 1
+    assert "misslyckades" in tg["sent"][0]
+
+
+def test_retry_reaching_the_cap_sends_one_give_up_message(tg):
+    _blocked_then_restaged(AIR_REASON, tries=orders_state.MAX_TRIES - 1)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "blocked"
+
+    assert tg["sent"] == [GIVE_UP]
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"
+    assert rec["tries"] == orders_state.MAX_TRIES
+    assert rec["gave_up"] is True
+    assert orders_state.restage("B1") is False
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False  # once only
+    assert tg["sent"] == [GIVE_UP]
+
+
+def test_retry_below_the_cap_sends_no_give_up(tg):
+    _blocked_then_restaged(AIR_REASON, tries=orders_state.MAX_TRIES - 2)
+
+    parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE, confident)
+
+    assert tg["sent"] == []
+    assert "gave_up" not in orders_state.get("B1")
+
+
+def test_give_up_if_capped_sends_once_for_a_capped_record(tg):
+    orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES)
+
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
+    assert tg["sent"] == [GIVE_UP]
+
+
+@pytest.mark.parametrize("fields", [{"tries": 3}, {"tries": 10, "cart_touched": True}])
+def test_give_up_if_capped_ignores_other_records(tg, fields):
+    orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
+    orders_state.update_fields("B1", **fields)
+
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
+    assert tg["sent"] == []
+
+
+def test_give_up_undelivered_is_tried_again_later(tg):
+    orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES)
+    tg["send_ok"] = False
+
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
+    assert "gave_up" not in orders_state.get("B1")
+    tg["send_ok"] = True
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
