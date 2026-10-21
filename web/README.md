@@ -14,18 +14,42 @@ serverless functions in `api/`, pure modules in `lib/`, Node built-ins only.
 
 ## Try the demo
 
-Requires Node 20 or newer. Works the same on Windows, macOS and Linux.
+### Option 1: preview file, no server and no Node at runtime
 
 ```bash
 cd web
+npm run preview
+```
+
+This writes `web/preview/dashboard-preview.html`, a single file with the
+dashboard and invented demo data built in. Double-click it to open it in any
+browser. It makes no network requests and has no login step. The "Kör nu"
+buttons only show "Startad (demo)". Add `?stale=1` to the address to see the
+stale-data warning. The file is gitignored, and it has to be built once on a
+machine with Node.
+
+### Option 2: local demo server
+
+Requires Node 20 or newer. On Windows, install **Node.js LTS** from
+https://nodejs.org (the default options are fine). Then open **PowerShell** or
+**cmd**, not WSL, and run:
+
+```powershell
+cd C:\Users\<you>\PycharmProjects\AiAgentFetchBookings\web
 npm run demo
 ```
 
-Open http://localhost:3000 and log in with the password `demo`. The demo uses
-invented data (every status, a verified and an unverified order, a blocked
-order with a reason, failed runs in the history). The "Kör nu" buttons
-pretend to succeed and nothing is sent to GitHub. Add `?stale=1` to the URL to
-see the stale-data warning.
+Open the address the server prints. `http://127.0.0.1:3000` is the
+recommended one. Log in with the password `demo`. The demo uses invented data:
+every status, a verified and an unverified order, a blocked order with a
+reason, and failed runs in the history. The "Kör nu" buttons pretend to
+succeed and nothing is sent to GitHub. Add `?stale=1` to the URL to see the
+stale-data warning.
+
+Use a different port with `npm run demo -- --port 3001`, which works in
+PowerShell, cmd and bash, or with `node dev-server.js --demo --port 3001`.
+The server listens only on this computer: 127.0.0.1 and ::1, never the
+network.
 
 Run the tests (no network needed):
 
@@ -33,6 +57,28 @@ Run the tests (no network needed):
 cd web
 npm test
 ```
+
+### Felsökning (troubleshooting)
+
+- **Blank page or "Laddar instrumentpanelen…" that never goes away:** press
+  F12 and open the **Console** tab. A red error there names the problem. Check
+  that you opened the address printed by `npm run demo`, not the
+  `index.html` file directly. The server prints `OK – öppna …` once it has
+  checked itself.
+- **`ERR_CONNECTION_RESET` / "connection refused":** the server is not running
+  on this machine. A server started inside WSL or a Claude Code `!` command is
+  not always reachable from Windows browsers. Start it in PowerShell or cmd
+  instead, or use `npm run preview`.
+- **The login form comes back, or a message says the browser did not keep
+  the cookie:** use `http://127.0.0.1:PORT`, or try another browser.
+  Shields or strict privacy settings, for example in Brave, can block
+  cookies on localhost.
+- **`Port 3000 används redan / is already in use`:** another program, or an
+  earlier demo, is using the port. Stop it with Ctrl+C in its window, or
+  start on another port: `npm run demo -- --port 3001`.
+- **`Instrumentpanelen är inte konfigurerad` (live mode):**
+  `SESSION_SECRET` must be at least 32 characters, and
+  `DASHBOARD_PASSWORD` at least 16 characters with 6 different characters.
 
 ## Deploy on Vercel
 
@@ -144,9 +190,11 @@ refreshes every 60 s while the tab is visible.
 web/
   api/        login.js logout.js status.js run.js  (Vercel functions, thin wrappers)
   lib/        auth.js github.js summarize.js ratelimit.js http.js handlers.js runtime.js demo.js
-  public/     index.html app.js render.js links.js style.css robots.txt
+              cli.js preview-transport.js
+  public/     index.html app.js render.js links.js session.js transport.js style.css robots.txt
   test/       node:test suites (no network)
-  dev-server.js  local server for the demo, or for live mode with real env vars
+  dev-server.js  local server for the demo (--demo, --port N), or live mode with real env vars
+  preview.js     builds preview/dashboard-preview.html (offline, self-contained)
   vercel.json    headers and output directory
 ```
 

@@ -1,17 +1,24 @@
 // Local server: serves public/ and the same API handlers as Vercel.
-//   node dev-server.js --demo     invented demo data, password "demo", no GitHub calls
-//   node dev-server.js            real env vars (DASHBOARD_PASSWORD, SESSION_SECRET, GITHUB_*)
-// Listens on 127.0.0.1 only. Not used in production.
+//   node dev-server.js --demo [--port N]   invented demo data, password "demo", no GitHub calls
+//   node dev-server.js [--port N]          real env vars (DASHBOARD_PASSWORD, SESSION_SECRET, GITHUB_*)
+// Listens on the loopback addresses only (127.0.0.1 and ::1), never on the LAN.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applySecurityHeaders } from './lib/http.js';
+import { buildHandlers } from './lib/runtime.js';
+import { parseArgs, portInUseMessage } from './lib/cli.js';
 
-if (process.argv.includes('--demo')) process.env.DEMO = '1';
-const { buildHandlers, isDemo } = await import('./lib/runtime.js');
+let options;
+try {
+  options = parseArgs(process.argv.slice(2), process.env);
+} catch (err) {
+  console.error(err.message);
+  process.exit(2);
+}
+const { demo, port: PORT } = options;
 
-const PORT = Number(process.env.PORT) || 3000;
 const ROOT = fileURLToPath(new URL('./public/', import.meta.url));
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -21,7 +28,7 @@ const TYPES = {
   '.ico': 'image/x-icon',
   '.txt': 'text/plain; charset=utf-8',
 };
-const handlers = buildHandlers();
+const handlers = buildHandlers(process.env, { demo });
 const routes = {
   '/api/login': handlers.login,
   '/api/logout': handlers.logout,
@@ -30,7 +37,13 @@ const routes = {
 };
 
 async function serveStatic(pathname, res) {
-  const rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  let rel;
+  try {
+    rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  } catch {
+    res.statusCode = 400;
+    return res.end();
+  }
   const file = normalize(join(ROOT, rel));
   if (!file.startsWith(ROOT.endsWith(sep) ? ROOT : ROOT + sep) || !TYPES[extname(file)]) {
     res.statusCode = 404;
@@ -47,7 +60,7 @@ async function serveStatic(pathname, res) {
   }
 }
 
-const server = createServer(async (req, res) => {
+async function handle(req, res) {
   applySecurityHeaders(res);
   let pathname;
   try {
@@ -65,12 +78,48 @@ const server = createServer(async (req, res) => {
     }
     return await serveStatic(pathname, res);
   } catch {
-    res.statusCode = 500;
+    if (!res.headersSent) res.statusCode = 500;
     res.end();
   }
-});
+}
 
-server.listen(PORT, '127.0.0.1', () => {
-  const mode = isDemo() ? 'demo mode, password "demo"' : 'live mode (GitHub)';
-  console.log(`Dashboard on http://localhost:${PORT} (${mode}). Ctrl+C to stop.`);
-});
+function listen(host) {
+  return new Promise((resolve, reject) => {
+    const server = createServer(handle);
+    server.once('error', reject);
+    server.listen(PORT, host, () => resolve(server));
+  });
+}
+
+async function selfCheck(base) {
+  try {
+    for (const path of ['/', '/app.js']) {
+      const res = await fetch(base + path, { signal: AbortSignal.timeout(3000) });
+      if (!res.ok) throw new Error(`${path} gav / returned HTTP ${res.status}`);
+      await res.arrayBuffer();
+    }
+    console.log(`OK – öppna ${base} i webbläsaren / open ${base} in your browser.`);
+  } catch (err) {
+    console.error(`Självtest misslyckades / self-check failed: ${err.message}`);
+  }
+}
+
+try {
+  await listen('127.0.0.1');
+} catch (err) {
+  console.error(err.code === 'EADDRINUSE' ? portInUseMessage(PORT) : `Kunde inte starta / could not start: ${err.message}`);
+  process.exit(1);
+}
+let ipv6 = true;
+try {
+  await listen('::1');
+} catch {
+  ipv6 = false; // IPv6 loopback unavailable, or the port is taken there: 127.0.0.1 still works
+}
+
+const mode = demo ? 'demoläge, lösenord "demo" / demo mode, password "demo"' : 'live (GitHub)';
+console.log(`Instrumentpanelen körs / dashboard running (${mode}):`);
+console.log(`  http://127.0.0.1:${PORT}   (rekommenderas / recommended)`);
+if (ipv6) console.log(`  http://localhost:${PORT}   (http://[::1]:${PORT})`);
+console.log('Stoppa med / stop with Ctrl+C.');
+await selfCheck(`http://127.0.0.1:${PORT}`);

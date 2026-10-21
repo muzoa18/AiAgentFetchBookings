@@ -1,6 +1,8 @@
 // Dashboard controller: fetches /api/status, swaps views, wires buttons.
 // All rendering goes through render.js (DOM APIs only, no HTML strings).
 import * as R from './render.js';
+import { unauthorizedMessage } from './session.js';
+import { send } from './transport.js';
 
 const REFRESH_MS = 60_000;
 const RUN_LOCK_MS = 30_000;
@@ -28,15 +30,7 @@ function api(path, options = {}) {
     init.headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'dashboard' };
     init.body = JSON.stringify(options.body);
   }
-  return fetch(path, init).then(async (res) => {
-    let data = null;
-    try {
-      data = await res.json();
-    } catch {
-      data = null;
-    }
-    return { status: res.status, ok: res.ok, data: data ?? {} };
-  });
+  return send(path, init);
 }
 
 function replace(id, node) {
@@ -44,6 +38,7 @@ function replace(id, node) {
 }
 
 function show(view) {
+  $('boot').hidden = true;
   $('login-view').hidden = view !== 'login';
   $('dash-view').hidden = view !== 'dash';
   $('bar-actions').hidden = view !== 'dash';
@@ -72,7 +67,7 @@ function render(vm) {
   document.body.classList.toggle('is-demo', Boolean(vm.demo));
 }
 
-async function load({ announce = false } = {}) {
+async function load({ announce = false, justLoggedIn = false } = {}) {
   if (loading) return;
   loading = true;
   $('refresh').disabled = true;
@@ -83,6 +78,8 @@ async function load({ announce = false } = {}) {
       $('demo-note').hidden = !data.demo;
       show('login');
       showLoadError(null);
+      // Right after a successful login a 401 means the cookie was not kept: say so, never loop silently.
+      $('login-error').textContent = unauthorizedMessage({ justLoggedIn, location }) ?? '';
       $('password').focus();
       return;
     }
@@ -132,7 +129,7 @@ async function onLogin(event) {
       return;
     }
     input.value = '';
-    await load();
+    await load({ justLoggedIn: true });
     $('main').focus();
   } catch {
     error.textContent = 'Ingen kontakt med servern.';
@@ -200,6 +197,10 @@ async function onRun(event) {
       return;
     }
     status.className = 'run-status is-ok';
+    if (data.preview) {
+      status.replaceChildren('Startad (demo). Förhandsvisningen startar ingenting på GitHub.');
+      return;
+    }
     const href = R.safeHref(data.actionsUrl);
     status.replaceChildren(
       'Startad – se ',

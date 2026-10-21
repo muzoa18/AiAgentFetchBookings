@@ -34,3 +34,4 @@ playwright-report/
 # ── Dashboard (web/) ────────────────────────────────────────────
 web/node_modules/
 .vercel
+web/preview/

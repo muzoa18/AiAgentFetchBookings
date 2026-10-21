@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "demo": "node dev-server.js --demo"
+    "demo": "node dev-server.js --demo",
+    "preview": "node preview.js"
   }
 }

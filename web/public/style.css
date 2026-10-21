@@ -117,6 +117,9 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-siz
 .link { color: var(--accent); font-weight: 600; text-underline-offset: 3px; }
 .link:hover { text-decoration-thickness: 2px; }
 
+/* ---------- Boot ---------- */
+.boot { max-width: 640px; margin: 48px auto; padding: 0 var(--gutter); color: var(--muted); }
+
 /* ---------- Login ---------- */
 .login { display: grid; place-items: center; padding: 48px var(--gutter); min-height: calc(100vh - 62px); }
 .login-card {
