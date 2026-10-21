@@ -49,6 +49,7 @@ from datetime import datetime
 from pathlib import Path
 
 import orders_state
+from logsafe import describe
 from config_loader import load_config
 from notifier import send_message
 from parts_matcher import make_claude_picker
@@ -153,9 +154,10 @@ def run() -> int:
         try:
             _process_booking(config, booking, seen_ids, (no_button, no_button_once),
                              to_order, counts)
-        except Exception:
-            log.exception("Processing %s raised — continuing with the next booking.",
-                          booking.get("id", "unknown"))
+        except Exception as e:
+            log.error("Processing %s raised (%s) — continuing with the next booking.",
+                      booking.get("id", "unknown"), describe(e))
+            log.debug("Traceback", exc_info=True)
             counts["errors"] += 1
 
     # Queued records (orders_state.queue/restage) are written before seen_ids.
@@ -328,8 +330,9 @@ def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool | No
     log.info("Marking %s as Hanterad%s ...", booking_id, " (retry)" if retry else "")
     try:
         handled_ok = mark_booking_handled(config, detail_url)
-    except Exception:
-        log.exception("Marking %s as Hanterad raised.", booking_id)
+    except Exception as e:
+        log.error("Marking %s as Hanterad raised: %s", booking_id, describe(e))
+        log.debug("Traceback", exc_info=True)
         handled_ok = False
 
     if handled_ok is True:
@@ -430,18 +433,20 @@ def _order_parts(config: dict, bookings: list[dict]) -> tuple[int, int]:
                             try:
                                 tools = _open_ordering_tools(config, stack)
                             except _SetupError as e:
-                                log.exception("Could not start parts ordering.")
+                                log.error("Could not start parts ordering: %s", e)
                                 setup_error = f"kunde inte starta beställningen ({e})"[:200]
-                            except Exception:
-                                # The raw text (page text, internals) goes to the log only.
-                                log.exception("Could not start parts ordering.")
+                            except Exception as e:
+                                # Never the raw text: it can carry page HTML (logs are uploaded).
+                                log.error("Could not start parts ordering: %s", describe(e))
+                                log.debug("Traceback", exc_info=True)
                                 setup_error = "kunde inte starta beställningen"
                         if setup_error:
                             status = record_failure(config, booking, setup_error)
                         else:
                             status = plan_and_stage(config, booking, tools[0], rules, tools[1])
-                except Exception:
-                    log.exception("Parts ordering raised for %s.", booking.get("id"))
+                except Exception as e:
+                    log.error("Parts ordering raised for %s: %s", booking.get("id"), describe(e))
+                    log.debug("Traceback", exc_info=True)
                     status = "failed"
                 log.info("Parts order for %s: %s", booking.get("id"), status)
                 if status in ("pending", "ordered"):

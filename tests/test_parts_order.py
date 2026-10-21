@@ -1701,3 +1701,81 @@ def test_is_transient_classification():
                 PartsPortalError("x", "in_cart"), ValueError("x"), RuntimeError("x"),
                 OSError("disk"), KeyError("k")):
         assert not is_transient(exc), exc
+
+
+# ── Wave 4 review: vehicle_unknown, search_timeout, per-booking time budget ──
+
+def test_unknown_plate_is_not_retried(tg):
+    portal = Flaky("load_vehicle", PartsPortalError("vehicle X could not be loaded on pro.meca.se",
+                                                    "vehicle_unknown"))
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "failed"
+
+    assert tg["sent"] == ["Delbeställning misslyckades för OLRD-0001: pro.meca.se känner inte igen "
+                          "registreringsnumret. Beställ för hand."]
+    assert orders_state.restage("B1") is False
+
+
+def test_search_timeout_before_the_cart_is_retried(tg):
+    portal = Flaky("search", PartsPortalError("search results for 'x' did not appear",
+                                              "search_timeout"), nth=2)
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+    _assert_transient_block(tg, portal)
+
+
+@pytest.mark.parametrize("code,reason", [
+    ("vehicle_unknown", "pro.meca.se känner inte igen registreringsnumret"),
+    ("search_timeout", "sökresultatet visades inte i tid")])
+def test_new_codes_have_swedish_reasons(code, reason):
+    assert owner_reason(PartsPortalError("SECRET-PAGE-TEXT", code)) == reason
+
+
+class Clocked(NoClearPortal):
+    """Every search / add advances the injected stage clock."""
+
+    def __init__(self, clock, per_search=0, per_add=0, **kw):
+        super().__init__(**kw)
+        self.clock, self.per_search, self.per_add = clock, per_search, per_add
+
+    def search(self, term):
+        self.clock["t"] += self.per_search
+        return super().search(term)
+
+    def add_to_cart(self, candidate, qty):
+        self.clock["t"] += self.per_add
+        return super().add_to_cart(candidate, qty)
+
+
+@pytest.fixture
+def stage_clock(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(parts_order, "_clock", lambda: clock["t"])
+    return clock
+
+
+def test_stage_budget_exceeded_before_the_cart_is_a_transient_block(tg, stage_clock):
+    portal = Clocked(stage_clock, per_search=200)   # searches at 0, 200, 400; then 600 > 480
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert portal.names().count("search") == 3
+    _assert_transient_block(tg, portal)
+    assert parts_order.STAGE_BUDGET_S == 480
+
+
+def test_stage_budget_exceeded_while_adding_stops_and_lists_the_rest(tg, stage_clock):
+    portal = Clocked(stage_clock, per_add=300)      # adds at 0 and 300; then 600 > 480
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    assert [c[1] for c in portal.calls if c[0] == "add_to_cart"] == ["s1", "s2"]
+    _assert_partial(tg, portal, "\n".join([
+        "Delbeställning för OLRD-0001: i varukorgen: Bosch Kupéfilter x1, Bosch Oljefilter x1.",
+        "Inte försökt: Oljepluggspackning, Luftfilter, Tändstift.",
+        PROMISE,
+        "Förbered (finns på lager):", "- Olja 5W30 x5"]))
+
+
+def test_stage_within_budget_is_unchanged(tg, stage_clock):
+    portal = Clocked(stage_clock, per_search=10, per_add=10)
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "pending"

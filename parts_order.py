@@ -30,11 +30,14 @@ the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 
 import notifier
 import orders_state
+from logsafe import describe
 from parts_matcher import choose, is_fluid, search_terms
+from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
                                  is_transient, order_body, owner_reason, parse_qty,
                                  prepare_section, total_problem)
@@ -57,6 +60,10 @@ PARTIAL_PROMISE = ("Delarna som lades till ligger kvar orörda i varukorgen på 
 PARTIAL_PROMISE_CHECK = ("Det som redan ligger i varukorgen är orört – kontrollera antalet "
                          "innan du lägger till mer.")
 CART_UNTOUCHED = "Det som redan ligger i varukorgen är orört."
+# Time budget for staging one booking (searches + adds), checked before each search and add;
+# a slow pro.meca.se must not hold the whole run. Injectable clock for tests.
+STAGE_BUDGET_S = 480
+_clock = time.monotonic
 # After these the session cannot add anything more: the remaining parts are not tried.
 STOP_CODES = ("vehicle_lost", "login")
 
@@ -255,7 +262,8 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
     try:
         status = _stage(config, booking, portal, rules, picker)
     except Exception as e:
-        log.exception("Parts ordering failed for %s", booking_id)
+        log.error("Parts ordering failed for %s: %s", booking_id, describe(e))
+        log.debug("Traceback", exc_info=True)
         if not (is_transient(e) and not _cart_touched(booking_id)):
             return _fail(config, booking_id, label, owner_reason(e))
         try:
@@ -293,6 +301,10 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if fields:  # cart_touched=False marks the record as not legacy (orders_state.restage)
         orders_state.update_fields(booking_id, **fields)
     order_lines, fluids = split_lines(booking)
+    deadline = _clock() + STAGE_BUDGET_S
+
+    def out_of_time() -> bool:
+        return _clock() > deadline
 
     def block(reason: str, **kw) -> str:
         return _block(config, booking, reason, fluids, quiet_reason=quiet_reason, **kw)
@@ -318,6 +330,9 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     for line, name, qty in wanted:  # match everything before adding anything
         candidate = None
         for term in search_terms(name):  # synonyms first, then the normalised term, the original last
+            if out_of_time():  # nothing is in the cart yet: retried quietly (transient)
+                raise PartsPortalError(f"staging {booking_id} took longer than "
+                                       f"{STAGE_BUDGET_S} s", "search_timeout")
             candidate = choose(line, portal.search(term), rules, picker)
             if candidate is not None:
                 break
@@ -329,13 +344,18 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
         orders_state.update_fields(booking_id, cart_touched=True)
     added, not_added, partly, untried = [], [], [], []
     for i, (name, candidate, qty) in enumerate(matched):
+        if out_of_time():  # stop adding; what is in the cart stays untouched
+            log.warning("Staging %s ran out of time — %d part(s) not tried.",
+                        booking_id, len(matched) - i)
+            untried = [n for n, _, _ in matched[i:]]
+            break
         # Parts are independent: one that cannot be added never stops (or undoes) the others,
         # unless the session itself is gone (vehicle or login lost).
         try:
             portal.add_to_cart(candidate, qty)
         except Exception as e:
             log.warning("Could not add %r (%s) for %s to the cart: %s",
-                        name, candidate.get("url_or_id"), booking_id, _why(e))
+                        name, candidate.get("url_or_id"), booking_id, describe(e))
             steps = getattr(e, "steps_done", 0)
             if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
                 partly.append((name, steps, qty, owner_reason(e)))  # "+" was already clicked
@@ -346,7 +366,7 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
                 break
         else:
             added.append((candidate, qty))
-    if not_added or partly:
+    if not_added or partly or untried:
         return block(PARTIAL_REASON, cart_touched=True,
                      text=_partial_text(label, added, not_added, partly, untried, fluids))
 

@@ -23,6 +23,8 @@ OWNER_REASONS = {
     "cart_update": "varukorgen uppdaterades inte",
     "vehicle_lost": "fordonet försvann från sidan",
     "login": "inloggningen på pro.meca.se misslyckades",
+    "search_timeout": "sökresultatet visades inte i tid",
+    "vehicle_unknown": "pro.meca.se känner inte igen registreringsnumret",
 }
 # Fallback only, for a PartsPortalError raised without a code.
 _FALLBACK_CODES = (
@@ -49,7 +51,7 @@ def error_code(exc: BaseException) -> str | None:
 
 
 # Portal error codes that are worth an automatic retry while the cart is untouched.
-TRANSIENT_CODES = ("vehicle_lost", "login", "cart_update", None)
+TRANSIENT_CODES = ("vehicle_lost", "login", "cart_update", "search_timeout", None)
 
 
 def is_transient(exc: BaseException) -> bool:

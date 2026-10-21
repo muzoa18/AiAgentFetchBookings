@@ -408,11 +408,12 @@ def is_login_page(html: str) -> bool:
     return parse_html(html).find(id="ShopLoginForm_Login") is not None
 
 
-def is_results_page(html: str) -> bool:
-    """True once a search results page has rendered (its result tabs or header are present)."""
-    root = parse_html(html)
-    return (root.find(cls="search-page__tabs") is not None
-            or root.find(cls="search-page-header") is not None)
+def search_echo(html: str) -> str | None:
+    """The term a results page was searched for: pro.meca.se echoes it in the page's own
+    search field (#searchTerm_SearchPage, value attribute), with or without hits. None when
+    the page has no such field (vehicle overview, a page still loading)."""
+    node = parse_html(html).find("input", id="searchTerm_SearchPage")
+    return node.get("value") if node is not None else None
 
 
 def is_cart_page(html: str) -> bool:

@@ -16,6 +16,8 @@ import logging
 import re
 from pathlib import Path
 
+from logsafe import describe
+
 log = logging.getLogger(__name__)
 
 try:
@@ -294,10 +296,7 @@ def fetch_bookings(config: dict) -> list[dict]:
             log.info("Booking links found: %d", len(booking_links))
 
             if not booking_links:
-                log.warning("No booking links found on page.")
-                page.screenshot(path="logs/no_bookings.png")
-                # Never the text itself: the page lists customer names (logs are uploaded).
-                log.info("Page text length: %d", len(page.inner_text("body") or ""))
+                _report_no_booking_links(page)
                 return []
 
             # ── Step 7: Process each booking detail page ──────────────────────
@@ -347,7 +346,8 @@ def fetch_bookings(config: dict) -> list[dict]:
         except PWTimeout:
             log.error("Timeout.")
         except Exception as exc:
-            log.exception("Scraping error: %s", exc)
+            log.error("Scraping error: %s", describe(exc))
+            log.debug("Scraping error traceback", exc_info=True)
             try:
                 Path("logs").mkdir(exist_ok=True)
                 page.screenshot(path="logs/error_screenshot.png")
@@ -402,6 +402,17 @@ def _fill_login(page, username: str, password: str) -> bool:
             return True
     page.keyboard.press("Enter")
     return True
+
+
+def _report_no_booking_links(page) -> None:
+    """Diagnostics when the Nya tab shows no booking links: a local screenshot and the
+    page text LENGTH only (the text lists customer names; logs are uploaded)."""
+    log.warning("No booking links found on page.")
+    try:
+        page.screenshot(path="logs/no_bookings.png")
+    except Exception as e:
+        log.warning("Could not save logs/no_bookings.png: %s", type(e).__name__)
+    log.info("Page text length: %d", len(page.inner_text("body") or ""))
 
 
 def _collect_booking_links(page) -> list[dict]:
@@ -785,87 +796,6 @@ def _detect_booking_type(page, full_text: str) -> tuple[str, bool]:
 
 
 
-def _click_hanterad(page) -> bool:
-    """
-    Two-step Hanterad flow:
-      1. Click the "Hanterad" button (top right, in Händelselogg section)
-      2. Confirm with "Bekräfta" in the dialog that appears
-    """
-    Path("logs").mkdir(exist_ok=True)
-
-    # ── Diagnostic: log ALL buttons and links on the page ────────────────────
-    log.info("Scanning page for Hanterad button ...")
-    all_buttons = page.query_selector_all("button, a, input[type='button'], input[type='submit']")
-    log.info("Total clickable elements: %d", len(all_buttons))
-    for el in all_buttons:
-        try:
-            text    = (el.inner_text() or el.get_attribute("value") or "").strip()
-            visible = el.is_visible()
-            tag     = page.evaluate("(el) => el.tagName", el)
-            if text:
-                log.info("  [%s] visible=%s text='%s'", tag, visible, text[:50])
-        except Exception:
-            log.warning("Silenced exception in %s", __name__)
-
-    page.screenshot(path="logs/before_hanterad.png")
-    log.info("Screenshot: logs/before_hanterad.png")
-
-    # ── Step 1: Click Hanterad using JS to avoid selector issues ─────────────
-    clicked = page.evaluate("""
-        () => {
-            const els = document.querySelectorAll('button, a, input');
-            for (const el of els) {
-                const text = (el.innerText || el.value || '').trim();
-                // Match 'Hanterad' but NOT 'Hanterad 37' (the tab) — tab has a number
-                if (text === 'Hanterad' || text === 'hanterad') {
-                    el.click();
-                    return 'clicked: ' + el.tagName + ' "' + text + '"';
-                }
-            }
-            return 'not found';
-        }
-    """)
-    log.info("Hanterad JS click result: %s", clicked)
-
-    if "not found" in clicked:
-        log.warning("Hanterad button not found — check logs/before_hanterad.png")
-        return False
-
-    # ── Step 2: Wait for and click Bekräfta ──────────────────────────────────
-    page.wait_for_timeout(1500)
-    page.screenshot(path="logs/after_hanterad_click.png")
-    log.info("Screenshot: logs/after_hanterad_click.png")
-
-    try:
-        page.wait_for_selector("button:has-text('Bekräfta')", timeout=6_000)
-    except PWTimeout:
-        log.warning("Bekräfta dialog did not appear — check logs/after_hanterad_click.png")
-        return False
-
-    confirmed = page.evaluate("""
-        () => {
-            const els = document.querySelectorAll('button');
-            for (const el of els) {
-                const text = (el.innerText || '').trim();
-                if (text === 'Bekräfta') {
-                    el.click();
-                    return 'clicked Bekräfta';
-                }
-            }
-            return 'not found';
-        }
-    """)
-    log.info("Bekräfta result: %s", confirmed)
-
-    if "not found" in confirmed:
-        log.warning("Bekräfta button not found.")
-        return False
-
-    page.wait_for_load_state("networkidle", timeout=8_000)
-    log.info("Booking successfully marked as Hanterad.")
-    return True
-
-
 # Whitespace-tolerant exact words: the live button text is " Hanterad " (icon + spaces).
 HANTERAD_TEXT = re.compile(r"^\s*Hanterad\s*$", re.IGNORECASE)
 BEKRAFTA_TEXT = re.compile(r"^\s*Bekräfta\s*$", re.IGNORECASE)
@@ -998,7 +928,8 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool | None:
             return True
 
         except Exception as e:
-            log.exception("Error marking Hanterad: %s", e)
+            log.error("Error marking Hanterad: %s", describe(e))
+            log.debug("Hanterad error traceback", exc_info=True)
             return False
         finally:
             browser.close()

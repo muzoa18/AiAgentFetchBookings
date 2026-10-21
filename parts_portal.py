@@ -23,11 +23,12 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
 from parts_portal_parse import (PartsPortalError, PartsPortalPartialAdd, current_plate, extract_order_reference,
-                                is_cart_page, is_login_page, is_results_page, linked_tab_id, order_tokens, page_markers, parse_cart,
+                                is_cart_page, is_login_page, search_echo, linked_tab_id, order_tokens, page_markers, parse_cart,
                                 parse_checkout, parse_qty_text, parse_search_results, parse_sek,
                                 same_lines)
 
@@ -66,12 +67,26 @@ IDLE_TIMEOUT = 30_000
 IDLE_HINT_TIMEOUT = 8_000
 RESULTS_WAIT_S = 45
 POLL_S = 0.5
+# Worst case per search: one polling budget (RESULTS_WAIT_S, the idle hint runs inside it)
+# = 45 s. Only when the vehicle plate is missing at the end: load_vehicle (<= 45 s) plus one
+# repeated search (<= 45 s), so about 135 s, plus Playwright's own call timeouts.
 QTY_TIMEOUT_S = 15
 MAX_CLEAR_ATTEMPTS = 10
 
 
 def _is_qty_update(response) -> bool:
     return "ViewCart-ChangeProductQuantity" in response.url and response.request.method == "POST"
+
+
+def _is_navigation_error(exc: BaseException) -> bool:
+    """A Playwright error while the page is navigating (content not readable yet).
+    A closed page/browser (TargetClosedError) is a real failure."""
+    return (type(exc).__module__.split(".")[0] == "playwright"
+            and type(exc).__name__ != "TargetClosedError")
+
+
+def _norm_term(term) -> str:
+    return unicodedata.normalize("NFC", str(term or "")).casefold().strip()
 
 
 def normalise_reg(reg_nr: str) -> str:
@@ -131,32 +146,52 @@ class PartsPortal:
         try:
             self.page.wait_for_load_state("networkidle", timeout=timeout)
         except Exception:
-            log.info("pro.meca.se did not reach network idle; continuing with checks.")
+            # The short hint before polling routinely times out; the full waits should not.
+            (log.warning if timeout >= IDLE_TIMEOUT else log.info)(
+                "pro.meca.se did not reach network idle; continuing with checks.")
+
+    def _read(self) -> tuple[str | None, str]:
+        """(html, url); (None, "") while the page is navigating (not ready yet)."""
+        try:
+            return self.page.content(), str(self.page.url or "")
+        except Exception as e:
+            if _is_navigation_error(e):
+                return None, ""
+            raise
 
     def _login_lost(self):
         self._logged_in, self._reg = False, None
         return PartsPortalError("pro.meca.se session expired (login form shown)", "login")
 
     def _poll(self, ready) -> str | None:
-        """Page HTML once ready(html) holds (polled every POLL_S, up to RESULTS_WAIT_S);
-        None when the budget ran out. A login page raises a "login" error at once."""
-        self._settle(IDLE_HINT_TIMEOUT)
+        """Page HTML once ready(html, url) holds, polled every POLL_S up to RESULTS_WAIT_S;
+        None when the budget ran out (self._last_html keeps the last page read).
+
+        Readiness is checked first, so a page that is already there never waits for the
+        network-idle hint. A page that is navigating counts as not ready; a login page
+        raises a "login" error at once."""
         deadline = self._clock() + RESULTS_WAIT_S
+        self._last_html, hinted = None, False
         while True:
-            html = self.page.content()
-            if is_login_page(html):
-                raise self._login_lost()
-            if ready(html):
-                return html
+            html, url = self._read()
+            if html is not None:
+                self._last_html = html
+                if is_login_page(html):
+                    raise self._login_lost()
+                if ready(html, url):
+                    return html
             if self._clock() >= deadline:
                 return None
+            if not hinted:
+                hinted = True
+                self._settle(IDLE_HINT_TIMEOUT)
             self._sleep(POLL_S)
 
     def _goto(self, url: str, ready=None) -> str:
         self.page.goto(url, timeout=NAV_TIMEOUT)
         if ready is not None:
             html = self._poll(ready)
-            return html if html is not None else self.page.content()
+            return html if html is not None else (self._last_html or "")
         self._settle()
         html = self.page.content()
         if is_login_page(html):
@@ -208,35 +243,48 @@ class PartsPortal:
         # Enter, not the submit button: that button is display:none once a vehicle is loaded.
         self.page.press(SEL_REG_INPUT, "Enter")
 
-        def loaded(html: str) -> bool:
-            url = unquote(self.page.url)
+        def loaded(html: str, url: str) -> bool:
+            url = unquote(url)
             return ("ViewCarOverview-Start" in url and f"registrationNumber={reg}" in url
                     and current_plate(html) == reg)
 
         if self._poll(loaded) is None:
-            raise PartsPortalError(f"vehicle {reg} could not be loaded on pro.meca.se")
+            raise PartsPortalError(f"vehicle {reg} could not be loaded on pro.meca.se",
+                                   "vehicle_unknown")
         self._reg = reg
         log.info("Vehicle %s loaded.", reg)
 
     # ── Search and cart ──────────────────────────────────────────────────────
 
     def _run_search(self, term: str, reload_once: bool = True) -> str:
-        """Search and wait for the real results page of the loaded vehicle.
+        """Search and wait for THIS search's results page of the loaded vehicle.
 
-        If the plate does not show within the budget, the vehicle is loaded again and the
-        search repeated once; only then is the vehicle reported lost."""
+        Ready = a ViewParametricSearch URL, the loaded plate, and the page's own search field
+        echoing `term` (the previous search's page, still shown for a moment, echoes another
+        term and is never accepted). At the end of the budget: plate shown but no matching
+        results -> "search_timeout"; plate missing -> the vehicle is loaded again and the
+        search repeated once, and only then is the vehicle reported lost."""
         reg = self._require_vehicle()
         self.page.fill(SEL_SEARCH, term)
         self.page.press(SEL_SEARCH, "Enter")
-        html = self._poll(lambda h: current_plate(h) == reg and is_results_page(h))
+        want = _norm_term(term)
+
+        def ready(html: str, url: str) -> bool:
+            return ("ViewParametricSearch" in url and current_plate(html) == reg
+                    and _norm_term(search_echo(html)) == want)
+
+        html = self._poll(ready)
         if html is None:
+            if self._last_html is not None and current_plate(self._last_html) == reg:
+                raise PartsPortalError(f"search results for {term!r} did not appear",
+                                       "search_timeout")
             if reload_once:
                 log.warning("Results for %r did not show vehicle %s in time — loading the "
                             "vehicle again and repeating the search once.", term, reg)
                 try:
                     self.load_vehicle(reg)
                 except PartsPortalError as e:
-                    if e.code:
+                    if e.code not in (None, "vehicle_unknown"):  # it was known a moment ago
                         raise
                     raise PartsPortalError(f"vehicle {reg} is no longer loaded after searching "
                                            "(loading it again failed)", "vehicle_lost") from e
@@ -260,8 +308,12 @@ class PartsPortal:
         log.info("Search %r: %d linked candidate(s).", term, len(result))
         return result
 
-    def _quick_form(self, sku: str):
-        tab = linked_tab_id(self.page.content())
+    def _quick_form(self, sku: str, html: str | None = None):
+        if html is None:
+            html, _ = self._read()
+            if html is None:  # navigating: treat the part as not on this page
+                return None, None
+        tab = linked_tab_id(html)
         if not tab:
             return None, None
         tab_sel = f"div.tab-section__item[data-tab-id='{tab}']"
@@ -284,8 +336,8 @@ class PartsPortal:
             if not again:
                 raise PartsPortalError(f"part {sku} is not on the current page and no search to repeat",
                                        "not_linked")
-            self._run_search(again)
-            tab_sel, form_sel = self._quick_form(sku)
+            html = self._run_search(again)
+            tab_sel, form_sel = self._quick_form(sku, html)
             if not form_sel or self._count(form_sel) == 0:
                 raise PartsPortalError(f"part {sku} not found among linked parts", "not_linked")
         trigger = self.page.locator(f"{tab_sel} > a.js-search-result-tab-trigger").first
@@ -339,7 +391,7 @@ class PartsPortal:
 
     def _cart(self) -> dict:
         reg = self._require_vehicle()
-        cart = parse_cart(self._goto(CART_URL, ready=is_cart_page))
+        cart = parse_cart(self._goto(CART_URL, ready=lambda html, url: is_cart_page(html)))
         if cart.get("reg_nr") != reg:
             raise PartsPortalError(f"cart page is for {cart.get('reg_nr')!r}, expected {reg}")
         return cart

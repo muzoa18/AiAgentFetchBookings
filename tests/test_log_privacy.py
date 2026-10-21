@@ -94,10 +94,98 @@ def test_booking_type_detection_logs_no_element_text(caplog, element_text):
     _assert_no_sentinels(caplog)
 
 
-def test_no_booking_links_logs_only_the_page_text_length():
-    source = (REPO / "portal_scraper.py").read_text(encoding="utf-8")
-    assert 'log.info("Page text: %s", page.inner_text("body")[:500])' not in source
-    assert "Page text length" in source
+def test_no_booking_links_logs_only_the_page_text_length(caplog, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class ListPage:
+        def inner_text(self, selector):
+            return f"Nya bokningar\n{NAME} {PHONE} {EMAIL}"
+
+        def screenshot(self, path):
+            pass
+
+    caplog.set_level(logging.DEBUG)
+    portal_scraper._report_no_booking_links(ListPage())
+
+    _assert_no_sentinels(caplog)
+    assert any("Page text length" in r.getMessage() for r in caplog.records)
+
+
+def test_unused_hanterad_scanner_is_gone():
+    assert not hasattr(portal_scraper, "_click_hanterad")
+
+
+# ── exception text in the booking flow ───────────────────────────────────────
+
+CALL_LOG = ("Timeout 15000ms exceeded.\nCall log:\n  - waiting for locator('button')\n"
+            f"  -   locator resolved to <a href=\"tel:{PHONE}\">ring</a> "
+            f"<a href=\"mailto:{EMAIL}\">mejla</a>")
+
+
+def test_describe_masks_digits_and_addresses_and_is_short():
+    import logsafe
+
+    text = logsafe.describe(RuntimeError(CALL_LOG + "x" * 500))
+
+    assert text.startswith("RuntimeError: ")
+    assert PHONE not in text and EMAIL not in text and "700000999" not in text
+    assert "@" not in text and not any(c.isdigit() for c in text)
+    assert len(text) <= len("RuntimeError: ") + 200
+
+
+def test_agent_booking_errors_log_no_phone_or_email(run_agent, monkeypatch, caplog):
+    run, sent = run_agent
+
+    def boom(config, url):
+        raise RuntimeError(CALL_LOG)
+
+    monkeypatch.setattr(agent, "mark_booking_handled", boom)
+    caplog.set_level(logging.INFO)
+
+    run(True)
+
+    text = caplog.text
+    assert "RuntimeError" in text
+    assert PHONE not in text and EMAIL not in text
+
+
+def test_scraper_hanterad_error_logs_no_phone_or_email(monkeypatch, caplog):
+    class Browser:
+        def new_page(self):
+            raise RuntimeError(CALL_LOG)
+
+        def close(self):
+            pass
+
+    class Chromium:
+        def launch(self, **kw):
+            return Browser()
+
+    class PW:
+        chromium = Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(portal_scraper, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(portal_scraper, "sync_playwright", lambda: PW(), raising=False)
+    caplog.set_level(logging.INFO)
+    config = {"portal": {"username": "u", "password": "p"}}
+
+    with pytest.raises(RuntimeError):
+        portal_scraper.mark_booking_handled(config, "http://x/B1")  # new_page is outside the try
+    # the try/except path: make new_page work and goto fail
+    class Page:
+        def goto(self, *a, **k):
+            raise RuntimeError(CALL_LOG)
+
+    Browser.new_page = lambda self: Page()
+    assert portal_scraper.mark_booking_handled(config, "http://x/B1") is False
+    assert "RuntimeError" in caplog.text
+    assert PHONE not in caplog.text and EMAIL not in caplog.text
 
 
 # ── agent.run ────────────────────────────────────────────────────────────────

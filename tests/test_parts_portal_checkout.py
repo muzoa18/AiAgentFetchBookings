@@ -458,6 +458,7 @@ class AddPage:
             self.url = ("https://pro.meca.se/x/ViewCarOverview-Start?registrationNumber="
                         + self._typed)
             return
+        self.url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
         self.term = self._typed
         self.searches.append(self.term)
         if self.close_tab_on_search:
@@ -489,7 +490,8 @@ def add_page(monkeypatch):
         page = AddPage(catalogue, in_cart)
         monkeypatch.setattr(parts_portal, "current_plate", lambda html: "ABC123")
         monkeypatch.setattr(parts_portal, "linked_tab_id", lambda html: "t1")
-        monkeypatch.setattr(parts_portal, "is_results_page", lambda html: True, raising=False)
+        # the fake results page echoes the term it shows (like pro.meca.se's search field)
+        monkeypatch.setattr(parts_portal, "search_echo", lambda html: page.term, raising=False)
         monkeypatch.setattr(parts_portal, "parse_search_results", lambda html: [
             {"title": f"Del {sku}", "url_or_id": sku} for sku in catalogue.get(page.term, ())])
         return page, portal_with(page)
@@ -789,26 +791,53 @@ def test_stage_lists_a_read_failure_after_a_click_as_maybe_in_the_cart(add_page,
 
 
 
-# ── Wave 4: wait for the real results page; retry a lost vehicle once ───────
+# ── Wave 4 (+ review): wait for THIS search's results page; reload a lost vehicle once ─
 
-SEARCH_RESULTS = (FIXTURES / "meca_search_no_linked.html").read_text(encoding="utf-8")
+from parts_portal_parse import search_echo  # noqa: E402
+
+NO_LINKED = (FIXTURES / "meca_search_no_linked.html").read_text(encoding="utf-8")
+ZERO_HITS = (FIXTURES / "meca_search_zero_hits.html").read_text(encoding="utf-8")
+WITH_HITS = (FIXTURES / "meca_search.html").read_text(encoding="utf-8")
 MID_LOAD = "<html><head><title>Sök</title></head><body><main>laddar…</main></body></html>"
 OVERVIEW = ("<html><body><header><span class='js-current-license-plate-number'>ABC123</span>"
             "</header><main>Fordonsöversikt</main></body></html>")
-OVERVIEW_URL = SHOP_URL = ("https://pro.meca.se/INTERSHOP/web/WFS/x/ViewCarOverview-Start"
-                           "?registrationNumber=ABC123")
+OVERVIEW_URL = ("https://pro.meca.se/INTERSHOP/web/WFS/x/ViewCarOverview-Start"
+                "?registrationNumber=ABC123")
+RESULTS_URL = "https://pro.meca.se/INTERSHOP/web/WFS/x/ViewParametricSearch-SimpleOfferSearch"
+
+
+def results_for(term, base=NO_LINKED):
+    """A results page whose search field echoes `term` (as pro.meca.se does)."""
+    return base.replace('value="oljefilter"', f'value="{term}"')
+
+
+class Navigating(Exception):
+    """Stands in for playwright's Error while the page is navigating."""
+
+
+Navigating.__module__ = "playwright._impl._errors"
+NAVIGATING = Navigating("Unable to retrieve content because the page is navigating "
+                        "and changing the content.")
+
+
+class TargetClosedError(Exception):
+    pass
+
+
+TargetClosedError.__module__ = "playwright._impl._errors"
 
 
 class PollPage:
     """content() walks through the pages queued by the last Enter press (the last one sticks).
 
-    `searches` holds one list of pages per search press; `overviews` one per vehicle load."""
+    `searches`: one list per search press; the string "RESULTS" stands for the results page of
+    the typed term. An exception instance in a list is raised by content() at that read."""
 
-    def __init__(self, searches, overviews=None):
+    def __init__(self, searches, overviews=None, start=MID_LOAD):
         self.search_queue = [list(x) for x in searches]
         self.overview_queue = [list(x) for x in (overviews or [[OVERVIEW]])]
-        self.pages = [MID_LOAD]
-        self.url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
+        self.pages = [start]
+        self.url = RESULTS_URL
         self.searched, self.loads, self.idle_timeouts, self.reads = [], 0, [], 0
 
     def fill(self, selector, value):
@@ -817,8 +846,9 @@ class PollPage:
     def press(self, selector, key):
         if selector == parts_portal.SEL_SEARCH:
             self.searched.append(self._typed)
-            self.pages = self.search_queue.pop(0) if self.search_queue else [MID_LOAD]
-            self.url = "https://pro.meca.se/x/ViewParametricSearch-SimpleOfferSearch"
+            queued = self.search_queue.pop(0) if self.search_queue else [MID_LOAD]
+            self.pages = [results_for(self._typed) if p == "RESULTS" else p for p in queued]
+            self.url = RESULTS_URL
         else:
             assert selector == parts_portal.SEL_REG_INPUT
             self.loads += 1
@@ -827,45 +857,124 @@ class PollPage:
 
     def content(self):
         self.reads += 1
-        return self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        page = self.pages.pop(0) if len(self.pages) > 1 else self.pages[0]
+        if isinstance(page, BaseException):
+            raise page
+        return page
 
     def wait_for_load_state(self, state, timeout=None):
         self.idle_timeouts.append(timeout)
 
 
-def test_fast_results_page_does_not_wait():
-    page = PollPage([[SEARCH_RESULTS]])
+def _budget_polls():
+    return int(parts_portal.RESULTS_WAIT_S / parts_portal.POLL_S) + 2
+
+
+def test_search_echo_reads_the_echoed_term_from_the_fixtures():
+    assert search_echo(WITH_HITS) == "oljefilter"
+    assert search_echo(NO_LINKED) == "oljefilter"
+    assert search_echo(ZERO_HITS) == "pollenfilter"
+    assert search_echo(OVERVIEW) is None and search_echo(MID_LOAD) is None
+
+
+def test_ready_results_page_is_accepted_without_waiting_for_network_idle():
+    page = PollPage([["RESULTS"]])
     portal = portal_with(page)
 
     assert portal.search("Oljepluggspackning") == []
 
     assert portal.clock.sleeps == []
+    assert page.idle_timeouts == []          # readiness is checked before the idle hint
     assert page.loads == 0 and page.searched == ["Oljepluggspackning"]
-    assert all(t <= 10_000 for t in page.idle_timeouts)   # network idle is only a short hint
 
 
-def test_mid_load_page_is_polled_until_the_results_show():
-    page = PollPage([[MID_LOAD, MID_LOAD, SEARCH_RESULTS]])
+def test_new_results_on_the_third_poll_are_accepted():
+    page = PollPage([[MID_LOAD, MID_LOAD, "RESULTS"]])
     portal = portal_with(page)
 
     portal.search("Oljepluggspackning")
 
     assert portal.clock.sleeps == [parts_portal.POLL_S, parts_portal.POLL_S]
+    assert all(t <= 10_000 for t in page.idle_timeouts)   # only a short hint
     assert page.loads == 0
 
 
-def test_plate_without_results_page_is_not_enough():
-    plate_only = OVERVIEW  # plate present, but not a results page yet
-    page = PollPage([[plate_only, SEARCH_RESULTS]])
+def test_echo_matching_ignores_case_spaces_and_unicode_form():
+    import unicodedata
+    decomposed = unicodedata.normalize("NFD", "  KUPÉFILTER ")
+    page = PollPage([[results_for(decomposed)]])
     portal = portal_with(page)
 
-    portal.search("Oljepluggspackning")
+    portal.search("kupéfilter")
 
-    assert len(portal.clock.sleeps) == 1
+    assert portal.clock.sleeps == []
 
 
-def test_persistently_missing_plate_reloads_the_vehicle_once_and_repeats_the_search():
-    page = PollPage([[MID_LOAD], [SEARCH_RESULTS]])
+def test_previous_terms_results_are_never_accepted():
+    previous = results_for("Oljefilter", WITH_HITS)      # plate shown, linked hits, old echo
+    page = PollPage([[previous]], start=previous)
+    portal = portal_with(page)
+
+    with pytest.raises(PartsPortalError) as info:
+        portal.search("Luftfilter")
+
+    assert info.value.code == "search_timeout"
+    assert page.loads == 0                    # the plate was there: no vehicle reload
+    assert page.searched == ["Luftfilter"]
+    assert page.reads <= _budget_polls()
+    assert "Luftfilter" not in str(portal._last_search)
+
+
+def test_search_never_returns_another_terms_candidates():
+    previous = results_for("Oljefilter", WITH_HITS)
+    page = PollPage([[previous, previous, results_for("Luftfilter", NO_LINKED)]], start=previous)
+    portal = portal_with(page)
+
+    found = portal.search("Luftfilter")
+
+    assert found == []                        # NO_LINKED has no linked candidates
+    assert len(portal.clock.sleeps) == 2
+
+
+def test_same_term_again_is_accepted_immediately():
+    page = PollPage([["RESULTS"], ["RESULTS"]])
+    portal = portal_with(page)
+    portal.search("Oljefilter")
+    portal.search("Oljefilter")
+    assert portal.clock.sleeps == []
+
+
+def test_zero_hits_page_is_accepted_fast():
+    page = PollPage([[ZERO_HITS]])
+    portal = portal_with(page)
+
+    assert portal.search("pollenfilter") == []
+    assert portal.clock.sleeps == []
+
+
+def test_vehicle_overview_is_never_taken_for_results():
+    page = PollPage([[OVERVIEW]])
+    portal = portal_with(page)
+    page.url = OVERVIEW_URL
+
+    with pytest.raises(PartsPortalError) as info:
+        portal.search("Oljefilter")
+    assert info.value.code == "search_timeout"
+
+
+def test_results_url_is_required():
+    class WrongUrl(PollPage):
+        def press(self, selector, key):
+            super().press(selector, key)
+            self.url = "https://pro.meca.se/x/ViewOther-Start"
+
+    page = WrongUrl([["RESULTS"]])
+    with pytest.raises(PartsPortalError):
+        portal_with(page).search("Oljefilter")
+
+
+def test_missing_plate_reloads_the_vehicle_once_and_repeats_the_search():
+    page = PollPage([[MID_LOAD], ["RESULTS"]])
     portal = portal_with(page)
 
     portal.search("Oljepluggspackning")
@@ -873,11 +982,10 @@ def test_persistently_missing_plate_reloads_the_vehicle_once_and_repeats_the_sea
     assert page.loads == 1
     assert page.searched == ["Oljepluggspackning", "Oljepluggspackning"]
     assert portal._reg == "ABC123" and portal._last_search == "Oljepluggspackning"
-    assert sum(portal.clock.sleeps) >= parts_portal.RESULTS_WAIT_S
 
 
-def test_still_missing_after_one_reload_is_vehicle_lost():
-    page = PollPage([[MID_LOAD], [MID_LOAD], [SEARCH_RESULTS]])
+def test_missing_plate_after_one_reload_is_vehicle_lost():
+    page = PollPage([[MID_LOAD], [MID_LOAD], ["RESULTS"]])
     portal = portal_with(page)
 
     with pytest.raises(PartsPortalError) as info:
@@ -885,8 +993,8 @@ def test_still_missing_after_one_reload_is_vehicle_lost():
 
     assert info.value.code == "vehicle_lost"
     assert page.loads == 1 and len(page.searched) == 2
-    # two budgets (search, repeated search), no endless polling
-    assert sum(portal.clock.sleeps) <= 2 * parts_portal.RESULTS_WAIT_S + 2 * parts_portal.POLL_S
+    # worst case: two search budgets plus the reload (see the constants in parts_portal)
+    assert sum(portal.clock.sleeps) <= 2 * parts_portal.RESULTS_WAIT_S + 4 * parts_portal.POLL_S
 
 
 def test_login_page_while_polling_is_a_login_error():
@@ -900,8 +1008,34 @@ def test_login_page_while_polling_is_a_login_error():
     assert page.loads == 0
 
 
+def test_navigation_errors_while_polling_mean_not_ready_yet():
+    page = PollPage([[NAVIGATING, NAVIGATING, NAVIGATING, "RESULTS"]])
+    portal = portal_with(page)
+
+    portal.search("Oljefilter")
+
+    assert len(portal.clock.sleeps) == 3 and page.loads == 0
+
+
+def test_navigation_errors_for_the_whole_budget_are_a_search_timeout():
+    page = PollPage([[NAVIGATING]], start=OVERVIEW)
+    portal = portal_with(page)
+
+    with pytest.raises(PartsPortalError) as info:
+        portal.search("Oljefilter")
+    # nothing readable at all: the plate cannot be confirmed either -> one reload
+    assert info.value.code in ("vehicle_lost", "search_timeout")
+    assert page.reads <= 3 * _budget_polls()
+
+
+def test_target_closed_is_not_swallowed():
+    page = PollPage([[TargetClosedError("Target page, context or browser has been closed")]])
+    with pytest.raises(TargetClosedError):
+        portal_with(page).search("Oljefilter")
+
+
 def test_load_vehicle_waits_for_the_plate():
-    page = PollPage([], overviews=[[MID_LOAD, MID_LOAD, OVERVIEW]])
+    page = PollPage([], overviews=[[MID_LOAD, NAVIGATING, OVERVIEW]])
     portal = portal_with(page, reg=None)
 
     portal.load_vehicle("ABC 123")
@@ -910,22 +1044,45 @@ def test_load_vehicle_waits_for_the_plate():
     assert len(portal.clock.sleeps) == 2
 
 
-def test_load_vehicle_that_never_shows_the_plate_fails_after_the_budget():
+def test_unknown_plate_has_its_own_code():
     page = PollPage([], overviews=[[MID_LOAD]])
     portal = portal_with(page, reg=None)
 
-    with pytest.raises(PartsPortalError, match="could not be loaded"):
+    with pytest.raises(PartsPortalError, match="could not be loaded") as info:
         portal.load_vehicle("ABC123")
+    assert info.value.code == "vehicle_unknown"
     assert portal._reg is None
-    assert sum(portal.clock.sleeps) >= parts_portal.RESULTS_WAIT_S
 
 
-def test_cart_page_is_polled_until_it_shows_the_cart():
+def test_cart_page_is_polled_through_navigation_errors():
     page = FakePage()
     portal = portal_with(page)
-    seq = [MID_LOAD, MID_LOAD, CART]
-    page.content = lambda: seq.pop(0) if len(seq) > 1 else seq[0]
+    seq = [MID_LOAD, NAVIGATING, CART]
 
+    def content():
+        item = seq.pop(0) if len(seq) > 1 else seq[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    page.content = content
     cart = portal.read_cart()
 
     assert cart["lines"] and len(portal.clock.sleeps) == 2
+
+
+def test_add_to_cart_quick_form_read_tolerates_a_navigation_error(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]})
+    (cand,) = portal.search("Oljefilter")
+    real = page.content
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise NAVIGATING
+        return real()
+
+    page.content = flaky
+    portal.add_to_cart(cand, 1)
+    assert page.qty == {"p1": 1}
