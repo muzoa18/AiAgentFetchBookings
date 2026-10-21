@@ -389,3 +389,12 @@ def test_empty_result_still_means_no_new_bookings(env, caplog):
     assert "No new bookings found" in caplog.text
     assert "login_failed" not in env["logged"]
     assert env["sent"] == []
+
+
+def test_failed_login_message_carries_portal_reason(env, monkeypatch):
+    _login_fails(env, monkeypatch,
+                 reason="Fel användarnamn eller lösenord (portalen avvisade inloggningen)")
+
+    assert agent.run() == 1
+    assert env["sent"] == [agent.LOGIN_FAILED_TEXT
+                           + "Fel användarnamn eller lösenord (portalen avvisade inloggningen)"]

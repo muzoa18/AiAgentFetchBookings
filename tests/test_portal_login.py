@@ -7,6 +7,7 @@ import portal_scraper
 from portal_scraper import PortalLoginError, _logged_in, _login_error_text
 
 LOGIN_URL = portal_scraper.PORTAL_LOGIN_URL
+PORTAL = portal_scraper.PORTAL_BASE
 BOOKING_URL = portal_scraper.PORTAL_BASE + "/Booking/Index"
 CONFIG = {"portal": {"username": "verkstad.user", "password": "S3cretPw!"}}
 
@@ -30,6 +31,16 @@ class FakeKeyboard:
         self.page.actions.append(("press", key))
 
 
+class FakeResponse:
+    def __init__(self, url, body):
+        self.url, self.body = url, body
+
+    def json(self):
+        if self.body is None:
+            raise ValueError("not json")
+        return self.body
+
+
 class FakePage:
     """A page is a URL plus {selector: [FakeElement, ...]} and a body text."""
 
@@ -43,6 +54,21 @@ class FakePage:
         # what the page turns into after a login submit / a goto
         self.after_submit = None
         self.routes = {}
+        # JSON body the portal's Authenticate call answers with after a login click
+        self.auth_body = None
+        self.handlers = []
+        self._pending = []
+
+    def on(self, event, handler):
+        assert event == "response"
+        self.handlers.append(handler)
+
+    def _dispatch(self):
+        # Playwright delivers events while the sync API waits, not inside click().
+        pending, self._pending = self._pending, []
+        for resp in pending:
+            for handler in self.handlers:
+                handler(resp)
 
     def _set(self, state):
         self.url, self.elements, self.body = state
@@ -64,13 +90,14 @@ class FakePage:
             self._set(self.routes[url])
 
     def wait_for_load_state(self, *_, **__):
-        pass
+        self._dispatch()
 
     def wait_for_url(self, *_, **__):
-        pass
+        self.actions.append(("wait_for_url",))
+        self._dispatch()
 
     def wait_for_timeout(self, *_):
-        pass
+        self._dispatch()
 
     def wait_for_selector(self, sel, **_):
         self.actions.append(("wait_for_selector", sel))
@@ -80,6 +107,10 @@ class FakePage:
 
     def click(self, sel):
         self.actions.append(("click", sel))
+        if sel == "#btnLogin":
+            self._pending.append(FakeResponse(PORTAL + "/api/V1/Users/Authenticate", self.auth_body)
+                                 if self.auth_body is not None
+                                 else FakeResponse(PORTAL + "/Content/site.css", None))
         if self.after_submit is not None:
             self._set(self.after_submit)
 
@@ -323,3 +354,111 @@ def test_fill_login_without_a_known_button_presses_enter_instead_of_a_language_b
     assert portal_scraper._fill_login(page, "u", "p") is True
     assert [a for a in page.actions if a[0] == "click"] == []
     assert ("press", "Enter") in page.actions
+
+
+# ── The portal's own Authenticate response ───────────────────────────────────
+
+from portal_scraper import _auth_reason  # noqa: E402
+
+WRONG = {"Success": False, "ErrorCode": "WrongUsernameOrPassword", "PasswordExpired": False,
+         "TemporarilyDeactivated": False, "SomeToken": "SECRET-TOKEN"}
+
+
+def _logins(page):
+    return [a for a in page.actions if a == ("click", "#btnLogin")]
+
+
+def test_auth_reason_mapping():
+    assert _auth_reason(None) == ""
+    assert _auth_reason({"Success": True, "ErrorCode": ""}) == ""
+    assert _auth_reason({"Success": False, "ErrorCode": "WrongUsernameOrPassword"}) == \
+        "Fel användarnamn eller lösenord (portalen avvisade inloggningen)"
+    assert _auth_reason({"Success": False, "ErrorCode": "FastLoginAttempts"}) == \
+        "För många inloggningsförsök i rad – vänta en stund och försök igen"
+    assert _auth_reason({"Success": False, "ErrorCode": "", "PasswordExpired": True}) == \
+        "Lösenordet har gått ut – byt lösenord i portalen"
+    assert _auth_reason({"Success": False, "ErrorCode": "", "TemporarilyDeactivated": True}) == \
+        "Kontot är tillfälligt avstängt"
+
+
+def test_auth_reason_unknown_code_is_sanitised_and_truncated():
+    reason = _auth_reason({"Success": False, "ErrorCode": "Some<b>Odd</b> Code!" + "X" * 60})
+    code = reason[len("Portalen avvisade inloggningen ("):-1]
+    assert reason.startswith("Portalen avvisade inloggningen (") and reason.endswith(")")
+    assert code.isalnum() and len(code) == 40
+    assert code.startswith("SomebOddbCode")
+
+
+def test_wrong_password_response_raises_immediately_with_mapped_reason(fake_pw, caplog):
+    caplog.set_level("INFO")
+    page = _login_page((LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY))
+    page.auth_body = WRONG
+    fake_pw(page)
+
+    with pytest.raises(PortalLoginError) as exc:
+        portal_scraper.fetch_bookings(CONFIG)
+
+    assert "Fel användarnamn eller lösenord" in str(exc.value)
+    assert "SECRET-TOKEN" not in str(exc.value) and "SECRET-TOKEN" not in caplog.text
+    assert "S3cretPw!" not in caplog.text
+    assert len(_logins(page)) == 1                       # never retried
+    assert ("wait_for_url",) not in page.actions          # no 15 s URL wait
+    assert ("goto", BOOKING_URL) not in page.actions
+    assert ("evaluate",) not in page.actions
+    assert page.screenshots == ["logs/login_failed.png"]
+
+
+def test_fast_login_attempts_reason_reaches_the_error(fake_pw):
+    page = _login_page((LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY))
+    page.auth_body = {"Success": False, "ErrorCode": "FastLoginAttempts"}
+    fake_pw(page)
+
+    with pytest.raises(PortalLoginError, match="För många inloggningsförsök"):
+        portal_scraper.fetch_bookings(CONFIG)
+    assert len(_logins(page)) == 1
+
+
+def test_success_response_proceeds_to_booking_list(fake_pw):
+    # Even if the form lingers after a good Authenticate, stage 1 trusts the portal;
+    # the booking list (no form) is the definitive check.
+    page = _login_page((LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY))
+    page.auth_body = {"Success": True, "ErrorCode": None}
+    page.routes[BOOKING_URL] = (BOOKING_URL, {"table": [FakeElement()]}, "Nya 0")
+    fake_pw(page)
+
+    assert portal_scraper.fetch_bookings(CONFIG) == []
+    assert ("goto", BOOKING_URL) in page.actions
+    assert len(_logins(page)) == 1
+
+
+def test_success_response_but_booking_list_shows_login_raises(fake_pw):
+    page = _login_page((LOGIN_URL, {}, "Start"))
+    page.auth_body = {"Success": True}
+    page.routes[BOOKING_URL] = LOGIN_PAGE
+    fake_pw(page)
+
+    with pytest.raises(PortalLoginError, match="okänd orsak"):
+        portal_scraper.fetch_bookings(CONFIG)
+
+
+def test_no_auth_response_falls_back_to_page_text(fake_pw):
+    page = _login_page((LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY + "\nAccount locked"))
+    fake_pw(page)   # auth_body None: only an unrelated response is seen
+
+    with pytest.raises(PortalLoginError, match="Account locked"):
+        portal_scraper.fetch_bookings(CONFIG)
+    assert len(_logins(page)) == 1
+
+
+def test_mark_booking_handled_false_on_rejected_auth_without_clicking(fake_pw, caplog):
+    caplog.set_level("INFO")
+    page = _login_page((LOGIN_URL, PASSWORD_FIELD, LOGIN_BODY))
+    page.auth_body = WRONG
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, "https://x/BookingInfo?BookingID=1") is False
+    assert [a for a in page.actions if a[0] == "click"] == [("click", "#btnLogin")]
+    assert not any(a[0] in ("locator", "goto") and "BookingInfo" in str(a) for a in page.actions)
+    assert ("wait_for_url",) not in page.actions
+    assert "Fel användarnamn eller lösenord" in caplog.text
+    assert "SECRET-TOKEN" not in caplog.text

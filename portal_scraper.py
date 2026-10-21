@@ -3,8 +3,9 @@ portal_scraper.py
 -----------------
 Workflow:
   1. Log in — portal lands directly on Booking/Index with Nya tab active.
-     A visible login form after login, or on the booking list, raises
-     PortalLoginError (never "no bookings"); the booking-list check is definitive.
+     The portal's Authenticate JSON response decides first (Success false ->
+     PortalLoginError with its reason); without it, a visible login form does.
+     A login form on the booking list also raises; that check is definitive.
   2. Dismiss cookie popup if present
   3. Collect all BookingInfo links visible on the page
   4. Open each detail page, extract all info
@@ -57,6 +58,81 @@ def _visible(page, selector: str) -> bool:
         return False
 
 
+# The LOGIN button is an SPA call that always answers HTTP 200 with JSON such as
+# {"Success": false, "ErrorCode": "WrongUsernameOrPassword", ...}. The page shows
+# nothing for a wrong password, so this response is the only source of the reason.
+AUTH_PATH = "/api/v1/users/authenticate"
+AUTH_WAIT_MS = 10_000
+AUTH_REASONS = {
+    "WrongUsernameOrPassword": "Fel användarnamn eller lösenord (portalen avvisade inloggningen)",
+    "FastLoginAttempts": "För många inloggningsförsök i rad – vänta en stund och försök igen",
+}
+
+
+def _error_code(value) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value)[:40] if isinstance(value, str) else ""
+
+
+def _auth_summary(body) -> dict | None:
+    """Only the four non-secret fields; the rest of the body can carry tokens and is dropped."""
+    if not isinstance(body, dict) or not isinstance(body.get("Success"), bool):
+        return None
+    return {
+        "Success": body["Success"],
+        "ErrorCode": _error_code(body.get("ErrorCode")),
+        "PasswordExpired": body.get("PasswordExpired") is True,
+        "TemporarilyDeactivated": body.get("TemporarilyDeactivated") is True,
+    }
+
+
+def _watch_auth(page) -> dict:
+    """Register (before the login click) a listener keeping the Authenticate summary in ["result"]."""
+    holder = {}
+
+    def on_response(response):
+        try:
+            if AUTH_PATH not in (response.url or "").lower():
+                return
+            summary = _auth_summary(response.json())
+        except Exception as e:
+            log.warning("Could not read the portal's login response (%s).", type(e).__name__)
+            return
+        if summary is not None:
+            holder["result"] = summary
+
+    page.on("response", on_response)
+    return holder
+
+
+def _wait_for_auth(page, holder: dict) -> dict | None:
+    """Let Playwright deliver the Authenticate response (events arrive while waiting)."""
+    waited = 0
+    while "result" not in holder and waited < AUTH_WAIT_MS:
+        page.wait_for_timeout(250)
+        waited += 250
+    return holder.get("result")
+
+
+def _auth_reason(result) -> str:
+    """Short Swedish reason from the Authenticate summary; "" on success or when none was seen."""
+    if not result or result.get("Success") is not False:
+        return ""
+    code = _error_code(result.get("ErrorCode"))
+    if code in AUTH_REASONS:
+        return AUTH_REASONS[code]
+    if result.get("PasswordExpired") is True:
+        return "Lösenordet har gått ut – byt lösenord i portalen"
+    if result.get("TemporarilyDeactivated") is True:
+        return "Kontot är tillfälligt avstängt"
+    return f"Portalen avvisade inloggningen ({code})" if code else "Portalen avvisade inloggningen"
+
+
+def _failure_reason(page, auth_result, username: str, password: str) -> str:
+    return (_auth_reason(auth_result) or _login_error_text(page, username, password)
+            or "okänd orsak")
+
+
+
 def _logged_in(page) -> bool:
     """
     False while the login form is showing (a visible password input), else True.
@@ -101,16 +177,18 @@ def _login_error_text(page, username: str = "", password: str = "") -> str:
     return found[:200]
 
 
-def _require_login(page, username: str, password: str, stage: str) -> None:
-    """Raise PortalLoginError (after a screenshot and an ERROR log) unless logged in."""
-    if _logged_in(page):
-        return
+def _login_failed(page, auth_result, username: str, password: str, stage: str):
+    """Screenshot, ERROR log (no credentials, no response body) and raise PortalLoginError."""
     _login_failed_screenshot(page)
-    error_text = _login_error_text(page, username, password)
-    log.error("MECA login not accepted (%s). URL: %s. Portal message: %s",
-              stage, page.url, error_text or "(none)")
-    reason = "inloggningsformuläret visas fortfarande / login form still showing"
-    raise PortalLoginError(f"{reason}: {error_text}" if error_text else reason)
+    reason = _failure_reason(page, auth_result, username, password)
+    log.error("MECA login not accepted (%s). URL: %s. Reason: %s", stage, page.url, reason)
+    raise PortalLoginError(reason)
+
+
+def _require_login(page, auth_result, username: str, password: str, stage: str) -> None:
+    """Raise PortalLoginError unless the login form is gone."""
+    if not _logged_in(page):
+        _login_failed(page, auth_result, username, password, stage)
 
 
 def _login_failed_screenshot(page) -> None:
@@ -144,10 +222,16 @@ def fetch_bookings(config: dict) -> list[dict]:
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
             page.wait_for_load_state("networkidle")
 
+            auth = _watch_auth(page)   # before the click, so the response is not missed
             if not _fill_login(page, username, password):
                 log.error("Login form not found.")
                 _login_failed_screenshot(page)
                 raise PortalLoginError("login form not found")
+
+            # Never retried: repeated bad attempts can lock the account.
+            auth_result = _wait_for_auth(page, auth)
+            if auth_result is not None and not auth_result["Success"]:
+                _login_failed(page, auth_result, username, password, "authenticate")
 
             try:
                 page.wait_for_url(
@@ -157,11 +241,13 @@ def fetch_bookings(config: dict) -> list[dict]:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
-            # Provisional: only a still-visible login form fails here. The
-            # definitive check is on the booking list below. Never retried:
-            # repeated bad attempts can lock the account.
-            _require_login(page, username, password, "after login")
-            log.info("Login form gone. URL: %s", page.url)
+            if auth_result is None:
+                # No Authenticate response seen: provisional check on the login form.
+                # The definitive check is on the booking list below.
+                _require_login(page, None, username, password, "after login")
+                log.info("Login form gone. URL: %s", page.url)
+            else:
+                log.info("Portal accepted the login. URL: %s", page.url)
 
             # ── Step 2: Go to booking list if not already there ───────────────
             if bookings_path.lstrip("/") not in page.url:
@@ -171,7 +257,7 @@ def fetch_bookings(config: dict) -> list[dict]:
             else:
                 log.info("Already on booking list.")
             # Definitive: the login form on the booking list means the session was not accepted.
-            _require_login(page, username, password, "booking list")
+            _require_login(page, auth_result, username, password, "booking list")
             log.info("Logged in (verified on booking list).")
 
             # ── Step 3: Dismiss cookie popup ──────────────────────────────────
@@ -677,8 +763,14 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             # Login
             page.goto(PORTAL_LOGIN_URL, timeout=30_000)
             page.wait_for_load_state("networkidle")
+            auth = _watch_auth(page)   # before the click
             if not _fill_login(page, username, password):
                 log.error("Hanterad step: login form not found — not marking.")
+                return False
+            auth_result = _wait_for_auth(page, auth)   # never retried
+            if auth_result is not None and not auth_result["Success"]:
+                log.error("Hanterad step: MECA login not accepted — not marking. Reason: %s",
+                          _auth_reason(auth_result))
                 return False
             try:
                 page.wait_for_url(
@@ -688,9 +780,9 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             except PWTimeout:
                 pass
             page.wait_for_load_state("networkidle", timeout=15_000)
-            if not _logged_in(page):
-                log.error("Hanterad step: MECA login not accepted — not marking. Portal message: %s",
-                          _login_error_text(page, username, password) or "(none)")
+            if auth_result is None and not _logged_in(page):
+                log.error("Hanterad step: MECA login not accepted — not marking. Reason: %s",
+                          _failure_reason(page, None, username, password))
                 return False
             _dismiss_cookies(page)
             log.info("Logged in for Hanterad step (verified).")
