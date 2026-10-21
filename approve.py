@@ -1,7 +1,7 @@
 """
 approve.py
 ----------
-Telegram approval poller (approve.yml, every 15 min). Reads the owner's
+Telegram approval poller (approve.yml, every 20 min in working hours). Reads the owner's
 Approve/Cancel taps on staged parts orders, checks out or cancels, and expires
 approvals older than 48 h.
 

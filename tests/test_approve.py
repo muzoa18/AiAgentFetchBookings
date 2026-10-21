@@ -624,8 +624,11 @@ def _steps(wf):
 def test_approve_workflow_shape():
     wf = _workflow("approve.yml")
     on = wf.get("on", wf.get(True))  # PyYAML reads a bare `on` key as True
-    assert on["schedule"] == [{"cron": "*/15 * * * *"}]
+    # Every 20 min, 05-19 UTC, Mon-Sat: stays inside the Actions free-minutes quota.
+    assert on["schedule"] == [{"cron": "*/20 5-19 * * 1-6"}]
     assert "workflow_dispatch" in on
+    (job,) = wf["jobs"].values()
+    assert job["timeout-minutes"] == 10
     assert wf["concurrency"] == {"group": "meca-bookings", "cancel-in-progress": False}
     assert _workflow("bookings.yml")["concurrency"]["group"] == "meca-bookings"
 
@@ -654,3 +657,13 @@ def test_persist_step_rebases_and_retries(name):
     assert "git pull --rebase --autostash origin main" in persist["run"]
     assert "exit 1" in persist["run"]
     assert "git rebase --abort 2>/dev/null || true" in persist["run"]
+
+
+def test_daily_run_is_off_the_poll_ticks():
+    wf = _workflow("bookings.yml")
+    on = wf.get("on", wf.get(True))
+    assert on["schedule"] == [{"cron": "7 15 * * 1-6"}]
+    minute = int(on["schedule"][0]["cron"].split()[0])
+    assert minute % 20 != 0  # never on a :00/:20/:40 poll tick (shared concurrency group)
+    text = (REPO / ".github" / "workflows" / "bookings.yml").read_text(encoding="utf-8")
+    assert "15:07 UTC" in text and "17:07" in text and "16:07" in text

@@ -1,10 +1,12 @@
 name: MECA Booking Agent
 
-# Runs once a day, Mon-Sat. Cron is in UTC: 15:00 UTC = 17:00 Swedish summer
-# time (CEST) / 16:00 winter time (CET). Owner to confirm the desired hour.
+# Runs once a day, Mon-Sat. Cron is in UTC: 15:07 UTC = 17:07 Swedish summer
+# time (CEST) / 16:07 winter time (CET). Owner to confirm the desired hour.
+# Offset by 7 minutes on purpose: off the approval poller's :00/:20/:40 ticks,
+# so the shared concurrency group never replaces a queued daily run.
 on:
   schedule:
-    - cron: "0 15 * * 1-6"
+    - cron: "7 15 * * 1-6"
   workflow_dispatch:               # allow manual runs from the Actions tab
 
 # Don't let two runs overlap (they both push state back to main).
