@@ -1,5 +1,5 @@
 // Argument parsing for dev-server.js (kept separate so it can be tested).
-export const DEFAULT_PORT = 3000;
+export const DEFAULT_PORT = 3737; // 3000 is often taken by other dev tools
 
 export function parsePort(value) {
   const s = String(value ?? '').trim();
@@ -28,7 +28,14 @@ export function parseArgs(argv, env = {}) {
 }
 
 export function portInUseMessage(port) {
-  const next = port < 65535 ? port + 1 : 3001;
+  const next = port < 65535 ? port + 1 : DEFAULT_PORT;
   return `Port ${port} används redan / is already in use — starta med / start with: `
     + `node dev-server.js --demo --port ${next}   (eller / or: npm run demo -- --port ${next})`;
+}
+
+/** DNS-rebinding defence: only Host values that name this server on a loopback address. */
+export function isAllowedHost(host, port) {
+  if (typeof host !== 'string') return false;
+  const h = host.toLowerCase();
+  return h === `127.0.0.1:${port}` || h === `localhost:${port}` || h === `[::1]:${port}`;
 }

@@ -44,9 +44,9 @@ test('origin must match scheme, host and port, case-insensitively', () => {
   denied(base({ referer: 'http://dash.example.test/' }), VERCEL);
   ok(base({ referer: 'https://dash.example.test/some/page?x=1' }), VERCEL);
   // Local dev server: plain http, scheme from the socket.
-  ok(base({ host: 'localhost:3000', origin: 'http://localhost:3000' }));
-  denied(base({ host: 'localhost:3000', origin: 'http://localhost:3001' }));
-  denied(base({ host: 'localhost:3000', origin: 'https://localhost:3000' }));
+  ok(base({ host: 'localhost:3737', origin: 'http://localhost:3737' }));
+  denied(base({ host: 'localhost:3737', origin: 'http://localhost:3738' }));
+  denied(base({ host: 'localhost:3737', origin: 'https://localhost:3737' }));
 });
 
 test('X-Forwarded-Host is ignored when matching the origin', () => {

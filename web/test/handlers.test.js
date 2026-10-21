@@ -5,7 +5,7 @@ import { GitHubError } from '../lib/github.js';
 import { signSession } from '../lib/auth.js';
 import { buildHandlers } from '../lib/runtime.js';
 
-const PW = 'test-password-long-enough';
+const PW = 'fake-horse-lamp-river-test';
 const env = { DASHBOARD_PASSWORD: PW, SESSION_SECRET: 'test-secret-0123456789-abcdefghijklmnop' };
 const HOST = 'dash.example.test';
 const NOW = Date.parse('2026-10-21T12:00:00Z');
@@ -260,7 +260,7 @@ test('the password-strength refusal never reveals the password', async () => {
 });
 
 test('changing the password logs every session out', async () => {
-  const { h } = setup({ envOverride: { ...env, DASHBOARD_PASSWORD: 'a-brand-new-passphrase' } });
+  const { h } = setup({ envOverride: { ...env, DASHBOARD_PASSWORD: 'a-brand-new-fake-phrase' } });
   const r = res();
   await h.status(authed({ method: 'GET' }), r);
   assert.equal(r.statusCode, 401, 'a cookie minted under the old password is rejected');
@@ -292,18 +292,63 @@ test('off Vercel, a spoofed X-Forwarded-For does not dodge the limit', async () 
   assert.equal(r.statusCode, 429);
 });
 
-test('after 100 failed logins in 10 minutes every login is delayed, not refused', async () => {
-  const { h, sleeps } = setup();
+async function tripBrake(h) {
   for (let i = 0; i < 100; i++) {
     const r = res();
     await h.login(req({ body: { password: 'nope' }, ip: `10.${i >> 8}.${i & 255}.1` }), r);
     assert.equal(r.statusCode, 401);
   }
+}
+
+const flush = () => new Promise((r) => setImmediate(r));
+
+test('after the brake trips, at most 2 logins wait; a parallel flood gets 429 at once', async () => {
+  const pending = [];
+  const { h, sleeps } = setup({ sleep: () => new Promise((resolve) => pending.push(resolve)) });
+  await tripBrake(h);
+  const results = Array.from({ length: 200 }, () => res());
+  const calls = results.map((r, i) => h.login(req({ body: { password: 'nope' }, ip: `172.16.${i >> 8}.${i & 255}` }), r));
+  await flush();
+  const answered = results.filter((r) => r.statusCode !== 0);
+  assert.equal(sleeps.length, 2, 'only two requests are waiting');
+  assert.equal(answered.length, 198, 'everyone else is answered without waiting');
+  for (const r of answered) {
+    assert.equal(r.statusCode, 429);
+    assert.equal(r.headers['retry-after'], '2');
+    assert.deepEqual(Object.keys(r.json), ['error']);
+  }
+  pending.forEach((resolve) => resolve());
+  await Promise.all(calls);
+  assert.deepEqual(results.filter((r) => r.statusCode === 401).length, 2);
+  // Slots are released: the next login can wait again.
+  const after = res();
+  const p = h.login(req({ body: { password: PW }, ip: '192.0.2.77' }), after);
+  await flush();
+  assert.equal(sleeps.length, 3);
+  pending.at(-1)();
+  await p;
+  assert.equal(after.statusCode, 200);
+});
+
+test('during the brake the owner still logs in, just slowly', async () => {
+  const { h, sleeps } = setup();
+  await tripBrake(h);
   assert.equal(sleeps.length, 0, 'no delay before the threshold');
   const owner = res();
   await h.login(req({ body: { password: PW }, ip: '192.0.2.50' }), owner);
-  assert.equal(owner.statusCode, 200, 'the owner still gets in');
+  assert.equal(owner.statusCode, 200);
   assert.deepEqual(sleeps, [2000]);
+});
+
+test('rate-limited requests are answered at once, even while the brake is on', async () => {
+  const { h, sleeps } = setup();
+  await tripBrake(h);
+  for (let i = 0; i < 5; i++) await h.login(req({ body: { password: 'nope' }, ip: '198.51.100.200' }), res());
+  const before = sleeps.length;
+  const r = res();
+  await h.login(req({ body: { password: 'nope' }, ip: '198.51.100.200' }), r);
+  assert.equal(r.statusCode, 429);
+  assert.equal(sleeps.length, before, 'no sleep for a rate-limited request');
 });
 
 test('the api entry path ignores DEMO; demo needs the explicit option', async () => {

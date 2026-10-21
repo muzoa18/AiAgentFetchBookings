@@ -3,10 +3,12 @@
 // open it by double-clicking. The UI code is the real public/*.js, bundled here.
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildHandlers } from './lib/runtime.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
+const WEB_ROOT = here('./');
 export const OUT_FILE = here('./preview/dashboard-preview.html');
 
 // Module order = dependency order. transport.js is replaced by the preview transport.
@@ -26,7 +28,7 @@ function modName(spec) {
 /** Turns one of our ES modules into an IIFE that returns its exports. Only the syntax our modules use is supported. */
 export function wrapModule(name, source) {
   const exported = [];
-  let body = source
+  let body = source.replace(/\r\n?/g, '\n')
     .replace(/^import \* as (\w+) from '([^']+)';$/gm, (_, local, spec) => `const ${local} = __mod_${modName(spec)};`)
     .replace(/^import \{([^}]+)\} from '([^']+)';$/gm, (_, names, spec) => `const {${names}} = __mod_${modName(spec)};`)
     .replace(/^export \{([^}]+)\};$/gm, (_, names) => {
@@ -38,7 +40,6 @@ export function wrapModule(name, source) {
       return `${kind} ${id}`;
     });
   if (/^\s*(import|export)\b/m.test(body)) throw new Error(`${name}: unsupported import/export syntax`);
-  body = body.replace(/\r\n/g, '\n');
   return `const __mod_${name} = (() => {\n${body}\nreturn { ${exported.join(', ')} };\n})();\n`;
 }
 
@@ -71,13 +72,24 @@ async function demoStatus() {
 
 const sha = (text) => `'sha256-${createHash('sha256').update(text, 'utf8').digest('base64')}'`;
 
-export async function buildPreview() {
+/** JSON for embedding in an inline script: no "<" (cannot close the tag), no raw U+2028/U+2029. */
+export function embedJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+// Sources are read with line endings normalised, so a CRLF checkout (Windows) builds the same file.
+const readText = async (path) => (await readFile(path, 'utf8')).replace(/\r\n?/g, '\n');
+
+export async function buildPreview({ root = WEB_ROOT, status } = {}) {
   const [html, css, ...sources] = await Promise.all([
-    readFile(here('./public/index.html'), 'utf8'),
-    readFile(here('./public/style.css'), 'utf8'),
-    ...MODULES.map(([, p]) => readFile(here('./' + p), 'utf8')),
+    readText(join(root, 'public/index.html')),
+    readText(join(root, 'public/style.css')),
+    ...MODULES.map(([, p]) => readText(join(root, p))),
   ]);
-  const data = JSON.stringify(await demoStatus()).replace(/</g, '\\u003c');
+  const data = embedJson(status ?? await demoStatus());
   const script = `"use strict";\nconst PREVIEW_STATUS = ${data};\n`
     + MODULES.map(([name], i) => wrapModule(name, sources[i])).join('\n');
   if (/<\/(script|style)/i.test(script + css)) throw new Error('inline content would close its tag');

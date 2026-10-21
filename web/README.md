@@ -39,15 +39,15 @@ cd C:\Users\<you>\PycharmProjects\AiAgentFetchBookings\web
 npm run demo
 ```
 
-Open the address the server prints. `http://127.0.0.1:3000` is the
+Open the address the server prints. `http://127.0.0.1:3737` is the
 recommended one. Log in with the password `demo`. The demo uses invented data:
 every status, a verified and an unverified order, a blocked order with a
 reason, and failed runs in the history. The "Kör nu" buttons pretend to
 succeed and nothing is sent to GitHub. Add `?stale=1` to the URL to see the
 stale-data warning.
 
-Use a different port with `npm run demo -- --port 3001`, which works in
-PowerShell, cmd and bash, or with `node dev-server.js --demo --port 3001`.
+Use a different port with `npm run demo -- --port 3738`, which works in
+PowerShell, cmd and bash, or with `node dev-server.js --demo --port 3738`.
 The server listens only on this computer: 127.0.0.1 and ::1, never the
 network.
 
@@ -73,12 +73,17 @@ npm test
   the cookie:** use `http://127.0.0.1:PORT`, or try another browser.
   Shields or strict privacy settings, for example in Brave, can block
   cookies on localhost.
-- **`Port 3000 används redan / is already in use`:** another program, or an
+- **`Port 3737 används redan / is already in use`:** another program, or an
   earlier demo, is using the port. Stop it with Ctrl+C in its window, or
-  start on another port: `npm run demo -- --port 3001`.
+  start on another port: `npm run demo -- --port 3738`.
+- **`Misdirected request` (HTTP 421):** the local server only answers to
+  `127.0.0.1:PORT`, `localhost:PORT` and `[::1]:PORT`. This protects
+  against DNS rebinding. Open one of those addresses, not the PC's network
+  name or IP.
 - **`Instrumentpanelen är inte konfigurerad` (live mode):**
   `SESSION_SECRET` must be at least 32 characters, and
-  `DASHBOARD_PASSWORD` at least 16 characters with 6 different characters.
+  `DASHBOARD_PASSWORD` at least 16 characters with 8 different characters,
+  and not an obvious pattern (see the table under Deploy).
 
 ## Deploy on Vercel
 
@@ -91,7 +96,7 @@ npm test
 
 | Variable | Required | Value |
 |---|---|---|
-| `DASHBOARD_PASSWORD` | yes | The shared login password. At least 16 characters with at least 6 different characters, otherwise the API refuses every request. Use a passphrase of four random words, e.g. `kaffe ratt vinter lampa`. |
+| `DASHBOARD_PASSWORD` | yes | The shared login password. It must be at least 16 characters with at least 8 different characters, and must not contain common words or patterns such as `password`, `qwerty`, `123456`, `letmein` or repeated blocks like `aaaa`. Otherwise the API refuses every request. Use **five random words** chosen by dice or a password manager's passphrase generator, not words you pick yourself. Example of the format, *exempel – använd inte detta* (it is rejected on purpose): `granit moln sax tulpan väska`. |
 | `SESSION_SECRET` | yes | Random, at least 32 characters. Generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. If it is missing or weak, the API refuses every request. |
 | `GITHUB_TOKEN` | yes | Fine-grained personal access token (see below). |
 | `GITHUB_REPO` | yes | `owner/name` of this repository. |
@@ -134,18 +139,27 @@ start `approve.yml` or `bookings.yml`.
 
 ## Security model
 
-- **One shared password.** It must be at least 16 characters with 6 or more
-  different characters. It is compared with HMAC and `timingSafeEqual`, and
+- **One shared password.** It must be at least 16 characters (counted as
+  characters, not bytes) with 8 or more different characters, and must not be
+  an obvious pattern. It is compared with HMAC and `timingSafeEqual`, and
   errors are generic.
 - **Login throttling.** Failed logins are limited to 5 per 10 minutes per
   client. IPv4 is counted per address and IPv6 per /64 network. On Vercel the
   client IP comes from the platform's `x-vercel-forwarded-for` / `x-real-ip`
   headers. Locally these headers are ignored and the socket address is used.
-  After 100 failed logins in 10 minutes across all clients, every login
-  attempt waits about 2 s. That slows guessing but never locks the owner out.
-  **Caveat:** these counters live in memory in each Vercel function instance.
-  They are reset on a cold start and are not shared between instances, so
-  they are best-effort. The real protection is a long passphrase.
+  The per-client limit is checked first, so a limited request is answered
+  with 429 at once. After 100 failed logins in 10 minutes across all
+  clients, only 2 login attempts at a time may wait about 2 s each. Every
+  other attempt gets `429` with `Retry-After: 2` straight away. The owner can
+  still log in during an attack, just slowly; retry if you see "För många
+  försök".
+  **Be honest about the limits:** on Vercel, each function instance keeps
+  its own counters in memory. They are not shared between instances and are
+  reset on every cold start, so an attacker spread across many instances gets
+  more tries. **Password strength is the real protection.** If your Vercel
+  plan offers it, also turn on Vercel's own **Deployment Protection**
+  (Settings → Deployment Protection), so the platform asks for
+  authentication before the dashboard is even reached.
 - **Session cookie.** It holds an expiry and a nonce signed with HMAC-SHA256.
   The key is derived from `SESSION_SECRET` and a hash of the current
   password. The cookie is `HttpOnly; Secure; SameSite=Strict` with a 12 h

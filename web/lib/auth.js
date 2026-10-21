@@ -11,7 +11,27 @@ export const COOKIE_NAME = 'dash_session';
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 export const MIN_SECRET_LENGTH = 32;
 export const MIN_PASSWORD_LENGTH = 16;
-export const MIN_PASSWORD_DISTINCT = 6;
+export const MIN_PASSWORD_DISTINCT = 8;
+// Obvious passwords, compared after lower-casing and dropping everything but letters and digits.
+// Includes the README's example passphrase so copying it does not work.
+const DENYLIST = ['password', 'passw0rd', 'lösenord', 'losenord', 'letmein', 'iloveyou', 'welcome',
+  'admin', 'kaffe', 'granit moln sax tulpan väska'];
+const SEQUENCES = ['qwertyuiopå', 'asdfghjklöä', 'zxcvbnm', '1234567890', 'abcdefghijklmnopqrstuvwxyz'];
+
+function normalise(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+function isObvious(password) {
+  const flat = normalise(password);
+  if (DENYLIST.some((w) => flat.includes(normalise(w)))) return true;
+  for (const seq of SEQUENCES) {
+    for (const s of [seq, [...seq].reverse().join('')]) {
+      for (let i = 0; i + 6 <= s.length; i++) if (flat.includes(s.slice(i, i + 6))) return true;
+    }
+  }
+  return /(.{1,4})\1{3,}/u.test(password.toLowerCase()); // a block repeated 4+ times, e.g. "aaaa", "abababab"
+}
 
 export function assertSecret(secret) {
   if (typeof secret !== 'string' || secret.length < MIN_SECRET_LENGTH) {
@@ -23,10 +43,10 @@ export function assertSecret(secret) {
 }
 
 export function assertPassword(password) {
-  if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH
-      || new Set(password).size < MIN_PASSWORD_DISTINCT) {
-    throw new Error(`DASHBOARD_PASSWORD must be at least ${MIN_PASSWORD_LENGTH} characters `
-      + `with at least ${MIN_PASSWORD_DISTINCT} different characters`);
+  const chars = typeof password === 'string' ? [...password] : [];
+  if (chars.length < MIN_PASSWORD_LENGTH || new Set(chars).size < MIN_PASSWORD_DISTINCT || isObvious(password)) {
+    throw new Error(`DASHBOARD_PASSWORD must be at least ${MIN_PASSWORD_LENGTH} characters with at least `
+      + `${MIN_PASSWORD_DISTINCT} different characters and not an obvious pattern`);
   }
 }
 

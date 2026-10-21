@@ -8,7 +8,7 @@ import {
 const SECRET = 'test-secret-0123456789-abcdefghijklmnop';
 const OTHER = 'other-secret-0123456789-abcdefghijklmnop';
 const NOW = Date.UTC(2026, 9, 21, 12, 0, 0);
-const PW = 'test-password-long-enough';
+const PW = 'fake-horse-lamp-river-test';
 
 test('a freshly signed session verifies', () => {
   const token = signSession(SECRET, NOW, PW);
@@ -77,16 +77,27 @@ test('the session cookie is read from the Cookie header', () => {
 test('changing the password ends every session', () => {
   const token = signSession(SECRET, NOW, PW);
   assert.equal(verifySession(token, SECRET, NOW, PW), true);
-  assert.equal(verifySession(token, SECRET, NOW, 'another-password-long-enough'), false);
+  assert.equal(verifySession(token, SECRET, NOW, 'another-fake-river-lamp-phrase'), false);
 });
 
-test('short or low-variety passwords are refused', () => {
-  for (const pw of [undefined, '', 'short', 'fifteen-chars-x', 'aaaaaaaaaaaaaaaaaaaa', 'abababababababababab', 'abcabcabcabcabcabc']) {
-    assert.throws(() => assertPassword(pw), /DASHBOARD_PASSWORD/, String(pw));
-  }
-  for (const pw of ['sixteen-chars-ok', 'häst batteri fönster kaffe', PW]) {
-    assert.doesNotThrow(() => assertPassword(pw), pw);
-  }
+test('short, low-variety or obvious passwords are refused', () => {
+  const refused = [
+    undefined, '', 'short', 'fifteen-chars-x',
+    'aaaaaaaaaaaaaaaaaaaa', 'abababababababababab', 'abcabcabcabcabcabc',
+    'åäöåäöåäöåäöåäö', // 15 characters even though it is more bytes
+    'test-password-long-enough', 'MyPassword-is-long!', 'qwerty-but-much-longer', 'zz-123456-and-more-text',
+    'letmein-letmein-ok', 'Kaffe-Lampa-Vinter-Ratt', 'hejsan-aaaaaaaa-hejsan',
+    'granit moln sax tulpan väska', 'GRANIT MOLN SAX TULPAN VÄSKA', // the README example
+    'abcdefgh-ijklmnop', 'zxcvbnm-wonderful-day',
+  ];
+  for (const pw of refused) assert.throws(() => assertPassword(pw), /DASHBOARD_PASSWORD/, String(pw));
+  const accepted = ['sixteen-chars-ok', 'häst batteri fönster lök', 'ljung-kompass-ugn-tavla-snö', PW];
+  for (const pw of accepted) assert.doesNotThrow(() => assertPassword(pw), pw);
+});
+
+test('length is counted in characters, not UTF-16 units or bytes', () => {
+  assert.throws(() => assertPassword('🚗🚙🚕🏎🚓🚑🚒🚐🛻🚚🚛🚜🏍🛵🚲'), /DASHBOARD_PASSWORD/); // 15 emoji = 30 UTF-16 units
+  assert.doesNotThrow(() => assertPassword('🚗🚙🚕🏎🚓🚑🚒🚐🛻🚚🚛🚜🏍🛵🚲🛴'));
 });
 
 test('the demo cookie can drop Secure for http://localhost; the default keeps it', () => {

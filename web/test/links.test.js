@@ -7,7 +7,6 @@ import { summarize } from '../lib/summarize.js';
 const GOOD = [
   'https://meca.promeisterportal.com/booking/123',
   'https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrderOverview-Start',
-  'https://github.com/owner/repo/actions',
   'https://PRO.MECA.SE/x',
 ];
 const BAD = [
@@ -32,6 +31,16 @@ const BAD = [
 test('only https links to the allow-listed hosts pass', () => {
   for (const url of GOOD) assert.ok(safeHref(url), url);
   for (const url of BAD) assert.equal(safeHref(url), null, String(url));
+});
+
+test('github.com is only allowed when asked for (the Actions link)', () => {
+  assert.equal(safeHref('https://github.com/owner/repo/actions'), null);
+  assert.equal(safeHref('https://github.com/owner/repo/actions', { allowGithub: true }), 'https://github.com/owner/repo/actions');
+  assert.equal(safeHref('https://github.com.evil.com/', { allowGithub: true }), null);
+  assert.equal(safeHref('http://github.com/', { allowGithub: true }), null);
+  assert.equal(safeHref('https://x@github.com/', { allowGithub: true }), null);
+  const vm = summarize({ ordersText: JSON.stringify({ bookings: { a: { status: 'pending', detail_url: 'https://github.com/x', plan: {} } } }) });
+  assert.equal(vm.orders[0].detailUrl, null, 'detail_url can never point at github.com');
 });
 
 test('render.js uses the same allow-list', () => {

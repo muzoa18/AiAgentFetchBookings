@@ -8,7 +8,7 @@ import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applySecurityHeaders } from './lib/http.js';
 import { buildHandlers } from './lib/runtime.js';
-import { parseArgs, portInUseMessage } from './lib/cli.js';
+import { isAllowedHost, parseArgs, portInUseMessage } from './lib/cli.js';
 
 let options;
 try {
@@ -62,6 +62,10 @@ async function serveStatic(pathname, res) {
 
 async function handle(req, res) {
   applySecurityHeaders(res);
+  if (!isAllowedHost(req.headers.host, PORT)) {
+    res.statusCode = 421; // Misdirected Request: not addressed to this loopback server
+    return res.end('Misdirected request');
+  }
   let pathname;
   try {
     pathname = new URL(req.url, 'http://localhost').pathname;

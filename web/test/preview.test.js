@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
-import { buildPreview, wrapModule } from '../preview.js';
+import { buildPreview, embedJson, wrapModule } from '../preview.js';
 
 const page = await buildPreview();
 
@@ -32,4 +32,34 @@ test('wrapModule rewrites imports and exports', () => {
   assert.match(out, /const R = __mod_render;/);
   assert.match(out, /return \{ a, f, C \};/);
   assert.throws(() => wrapModule('y', "export default 1;\n"), /unsupported/);
+});
+
+test('the build works the same from a CRLF checkout', async () => {
+  const { mkdtemp, mkdir, readFile, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'preview-crlf-'));
+  try {
+    const files = ['public/index.html', 'public/style.css', 'public/links.js', 'public/render.js',
+      'public/session.js', 'public/app.js', 'lib/preview-transport.js'];
+    for (const f of files) {
+      const text = await readFile(new URL('../' + f, import.meta.url), 'utf8');
+      await mkdir(join(dir, f, '..'), { recursive: true });
+      await writeFile(join(dir, f), text.replace(/\r?\n/g, '\r\n'));
+    }
+    const status = { tiles: {}, orders: [], history: [], freshness: {}, counts: {}, preview: true };
+    const lf = await buildPreview({ status });
+    const crlf = await buildPreview({ root: dir, status });
+    assert.equal(crlf, lf);
+    assert.ok(!crlf.includes('\r'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('embedded JSON escapes <, U+2028 and U+2029', () => {
+  const out = embedJson({ t: '</script><b>\u2028x\u2029' });
+  assert.ok(!out.includes('<') && !out.includes('\u2028') && !out.includes('\u2029'));
+  assert.deepEqual(JSON.parse(out), { t: '</script><b>\u2028x\u2029' });
+  assert.ok(!/[\u2028\u2029]/.test(page));
 });

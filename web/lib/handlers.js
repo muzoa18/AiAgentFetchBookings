@@ -21,8 +21,10 @@ export const STATE_FILES = {
 export const WORKFLOWS = { approve: 'approve.yml', bookings: 'bookings.yml' };
 export const RUN_COOLDOWN_MS = 30_000;
 export const LOGIN_LIMIT = { attempts: 5, windowMs: 10 * 60_000 };
-// Per instance: after this many failed logins in the window, every login waits BRAKE_DELAY_MS.
-export const BRAKE = { failures: 100, windowMs: 10 * 60_000, delayMs: 2000 };
+// Per instance: after `failures` failed logins in the window, every login waits `delayMs`, and at
+// most `maxWaiting` logins may wait at once; the rest get 429 immediately.
+export const BRAKE = { failures: 100, windowMs: 10 * 60_000, delayMs: 2000, maxWaiting: 2 };
+const TOO_MANY = 'För många försök. Vänta en stund och försök igen.';
 export const ORDER_OVERVIEW_URL = 'https://pro.meca.se/INTERSHOP/web/WFS/Mekonomen-MecaB2BSE-Site/sv_SE/-/SEK/ViewOrderOverview-Start';
 
 const NOT_CONFIGURED = 'Instrumentpanelen är inte konfigurerad';
@@ -58,6 +60,7 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false,
   const brake = createBrake({ threshold: BRAKE.failures, windowMs: BRAKE.windowMs, clock: now });
   const cookieOpts = { secure: !demo };
   const postOpts = { trustProxy };
+  let waiting = 0; // logins currently held by the brake
   const lastRun = new Map(); // workflow -> ms
 
   function configured(res) {
@@ -93,14 +96,28 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false,
     if (!configured(res)) return;
     try {
       assertDashboardPost(req, postOpts);
-      // Many failures across all clients: slow everyone down rather than lock the owner out.
-      if (brake.tripped()) await sleep(BRAKE.delayMs);
+      // Per-client limit first, so rejected requests are answered at once and cost no waiting.
       const ip = rateLimitKey(clientIp(req, { trustProxy }));
       const limit = loginLimiter.hit(ip);
-      if (!limit.allowed) {
-        return sendError(res, 429, 'För många försök. Vänta en stund och försök igen.',
-          { 'Retry-After': String(limit.retryAfterS) });
+      if (!limit.allowed) return sendError(res, 429, TOO_MANY, { 'Retry-After': String(limit.retryAfterS) });
+      // Many failures across all clients: only a couple of slow attempts at a time, the rest
+      // are turned away immediately. The owner still gets in, just slowly.
+      if (!brake.tripped()) return await checkLogin(req, res, ip);
+      if (waiting >= BRAKE.maxWaiting) return sendError(res, 429, TOO_MANY, { 'Retry-After': '2' });
+      waiting += 1;
+      try {
+        await sleep(BRAKE.delayMs);
+        return await checkLogin(req, res, ip);
+      } finally {
+        waiting -= 1;
       }
+    } catch (err) {
+      return fail(res, err);
+    }
+  }
+
+  async function checkLogin(req, res, ip) {
+    try {
       const body = await readJsonBody(req);
       assertKeys(body, ['password']);
       if (typeof body.password !== 'string' || !checkPassword(body.password, env.DASHBOARD_PASSWORD, env.SESSION_SECRET)) {

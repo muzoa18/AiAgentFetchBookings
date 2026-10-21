@@ -3,11 +3,15 @@
 export const ALLOWED_LINK_HOSTS = Object.freeze([
   'meca.promeisterportal.com', // booking detail pages
   'pro.meca.se', // Orderöversikt
-  'github.com', // Actions page
 ]);
+// Only for the "se Actions" link after a run is started, never for data from the state files.
+const GITHUB_HOST = 'github.com';
 
-/** The normalised URL when it is https, has no userinfo or port, and its host is allow-listed; otherwise null. */
-export function safeHref(value) {
+/**
+ * The normalised URL when it is https, has no userinfo or port, and its host is allow-listed;
+ * otherwise null. github.com passes only with { allowGithub: true }.
+ */
+export function safeHref(value, { allowGithub = false } = {}) {
   if (typeof value !== 'string' || value.length > 500) return null;
   let u;
   try {
@@ -16,6 +20,7 @@ export function safeHref(value) {
     return null;
   }
   if (u.protocol !== 'https:' || u.username || u.password || u.port) return null;
-  if (!ALLOWED_LINK_HOSTS.includes(u.hostname.toLowerCase())) return null;
+  const host = u.hostname.toLowerCase();
+  if (!ALLOWED_LINK_HOSTS.includes(host) && !(allowGithub && host === GITHUB_HOST)) return null;
   return u.href;
 }

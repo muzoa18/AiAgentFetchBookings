@@ -201,7 +201,7 @@ async function onRun(event) {
       status.replaceChildren('Startad (demo). Förhandsvisningen startar ingenting på GitHub.');
       return;
     }
-    const href = R.safeHref(data.actionsUrl);
+    const href = R.safeHref(data.actionsUrl, { allowGithub: true });
     status.replaceChildren(
       'Startad – se ',
       href ? R.h(document, 'a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'link' }, 'Actions') : 'Actions',
