@@ -48,6 +48,21 @@ def error_code(exc: BaseException) -> str | None:
     return None
 
 
+# Portal error codes that are worth an automatic retry while the cart is untouched.
+TRANSIENT_CODES = ("vehicle_lost", "login", "cart_update", None)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """True for a pro.meca.se hiccup (slow page, lost session, timeout, network) rather than
+    a real problem: an unclassified PartsPortalError, the codes in TRANSIENT_CODES, any
+    Playwright error (timeouts, net::ERR_...), TimeoutError and ConnectionError."""
+    if isinstance(exc, PartsPortalError):
+        return getattr(exc, "code", None) in TRANSIENT_CODES
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return type(exc).__module__.split(".")[0] == "playwright"
+
+
 def owner_reason(exc: BaseException) -> str:
     """A short Swedish summary of a failure, safe to show the owner."""
     return OWNER_REASONS.get(error_code(exc), TECHNICAL)

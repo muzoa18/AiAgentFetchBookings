@@ -1395,9 +1395,23 @@ def test_secret_exception_text_never_reaches_telegram_when_staging(tg, step, cap
             if name == step:
                 raise PartsPortalError(f"{SECRET} at {name}")
 
-    assert parts_order.plan_and_stage(CONFIG, BOOKING, Secret(), APPROVE, confident) == "failed"
+    # wave 4: an unclassified portal error before the cart is touched is retried (blocked)
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, Secret(), APPROVE, confident) == "blocked"
     assert tg["sent"] and all(SECRET not in t for t in _all_text(tg))
     assert SECRET in caplog.text                          # the raw text still goes to the log
+
+
+@pytest.mark.parametrize("step", ["search", "read_cart"])
+def test_secret_exception_text_never_reaches_telegram_when_failing(tg, step, caplog):
+    class Secret(FakePortal):
+        def _record(self, name, *args):
+            self.calls.append((name, *args))
+            if name == step:
+                raise ValueError(f"{SECRET} at {name}")
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, Secret(), APPROVE, confident) == "failed"
+    assert tg["sent"] and all(SECRET not in t for t in _all_text(tg))
+    assert SECRET in caplog.text
 
 
 @pytest.mark.parametrize("step", ["login", "read_cart", "checkout"])
@@ -1546,3 +1560,144 @@ def test_lost_vehicle_detected_by_text_fallback_also_stops(tg):
     assert [c[1] for c in portal.calls if c[0] == "add_to_cart"] == ["s1"]
     assert "Inte försökt: Oljefilter, Oljepluggspackning, Luftfilter, Tändstift." in tg["sent"][0]
     assert "Inget lades i varukorgen." in tg["sent"][0]
+
+
+
+# ── Wave 4: transient pro.meca.se errors before the cart is touched are retried ─
+
+TRANSIENT_TEXT = ("Delbeställning för OLRD-0001: pro.meca.se svarade inte som väntat – inget "
+                  "lades i varukorgen. Jag försöker igen vid nästa körning.")
+
+
+class PlaywrightTimeout(Exception):
+    """Stands in for playwright.sync_api.TimeoutError (matched by its module)."""
+
+
+PlaywrightTimeout.__module__ = "playwright._impl._errors"
+
+
+class Flaky(FakePortal):
+    """Raises `exc` on the n-th call of `step` (1-based)."""
+
+    def __init__(self, step, exc, nth=1, **kw):
+        super().__init__(catalogue=FIVE_CATALOGUE, **kw)
+        self.step, self.exc, self.nth, self.seen = step, exc, nth, 0
+        self.cleared = []
+
+    def _record(self, name, *args):
+        self.calls.append((name, *args))
+        if name == self.step:
+            self.seen += 1
+            if self.seen == self.nth:
+                raise self.exc
+
+    def clear_cart(self, reg_nr=None):
+        self.cleared.append(reg_nr)
+        raise AssertionError("never cleared")
+
+
+def _assert_transient_block(tg, portal):
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"
+    assert rec["plan"]["reason"] == parts_order.TRANSIENT_REASON == "pro.meca.se svarade inte som väntat"
+    assert rec.get("cart_touched") is False
+    assert "add_to_cart" not in portal.names() and portal.cleared == []
+    assert tg["buttons"] == []
+    assert rec["klar_message_id"] == _klar_only(tg, TRANSIENT_TEXT)
+
+
+@pytest.mark.parametrize("step,exc,nth", [
+    ("login", PartsPortalError("login to pro.meca.se failed", "login"), 1),
+    ("search", PartsPortalError("vehicle AJZ167 is no longer loaded after searching",
+                                "vehicle_lost"), 3),               # the live case
+    ("search", PlaywrightTimeout("Timeout 30000ms exceeded"), 2),
+    ("load_vehicle", PartsPortalError("vehicle X could not be loaded on pro.meca.se"), 1),
+    ("read_cart", PartsPortalError("SECRET-PAGE-TEXT not the cart page"), 1),
+    ("search", TimeoutError("timed out"), 1),
+    ("search", ConnectionError("reset"), 4),
+    ("search", PartsPortalError("x", "cart_update"), 1),
+])
+def test_transient_error_before_the_cart_is_blocked_for_a_retry(tg, step, exc, nth):
+    portal = Flaky(step, exc, nth)
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_transient_block(tg, portal)
+    assert orders_state.restage("B1") is True       # retried quietly on the next run
+
+
+def test_transient_retry_failing_the_same_way_is_silent_then_succeeds(tg):
+    lost = PartsPortalError("vehicle lost", "vehicle_lost")
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, Flaky("search", lost, 3), APPROVE,
+                                      confident) == "blocked"
+    assert len(tg["sent"]) == 1
+
+    assert orders_state.restage("B1") is True
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, Flaky("search", lost, 2), APPROVE,
+                                      confident) == "blocked"
+    assert len(tg["sent"]) == 1                      # same reason: nothing new
+    assert orders_state.get("B1")["tries"] == 1
+
+    assert orders_state.restage("B1") is True
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, NoClearPortal(), APPROVE,
+                                      confident) == "pending"
+    (text, buttons), = tg["buttons"]
+    assert buttons == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+    assert len(tg["sent"]) == 1
+
+
+def test_transient_retries_stop_at_the_cap_with_one_give_up(tg):
+    lost = PartsPortalError("vehicle lost", "vehicle_lost")
+    parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, Flaky("login", lost), APPROVE, confident)
+    for _ in range(orders_state.MAX_TRIES):
+        assert orders_state.restage("B1") is True
+        parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, Flaky("login", lost), APPROVE, confident)
+
+    assert orders_state.restage("B1") is False
+    assert tg["sent"][0] == TRANSIENT_TEXT
+    assert tg["sent"][1:] == [GIVE_UP]
+
+
+def test_error_after_the_first_add_keeps_the_partial_cart_behaviour(tg):
+    portal = Flaky("read_cart", PartsPortalError("vehicle lost", "vehicle_lost"), nth=2)
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "failed"
+
+    (text,) = tg["sent"]
+    assert text.startswith("Delbeställning misslyckades för OLRD-0001: fordonet försvann")
+    assert "Det som redan ligger i varukorgen är orört." in text
+    assert portal.cleared == []
+
+
+@pytest.mark.parametrize("exc", [ValueError("SECRET-PAGE-TEXT bad"),
+                                 PartsPortalError("parts_portal username/password not configured",
+                                                  "config"),
+                                 PartsPortalError("invalid registration number 'x'", "config"),
+                                 KeyError("plan")])
+def test_non_transient_error_before_the_cart_still_fails(tg, exc):
+    portal = Flaky("search", exc)
+
+    assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "failed"
+
+    assert orders_state.get("B1")["status"] == "failed"
+    assert tg["sent"][0].startswith("Delbeställning misslyckades för OLRD-0001")
+
+
+def test_matching_problems_are_not_transient(tg):
+    portal = FakePortal(catalogue=NO_AIR)
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+    assert orders_state.get("B1")["plan"]["reason"] == AIR_REASON
+
+
+def test_is_transient_classification():
+    from parts_order_helpers import is_transient
+    assert is_transient(PartsPortalError("x", "vehicle_lost"))
+    assert is_transient(PartsPortalError("x", "login"))
+    assert is_transient(PartsPortalError("x", "cart_update"))
+    assert is_transient(PartsPortalError("unclassified"))
+    assert is_transient(PlaywrightTimeout("t"))
+    assert is_transient(TimeoutError()) and is_transient(ConnectionResetError())
+    for exc in (PartsPortalError("x", "config"), PartsPortalError("x", "not_linked"),
+                PartsPortalError("x", "in_cart"), ValueError("x"), RuntimeError("x"),
+                OSError("disk"), KeyError("k")):
+        assert not is_transient(exc), exc

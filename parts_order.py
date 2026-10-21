@@ -36,8 +36,8 @@ import notifier
 import orders_state
 from parts_matcher import choose, is_fluid, search_terms
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
-                                 order_body, owner_reason, parse_qty, prepare_section,
-                                 total_problem)
+                                 is_transient, order_body, owner_reason, parse_qty,
+                                 prepare_section, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -47,6 +47,11 @@ GIVE_UP_TEXT = "Försöker inte mer automatiskt för {label} – beställ för h
 KLAR_FALLBACK = "\n(Klar-knappen kunde inte skickas – markera bokningen som Hanterad i portalen.)"
 
 PARTIAL_REASON = "kunde inte lägga alla delar i varukorgen"
+# A pro.meca.se hiccup before anything was added: blocked (not failed), so
+# orders_state.restage retries it quietly on the next run (stable text = quiet repeats).
+TRANSIENT_REASON = "pro.meca.se svarade inte som väntat"
+TRANSIENT_TEXT = ("Delbeställning för {label}: pro.meca.se svarade inte som väntat – inget "
+                  "lades i varukorgen. Jag försöker igen vid nästa körning.")
 PARTIAL_PROMISE = ("Delarna som lades till ligger kvar orörda i varukorgen på pro.meca.se – "
                    "komplettera för hand.")
 PARTIAL_PROMISE_CHECK = ("Det som redan ligger i varukorgen är orört – kontrollera antalet "
@@ -251,7 +256,13 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
         status = _stage(config, booking, portal, rules, picker)
     except Exception as e:
         log.exception("Parts ordering failed for %s", booking_id)
-        return _fail(config, booking_id, label, owner_reason(e))
+        if not (is_transient(e) and not _cart_touched(booking_id)):
+            return _fail(config, booking_id, label, owner_reason(e))
+        try:
+            status = _block_transient(config, booking)
+        except Exception:
+            log.exception("Could not record the transient block for %s", booking_id)
+            return _fail(config, booking_id, label, owner_reason(e))
     if status == "blocked":
         try:
             if give_up_if_capped(config, booking) is False:
@@ -260,6 +271,14 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
             log.exception("Give-up check failed for %s", booking_id)
             return "failed"
     return status
+
+
+def _block_transient(config: dict, booking: dict) -> str:
+    """Block (for a quiet automatic retry) after a pro.meca.se hiccup; nothing is in the cart."""
+    record = orders_state.get(booking["id"]) or {}
+    quiet_reason = record.get("last_reason") if record.get("tries") else None
+    return _block(config, booking, TRANSIENT_REASON, split_lines(booking)[1],
+                  text=TRANSIENT_TEXT.format(label=_label(booking)), quiet_reason=quiet_reason)
 
 
 def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:

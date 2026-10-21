@@ -179,7 +179,7 @@ class PartsPortal:
         user = str(creds.get("username") or "").strip()
         password = str(creds.get("password") or "")
         if not user or not password.strip():
-            raise PartsPortalError("parts_portal username/password not configured")
+            raise PartsPortalError("parts_portal username/password not configured", "config")
         self.page.goto(START_URL, timeout=NAV_TIMEOUT)
         self._settle()
         if self._logged_in and self._count(SEL_LOGIN_USER) == 0 and self._count(SEL_LOGOUT) > 0:
@@ -200,7 +200,7 @@ class PartsPortal:
     def load_vehicle(self, reg_nr: str) -> None:
         reg = normalise_reg(reg_nr)
         if not re.fullmatch(r"[A-Z0-9]{2,8}", reg):
-            raise PartsPortalError(f"invalid registration number {reg_nr!r}")
+            raise PartsPortalError(f"invalid registration number {reg_nr!r}", "config")
         if not self._logged_in:
             raise PartsPortalError("not logged in", "login")
         self._reg, self._last_search = None, None

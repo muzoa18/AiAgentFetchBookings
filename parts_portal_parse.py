@@ -28,7 +28,7 @@ class PartsPortalError(Exception):
     """pro.meca.se did not behave as expected; nothing beyond the failing step was done.
 
     `code` names the kind of failure for callers (never shown raw to the owner):
-    not_linked, in_cart, cart_update, vehicle_lost, login; None = other."""
+    not_linked, in_cart, cart_update, vehicle_lost, login, config; None = other."""
 
     def __init__(self, message: str = "", code: str | None = None):
         super().__init__(message)
