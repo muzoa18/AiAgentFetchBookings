@@ -581,3 +581,32 @@ def test_pick_system_mentions_brand_order_and_same_part():
     text = parts_matcher.PICK_SYSTEM.lower()
     assert "already ordered by brand preference" in text
     assert "same part" in text
+
+
+# ── Follow-up: English fluid keywords match whole words only ─────────────────
+
+@pytest.mark.parametrize("name", [
+    "Ignition coil Bosch", "Bosch Ignition coil", "Coil", "Boil", "Foil", "Soil", "Tändspole coil-on-plug",
+])
+def test_english_keywords_need_whole_words(name):
+    assert not is_fluid(name)
+
+
+def test_ignition_coil_candidate_allowed():
+    coil = pcand("Ignition coil Bosch")
+    assert choose({"name": "Tändspole", "qty": 1}, [coil], RULES, recording()) is coil
+
+
+@pytest.mark.parametrize("name", [
+    "Motor oil 5W-30", "Engine Oil", "Oils", "Gear oil", "Motorolja", "Växellådsolja", "Bromsvätska DOT4",
+    "Kylarvätska", "AdBlue 10L", "AdBlue10L", "Brake fluid", "Washer fluid", "Fluids", "Grease",
+    "Coolant", "Antifreeze", "Lubricant", "Smörjfett", "Kullagerfett", "Fett",
+])
+def test_fluids_still_detected_after_word_boundaries(name):
+    assert is_fluid(name)
+
+
+def test_fettinsats_is_still_treated_as_a_fluid():
+    # Documented decision (fail closed): Swedish "fett" stays a substring match, so
+    # "Fettinsats" (grease insert/cartridge? not certain) keeps blocking.
+    assert is_fluid("Fettinsats")

@@ -15,12 +15,18 @@ MIN_CONFIDENCE = 0.8
 # Hard-coded in addition to rules.brand_forbid, so clearing the rules file can never allow it.
 ALWAYS_FORBIDDEN = ("promeister",)
 
-# Lowercase substrings marking fluids/consumables we never auto-order. Extend as needed.
+# Swedish stems: lowercase SUBSTRINGS, because Swedish compounds them ("motorolja",
+# "växellådsolja", "spolarvätska", "smörjfett"). "fett" stays a substring on purpose (fail
+# closed): "Fettinsats" therefore still counts as a fluid. Extend as needed.
 FLUID_KEYWORDS = (
-    "olja", "oil", "bromsvätska", "brake fluid", "kylarvätska", "coolant", "frostskydd",
-    "antifreeze", "glykol", "spolarvätska", "washer fluid", "adblue", "vätska", "fluid",
-    "oljor", "fett", "grease", "lubricant", "smörj", "glysantin", "kylvätska",
+    "olja", "bromsvätska", "kylarvätska", "frostskydd", "glykol", "spolarvätska", "vätska",
+    "oljor", "fett", "smörj", "glysantin", "kylvätska",
 )
+# English keywords: WHOLE WORDS only (optional plural "s"), so "Ignition coil", "foil",
+# "boil" and "soil" are not fluids. Covers "brake fluid", "washer fluid", "engine oil".
+# Bounded by non-letters, so digits may touch ("AdBlue10L").
+FLUID_WORDS = ("oil", "fluid", "grease", "lubricant", "coolant", "antifreeze", "adblue")
+_FLUID_WORD = re.compile(r"(?<![^\W\d_])(?:" + "|".join(FLUID_WORDS) + r")s?(?![^\W\d_])")
 # Patterns for fluids with no generic keyword: viscosity grades, brake fluid grades, ATF.
 FLUID_PATTERNS = (r"\b\d{1,2}w-?\d{2,3}\b", r"\bdot ?[345]\b", r"\batf\b")
 # Words containing "filter" (oljefilter, oil filter, pollenfilter) are parts, not fluids.
@@ -44,7 +50,8 @@ PICK_SYSTEM = (
 
 def is_fluid(name: str) -> bool:
     text = _FILTER_WORD.sub(" ", str(name).lower())
-    return any(k in text for k in FLUID_KEYWORDS) or any(re.search(p, text) for p in FLUID_PATTERNS)
+    return (any(k in text for k in FLUID_KEYWORDS) or bool(_FLUID_WORD.search(text))
+            or any(re.search(p, text) for p in FLUID_PATTERNS))
 
 
 def _norm(value) -> str:
