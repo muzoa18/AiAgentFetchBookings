@@ -14,7 +14,9 @@ Workflow (runs once a day on GitHub Actions; see .github/workflows/):
      portal's browser never overlaps the MECA portal's Hanterad browser.
 
 If a Telegram message fails, the booking stays unseen (retried next run),
-Hanterad is skipped and run() returns exit code 1. A parts order ending
+Hanterad is skipped and run() returns exit code 1. A Bokning whose Hanterad
+does not succeed is reported to the owner and makes run() return 1; a seen
+Bokning still on the Nya tab with no order record gets one Hanterad retry. A parts order ending
 "failed" (or an invalid rules file) also makes run() return 1.
 
 Crash recovery: a booking is queued in config/orders.json right after its
@@ -93,9 +95,10 @@ def run() -> int:
         return 1 if swept_failed else 0
 
     log.info("Found %d new booking(s) to process.", len(bookings))
-    new_count     = 0
-    notify_failed = 0
-    to_order      = []
+    new_count      = 0
+    notify_failed  = 0
+    handled_failed = 0
+    to_order       = []
 
     for booking in bookings:
         booking_id   = booking.get("id", "unknown")
@@ -108,6 +111,12 @@ def run() -> int:
                     "PENDING %s %s — no Hanterad button, still needs manual action in portal: %s",
                     booking_type, booking_id, detail_url
                 )
+            elif booking_type == "Bokning" and detail_url and _no_order_record(booking_id):
+                # Still on the Nya tab although notified earlier: an earlier Hanterad
+                # failed. Retry once; no re-notify, nothing re-queued.
+                log.info("Already notified: %s — still listed, retrying Hanterad.", booking_id)
+                if not _mark_handled(config, booking, retry=True):
+                    handled_failed += 1
             else:
                 log.info("Already handled: %s — skipping.", booking_id)
             continue
@@ -147,38 +156,62 @@ def run() -> int:
             log.warning("No detail URL for %s.", booking_id)
             continue
 
-        log.info("Marking %s as Hanterad ...", booking_id)
-        try:
-            handled_ok = mark_booking_handled(config, detail_url)
-        except Exception:
-            log.exception("Marking %s as Hanterad raised.", booking_id)
-            handled_ok = False
-
-        if handled_ok is True:
-            log.info("=" * 50)
-            log.info("Booking %s CONFIRMED as Hanterad.", booking_id)
-            log.info("=" * 50)
-        else:
-            log.warning(
-                "Could not mark %s as Hanterad. "
-                "Handle manually at: %s", booking_id, detail_url
-            )
+        if not _mark_handled(config, booking):
+            handled_failed += 1
 
     save_seen_ids(seen_ids)
 
     orders_staged, orders_failed = _order_parts(config, to_order)
     orders_failed += swept_failed
 
-    log.info("Done. Sent %d new notification(s), %d failed. Orders staged %d, failed %d.",
-             new_count, notify_failed, orders_staged, orders_failed)
+    log.info("Done. Sent %d new notification(s), %d failed. Orders staged %d, failed %d. "
+             "Hanterad failed %d.",
+             new_count, notify_failed, orders_staged, orders_failed, handled_failed)
     log_run("booking_agent", {
         "bookings_found": len(bookings),
         "notified":       new_count,
         "notify_failed":  notify_failed,
         "orders_staged":  orders_staged,
         "orders_failed":  orders_failed,
+        "handled_failed": handled_failed,
     })
-    return 1 if notify_failed or orders_failed else 0
+    return 1 if notify_failed or orders_failed or handled_failed else 0
+
+
+def _no_order_record(booking_id: str) -> bool:
+    """True only when the ordering flow has no record of this booking (it then owns it)."""
+    try:
+        return orders_state.get(booking_id) is None
+    except Exception:
+        log.exception("Order state unreadable — not retrying Hanterad for %s.", booking_id)
+        return False
+
+
+def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool:
+    """Click Hanterad for a Bokning; anything but True is reported to the owner. Returns success."""
+    booking_id = booking.get("id", "unknown")
+    detail_url = booking.get("detail_url", "")
+    log.info("Marking %s as Hanterad%s ...", booking_id, " (retry)" if retry else "")
+    try:
+        handled_ok = mark_booking_handled(config, detail_url)
+    except Exception:
+        log.exception("Marking %s as Hanterad raised.", booking_id)
+        handled_ok = False
+
+    if handled_ok is True:
+        log.info("=" * 50)
+        log.info("Booking %s CONFIRMED as Hanterad%s.", booking_id, " (retry)" if retry else "")
+        log.info("=" * 50)
+        return True
+
+    log.warning("Could not mark %s as Hanterad (%s). Handle manually at: %s",
+                booking_id, handled_ok, detail_url)
+    nr = booking.get("booking_nr") or booking_id
+    text = (f"Kunde inte markera bokning {nr} som Hanterad i portalen – "
+            f"gör det för hand: {detail_url}")
+    if not send_message(config, text):
+        log.error("Hanterad-failure message for %s was not delivered.", booking_id)
+    return False
 
 
 def _sweep_stale_orders(config: dict) -> int:

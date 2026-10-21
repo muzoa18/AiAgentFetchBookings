@@ -741,7 +741,26 @@ def _click_hanterad(page) -> bool:
     return True
 
 
-def mark_booking_handled(config: dict, detail_url: str) -> bool:
+# Whitespace-tolerant exact words: the live button text is " Hanterad " (icon + spaces).
+HANTERAD_TEXT = re.compile(r"^\s*Hanterad\s*$", re.IGNORECASE)
+BEKRAFTA_TEXT = re.compile(r"^\s*Bekräfta\s*$", re.IGNORECASE)
+
+
+def _visible_button_labels(page) -> list[str]:
+    """Short, deduplicated labels of the visible buttons (diagnostics only)."""
+    try:
+        texts = page.locator("button:visible").all_inner_texts()
+    except Exception:
+        return []
+    labels = []
+    for text in texts:
+        label = " ".join((text or "").split())[:30]
+        if label and label not in labels:
+            labels.append(label)
+    return labels[:20]
+
+
+def mark_booking_handled(config: dict, detail_url: str) -> bool | None:
     """
     Open a fresh browser session, navigate directly to the booking
     detail page, and click Hanterad → Bekräfta.
@@ -799,50 +818,58 @@ def mark_booking_handled(config: dict, detail_url: str) -> bool:
             # Wait for page JS to fully initialise before interacting
             page.wait_for_timeout(1000)
 
-            # Locate the Hanterad action button (exact text, excludes "Hanterad 37" tab)
-            hanterad_btn = page.locator("button, a").filter(
-                has_text=re.compile(r"^Hanterad$", re.IGNORECASE)
-            )
-            if hanterad_btn.count() == 0:
+            # The action button is <button data-btntype="Status"> Hanterad </button>,
+            # built asynchronously. Buttons only: the "Hanterad 37" tab is a link.
+            any_btn = page.locator("button").filter(has_text=HANTERAD_TEXT)
+            try:
+                any_btn.first.wait_for(state="visible", timeout=10_000)
+            except PWTimeout:
                 # Normal for Förfrågan/Offert — no action button exists
-                log.info("Hanterad button not present — booking is likely a Förfrågan or Offert.")
+                log.info("Hanterad button not present — booking is likely a Förfrågan or Offert. "
+                         "Visible buttons: %s", _visible_button_labels(page))
                 return None
+            preferred = page.locator("button[data-btntype='Status']").filter(has_text=HANTERAD_TEXT)
+            hanterad_btn = preferred if preferred.count() else any_btn
 
             # Use Playwright native click so pointer/mouse events fire correctly
             hanterad_btn.first.scroll_into_view_if_needed()
             hanterad_btn.first.click()
             log.info("Hanterad button clicked (native).")
 
-            # Wait for confirmation dialog
-            page.wait_for_timeout(1500)
+            # Dialog "Vill du ändra status till Hanterad": click exactly "Bekräfta" —
+            # never "Skicka bekräftelse" (mails the customer), "Avboka" or "Avbryt".
+            confirm = page.locator("button:visible").filter(has_text=BEKRAFTA_TEXT)
             try:
-                page.wait_for_selector("button:has-text('Bekräfta')", timeout=6_000)
+                confirm.first.wait_for(state="visible", timeout=6_000)
             except PWTimeout:
                 Path("logs").mkdir(exist_ok=True)
                 page.screenshot(path="logs/bekrafta_not_found.png")
-                log.warning("Bekräfta dialog did not appear. Screenshot: logs/bekrafta_not_found.png")
+                log.warning("Bekräfta dialog did not appear. Visible buttons: %s. "
+                            "Screenshot: logs/bekrafta_not_found.png", _visible_button_labels(page))
+                return False
+            n_confirm = confirm.count()
+            if n_confirm != 1:
+                log.warning("Expected exactly one Bekräfta button, found %d — not clicking. "
+                            "Visible buttons: %s", n_confirm, _visible_button_labels(page))
                 return False
 
             # Native click on Bekräfta
-            page.click("button:has-text('Bekräfta')")
+            confirm.first.click()
             log.info("Bekräfta clicked (native).")
             page.wait_for_load_state("networkidle", timeout=8_000)
             page.wait_for_timeout(1000)
 
-            # Verification: Hanterad button should be gone after successful confirmation
+            # Verification: success only when the Hanterad action button is gone.
             Path("logs").mkdir(exist_ok=True)
             page.screenshot(path="logs/hanterad_confirmed.png")
-            still_present = page.locator("button, a").filter(
-                has_text=re.compile(r"^Hanterad$", re.IGNORECASE)
-            ).count()
-            if still_present == 0:
-                log.info("Hanterad confirmed — action button gone. Screenshot: logs/hanterad_confirmed.png")
-            else:
-                log.warning(
-                    "Hanterad button still visible after Bekräfta — "
-                    "action may not have completed. Check logs/hanterad_confirmed.png"
-                )
-
+            remaining = page.locator("button:visible").filter(has_text=HANTERAD_TEXT)
+            try:
+                remaining.first.wait_for(state="hidden", timeout=8_000)
+            except PWTimeout:
+                log.warning("Hanterad button still visible after Bekräfta — status not changed. "
+                            "Check logs/hanterad_confirmed.png")
+                return False
+            log.info("Hanterad confirmed — action button gone. Screenshot: logs/hanterad_confirmed.png")
             return True
 
         except Exception as e:

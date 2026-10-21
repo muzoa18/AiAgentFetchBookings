@@ -115,7 +115,7 @@ def test_notify_failure_does_not_mark_seen(env):
     assert "B1" not in (env["saved"] or set())
     assert env["handled"] == []
     assert env["logged"] == {"bookings_found": 1, "notified": 0, "notify_failed": 1,
-                             "orders_staged": 0, "orders_failed": 0}
+                             "orders_staged": 0, "orders_failed": 0, "handled_failed": 0}
 
 
 def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
@@ -127,7 +127,7 @@ def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
     assert len(env["sent"]) == 3
     assert env["handled"] == ["http://x/B1"]
     assert env["logged"] == {"bookings_found": 3, "notified": 3, "notify_failed": 0,
-                             "orders_staged": 1, "orders_failed": 0}
+                             "orders_staged": 1, "orders_failed": 0, "handled_failed": 0}
 
 
 def test_already_seen_booking_is_not_resent(env):
@@ -137,7 +137,8 @@ def test_already_seen_booking_is_not_resent(env):
     assert agent.run() == 0
 
     assert env["sent"] == []
-    assert env["handled"] == []
+    # still on the Nya tab and no orders record -> one silent Hanterad retry, no re-notify
+    assert env["handled"] == ["http://x/B1"]
 
 
 def test_no_bookings_returns_zero_and_logs(env):
@@ -210,10 +211,11 @@ def test_mark_booking_handled_raising_does_not_skip_save(env, monkeypatch):
     monkeypatch.setattr(agent, "mark_booking_handled", boom)
     env["bookings"] = [_booking("B1"), _booking("B2")]
 
-    assert agent.run() == 0
+    assert agent.run() == 1   # a failed Hanterad is reported, never silent
 
     assert env["saved"] == {"B1", "B2"}
     assert env["logged"]["notified"] == 2
+    assert env["logged"]["handled_failed"] == 2
 
 
 def test_parts_portal_import_error_fails_booking_and_run_continues(env, monkeypatch):
@@ -311,7 +313,7 @@ def test_queue_happens_even_if_hanterad_raises(env, monkeypatch):
                         lambda c, b, p, r, k: seen.append(orders_state.get(b["id"])) or "pending")
     env["bookings"] = [_booking("B1")]
 
-    assert agent.run() == 0
+    assert agent.run() == 1   # the Hanterad failure is reported
     assert seen[0]["plan"] == {"queued": True}
 
 
@@ -398,3 +400,114 @@ def test_failed_login_message_carries_portal_reason(env, monkeypatch):
     assert agent.run() == 1
     assert env["sent"] == [agent.LOGIN_FAILED_TEXT
                            + "Fel användarnamn eller lösenord (portalen avvisade inloggningen)"]
+
+
+
+# ── Hanterad failures are reported; seen Bokningar still listed are retried ──
+
+HANDLED_FAILED = "Kunde inte markera bokning OLRD-3630 som Hanterad i portalen – gör det för hand: http://x/{}"
+
+
+def _handled_returns(env, monkeypatch, result):
+    def fake_handled(config, url):
+        env["handled"].append(url)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(agent, "mark_booking_handled", fake_handled)
+
+
+def _no_parts(bid, btype="Bokning"):
+    return {**_booking(bid, btype), "parts": [], "fluids": []}
+
+
+def test_hanterad_true_sends_no_extra_message(env):
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 0
+    assert len(env["sent"]) == 1
+    assert env["logged"]["handled_failed"] == 0
+
+
+@pytest.mark.parametrize("result", [None, False, RuntimeError("browser crashed")])
+def test_hanterad_not_true_is_reported_once_and_exits_1(env, monkeypatch, result):
+    _handled_returns(env, monkeypatch, result)
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 1
+
+    assert env["sent"][1:] == [HANDLED_FAILED.format("B1")]
+    assert env["logged"]["handled_failed"] == 1
+    assert env["saved"] == {"B1"}
+
+
+def test_hanterad_failure_message_uses_id_without_booking_nr(env, monkeypatch):
+    _handled_returns(env, monkeypatch, False)
+    env["bookings"] = [{**_no_parts("B1"), "booking_nr": ""}]
+
+    assert agent.run() == 1
+    assert env["sent"][1] == ("Kunde inte markera bokning B1 som Hanterad i portalen – "
+                              "gör det för hand: http://x/B1")
+
+
+def test_hanterad_failure_message_undeliverable_still_exits_1(env, monkeypatch):
+    _handled_returns(env, monkeypatch, None)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_no_parts("B1")]
+    env["send_ok"] = False
+
+    assert agent.run() == 1
+    assert env["logged"]["handled_failed"] == 1
+
+
+def test_forfragan_offert_have_no_hanterad_attempt_or_message(env):
+    env["bookings"] = [_no_parts("F1", "Förfrågan"), _no_parts("O1", "Offert")]
+
+    assert agent.run() == 0
+    assert env["handled"] == []
+    assert len(env["sent"]) == 2
+
+
+def test_seen_bokning_still_listed_is_retried_once_silently(env, caplog):
+    caplog.set_level("INFO")
+    env["seen"] = {"B1"}
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 0
+
+    assert env["handled"] == ["http://x/B1"]
+    assert env["sent"] == []
+    assert env["staged"] == []
+    assert orders_state.get("B1") is None
+    assert "Booking B1 CONFIRMED as Hanterad (retry)" in caplog.text
+
+
+def test_seen_bokning_retry_failure_is_reported(env, monkeypatch):
+    _handled_returns(env, monkeypatch, None)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_no_parts("B1")]
+
+    assert agent.run() == 1
+
+    assert env["handled"] == ["http://x/B1"]
+    assert env["sent"] == [HANDLED_FAILED.format("B1")]
+    assert env["logged"]["handled_failed"] == 1
+
+
+def test_seen_bokning_with_orders_record_is_left_to_ordering(env):
+    orders_state.put("B1", "pending", plan={"booking_id": "B1"})
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+    assert env["handled"] == []
+    assert env["sent"] == []
+
+
+def test_seen_forfragan_offert_are_not_retried(env):
+    env["seen"] = {"F1", "O1"}
+    env["bookings"] = [_no_parts("F1", "Förfrågan"), _no_parts("O1", "Offert")]
+
+    assert agent.run() == 0
+    assert env["handled"] == [] and env["sent"] == []

@@ -462,3 +462,183 @@ def test_mark_booking_handled_false_on_rejected_auth_without_clicking(fake_pw, c
     assert ("wait_for_url",) not in page.actions
     assert "Fel användarnamn eller lösenord" in caplog.text
     assert "SECRET-TOKEN" not in caplog.text
+
+
+# ── Hanterad button on the booking detail page ───────────────────────────────
+# Live markup: <button type="button" class="btn btn-fill btn-info icon-btn common-btn"
+#   data-btntype="Status"> <i class="tim-icons "></i>Hanterad </button>
+# Its text has whitespace around the word, so r"^Hanterad$" never matched.
+
+import re  # noqa: E402
+
+OLD_HANTERAD = re.compile(r"^Hanterad$", re.IGNORECASE)
+DETAIL = "https://meca.promeisterportal.com/Booking/BookingInfo?BookingID=1678702"
+
+
+class FakeButton:
+    def __init__(self, raw, tag="button", attrs=None, appear_after=0, on_click=None):
+        self.raw, self.tag, self.attrs = raw, tag, dict(attrs or {})
+        self.appear_after, self.on_click = appear_after, on_click
+
+
+class FakeLocator:
+    """Applies has_text regexes to the RAW text, the way the live page exposed it."""
+
+    def __init__(self, page, selector, regex=None):
+        self.page, self.selector, self.regex = page, selector, regex
+
+    def filter(self, has_text):
+        return FakeLocator(self.page, self.selector, has_text)
+
+    def _all(self):
+        tags = {"button"} | ({"a"} if ", a" in self.selector else set())
+        found = [b for b in self.page.buttons if b.tag in tags]
+        if "[data-btntype='Status']" in self.selector:
+            found = [b for b in found if b.attrs.get("data-btntype") == "Status"]
+        if ":visible" in self.selector:
+            found = [b for b in found if self.page.visible(b)]
+        if self.regex is not None:
+            found = [b for b in found if self.regex.search(b.raw)]
+        return found
+
+    def count(self):
+        return len(self._all())
+
+    @property
+    def first(self):
+        return self
+
+    def all_inner_texts(self):
+        return [" ".join(b.raw.split()) for b in self._all()]
+
+    def wait_for(self, state="visible", timeout=30_000):
+        self.page.waits.append((self.regex.pattern if self.regex else self.selector, state))
+        for _ in range(int(timeout / 250) + 1):
+            shown = [b for b in self._all() if self.page.visible(b)]
+            if (state == "visible" and shown) or (state == "hidden" and not shown):
+                return
+            self.page.tick += 1
+        raise portal_scraper.PWTimeout(f"wait_for {state} timed out")
+
+    def scroll_into_view_if_needed(self):
+        pass
+
+    def click(self):
+        shown = [b for b in self._all() if self.page.visible(b)]
+        assert shown, "click on a missing element"
+        button = shown[0]
+        self.page.clicked.append(" ".join(button.raw.split()))
+        if button.on_click:
+            button.on_click(self.page)
+
+
+class HanteradPage(FakePage):
+    """Logs in (Success true), then the detail route shows self.detail_buttons."""
+
+    def __init__(self, detail_buttons):
+        super().__init__(*LOGIN_PAGE)
+        self.routes[LOGIN_URL] = LOGIN_PAGE
+        self.auth_body = {"Success": True}
+        self.after_submit = (BOOKING_URL, {}, "Nya")
+        self.detail_buttons = detail_buttons
+        self.buttons, self.clicked, self.waits, self.tick = [], [], [], 0
+
+    def goto(self, url, **kw):
+        super().goto(url, **kw)
+        if url == DETAIL:
+            self._set((DETAIL, {}, "Bokning"))
+            self.buttons = list(self.detail_buttons)
+
+    def visible(self, button):
+        return button in self.buttons and self.tick >= button.appear_after
+
+    def locator(self, sel):
+        self.actions.append(("locator", sel))
+        return FakeLocator(self, sel)
+
+    def screenshot(self, path):
+        self.screenshots.append(path)
+
+
+def _open_dialog(*labels, then_remove_hanterad=True):
+    def on_hanterad(page):
+        def on_confirm(p):
+            if then_remove_hanterad:
+                p.buttons = [b for b in p.buttons if not re.search(r"^\s*Hanterad\s*$", b.raw)]
+            p.buttons = [b for b in p.buttons if b not in dialog]
+        dialog = [FakeButton(f" {label} ", on_click=on_confirm if label == "Bekräfta" else None)
+                  for label in labels]
+        page.buttons = page.buttons + dialog
+    return on_hanterad
+
+
+def _detail_buttons(on_hanterad=None, appear_after=0):
+    return [
+        FakeButton(" Skicka bekräftelse "),
+        FakeButton(" Anteckning "),
+        FakeButton(" Avboka "),
+        FakeButton("Hanterad 37", tag="a"),
+        FakeButton(" \n Hanterad ", attrs={"data-btntype": "Status"},
+                   appear_after=appear_after, on_click=on_hanterad or _open_dialog("Bekräfta", "Avbryt")),
+    ]
+
+
+def test_old_regex_misses_live_markup_new_one_matches():
+    page = HanteradPage([])
+    page.buttons = [FakeButton(" \n Hanterad ", attrs={"data-btntype": "Status"}),
+                    FakeButton("Hanterad 37", tag="a")]
+    assert page.locator("button, a").filter(has_text=OLD_HANTERAD).count() == 0
+    assert page.locator("button, a").filter(has_text=portal_scraper.HANTERAD_TEXT).count() == 1
+    assert page.locator("button").filter(has_text=portal_scraper.HANTERAD_TEXT).count() == 1
+
+
+def test_only_real_hanterad_and_bekrafta_are_clicked(fake_pw):
+    page = HanteradPage(_detail_buttons())
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is True
+    assert page.clicked == ["Hanterad", "Bekräfta"]
+
+
+def test_button_appearing_after_a_delay_is_waited_for(fake_pw):
+    page = HanteradPage(_detail_buttons(appear_after=1))
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is True
+    assert page.clicked == ["Hanterad", "Bekräfta"]
+
+
+def test_button_never_appearing_returns_none_and_logs_labels(fake_pw, caplog):
+    caplog.set_level("INFO")
+    page = HanteradPage([b for b in _detail_buttons() if b.tag == "a" or "Hanterad" not in b.raw])
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is None
+    assert page.clicked == []
+    assert "Skicka bekräftelse" in caplog.text and "Avboka" in caplog.text
+
+
+def test_two_bekrafta_buttons_return_false_without_clicking(fake_pw):
+    page = HanteradPage(_detail_buttons(_open_dialog("Bekräfta", "Bekräfta", "Avbryt")))
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is False
+    assert page.clicked == ["Hanterad"]
+
+
+def test_dialog_without_bekrafta_returns_false(fake_pw):
+    page = HanteradPage(_detail_buttons(_open_dialog("Avbryt")))
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is False
+    assert page.clicked == ["Hanterad"]
+
+
+def test_hanterad_still_present_after_confirm_returns_false(fake_pw, caplog):
+    page = HanteradPage(_detail_buttons(_open_dialog("Bekräfta", "Avbryt",
+                                                     then_remove_hanterad=False)))
+    fake_pw(page)
+
+    assert portal_scraper.mark_booking_handled(CONFIG, DETAIL) is False
+    assert page.clicked == ["Hanterad", "Bekräfta"]
+    assert "still visible" in caplog.text
