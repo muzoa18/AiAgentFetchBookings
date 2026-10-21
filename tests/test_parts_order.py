@@ -3,7 +3,7 @@ import pytest
 import notifier
 import orders_state
 import parts_order
-from parts_order_helpers import build_summary, parse_qty
+from parts_order_helpers import build_summary, cart_problem, parse_qty
 from rules import Rules
 
 CONFIG = {"telegram": {"bot_token": "123:ABC", "chat_id": "42"}}
@@ -668,3 +668,61 @@ def test_execute_order_login_exception_says_nothing_ordered(tg):
 
     assert orders_state.get("B1")["status"] == "failed"
     assert "Inget beställdes" in tg["sent"][0]
+
+
+# ── Final review: cart fluids / non-Latin lines, empty cart at execute time ──
+
+GOOD_LINE = {"title": "Bosch Oljefilter P7001", "qty": 2, "url_or_id": "p1"}
+
+
+@pytest.mark.parametrize("bad", [
+    {"title": "Castrol Motorolja Edge 5W-30 4L", "qty": 1, "url_or_id": "oil"},
+    {"title": "Bromsvätska DOT4", "qty": 1, "url_or_id": "bf"},
+])
+def test_cart_problem_rejects_fluid_lines_even_if_expected(bad):
+    problem = cart_problem([GOOD_LINE, bad], [GOOD_LINE, bad], APPROVE)
+    assert problem is not None
+    assert bad["title"] in problem
+    assert "vätska" in problem
+
+
+@pytest.mark.parametrize("bad", [
+    {"title": "Bosch Оljefilter", "qty": 1, "url_or_id": "cy"},
+    {"title": "Oljefilter", "brand": "Bоsch", "qty": 1, "url_or_id": "cy"},
+])
+def test_cart_problem_rejects_non_latin_lines_even_if_expected(bad):
+    problem = cart_problem([GOOD_LINE, bad], [GOOD_LINE, bad], APPROVE)
+    assert problem is not None
+    assert "tecken" in problem
+
+
+def test_cart_problem_allows_filter_lines():
+    air = {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2"}
+    assert cart_problem([GOOD_LINE, air], [GOOD_LINE, air], APPROVE) is None
+
+
+def test_execute_order_empty_cart_says_order_may_already_exist(tg):
+    portal = FakePortal()
+    plan = _staged_plan(tg, portal)
+    portal.carts = [{"lines": [], "total_sek": 0.0}]
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "failed"
+
+    assert "checkout" not in portal.names()
+    assert orders_state.get("B1")["status"] == "failed"
+    assert tg["sent"] == [
+        "Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
+        "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand."]
+
+
+def test_execute_order_other_mismatch_keeps_old_text(tg):
+    portal = FakePortal()
+    plan = _staged_plan(tg, portal)
+    portal.cart = _cart(490.0, [{"title": "Bosch Oljefilter P7001", "qty": 1, "price_sek": 120.0},
+                                {"title": "Bosch Luftfilter S0123", "qty": 1, "price_sek": 250.0}])
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "failed"
+
+    (text,) = tg["sent"]
+    assert text.startswith("Beställning stoppad för OLRD-3630: varukorgen stämmer inte")
+    assert text.endswith("Inget beställdes – beställ för hand.")

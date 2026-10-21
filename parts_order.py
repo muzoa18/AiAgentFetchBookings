@@ -8,8 +8,9 @@ Fails closed: every path ends in a non-"attempted" status in orders_state plus a
 Telegram message (ordered, blocked or failed). A message that cannot be delivered
 turns blocked into "failed" so the run goes red. No exception leaves this module.
 
-The pro.meca.se account has ONE cart, so staging requires it to be empty: a second
-booking while another is pending is blocked rather than mixed into the same cart.
+pro.meca.se keeps one cart PER VEHICLE, so staging requires the loaded vehicle's cart
+to be empty: a second booking for a vehicle whose cart is in use is blocked rather than
+mixed into the same cart.
 
 Customer data (name, phone, email, booking message) is never persisted: the plan
 only holds what approval needs (orders.json is committed to git).
@@ -26,6 +27,9 @@ from parts_order_helpers import (build_summary, cart_problem, clean_fluids, orde
 from rules import Rules
 
 log = logging.getLogger(__name__)
+
+EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
+                   "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
 
 
 def split_lines(booking: dict) -> tuple[list[dict], list[dict]]:
@@ -235,6 +239,13 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
         portal.login()
         portal.load_vehicle(plan["reg_nr"])
         cart = portal.read_cart()
+        if not (cart.get("lines") or []):
+            # An earlier run may have ordered it already (state push failed) or the owner
+            # ordered the cart by hand: never suggest ordering again without checking.
+            orders_state.put(booking_id, "failed")
+            if not notifier.send_message(config, EMPTY_CART_TEXT):
+                log.error("Empty-cart message for %s was not delivered.", booking_id)
+            return "failed"
         total = cart.get("total_sek")
         problem = total_problem(total, rules.ceiling_sek)
         if problem is None and abs(total - plan["total_sek"]) > 0.005:

@@ -80,7 +80,7 @@ def test_choose_returns_ranked_candidate():
         return 0, 0.8
 
     assert choose(LINE, [other, bosch], RULES, picker) is bosch
-    assert seen["ranked"] == [bosch, other]
+    assert seen["ranked"] == [bosch]  # brand preference: the preferred subset is offered first
 
 
 def test_low_confidence_returns_none():
@@ -285,7 +285,7 @@ def test_line_without_axle_and_same_axle_candidates_proceeds():
     a, b = pcand("Torkarblad Bosch", "fram"), pcand("Torkarblad Hengst fram")
     picker = recording()
     assert choose({"name": "Torkarblad", "qty": 1}, [b, a], RULES, picker) is a
-    assert picker.seen == [[a, b]]
+    assert picker.seen == [[a]]  # Bosch offered alone first
 
 
 def test_line_without_axle_and_no_candidate_axles_proceeds():
@@ -305,7 +305,8 @@ def test_placement_needs_whole_words_in_candidate():
     picker = recording()
     cands = [pcand("Torkarblad Bakgrund Höjd"), pcand("Torkarblad Bosch", "fram")]
     assert choose({"name": "Torkarblad", "qty": 1}, cands, RULES, picker) is cands[1]
-    assert picker.seen == [[cands[1], cands[0]]]
+    assert picker.seen == [[cands[1]]]  # the unknown-axle candidate stays; Bosch offered first
+    assert parts_matcher._placement_filter("Torkarblad", cands) == cands
 
 
 def test_line_naming_both_axles_is_ambiguous():
@@ -504,3 +505,79 @@ def test_not_axle_specific_part_without_axle_proceeds(name):
 ])
 def test_search_terms_drop_new_placement_forms(name, expected):
     assert search_terms(name) == expected
+
+
+# ── Final review: fluid candidates, brand preference enforced ─────────────────
+
+def test_fluid_candidate_dropped_even_when_line_is_not_a_fluid():
+    oil = pcand("Castrol Motorolja Edge 5W-30 4L")
+    picker = recording()
+    assert choose({"name": "Motorservice", "qty": 1}, [oil], RULES, picker) is None
+    assert picker.seen == []
+
+
+@pytest.mark.parametrize("title,brand", [
+    ("Castrol Motorolja Edge 5W-30 4L", ""), ("Bromsvätska DOT4 1L", ""),
+    ("Kylarvätska G12", "Bosch"), ("Delar", "Castrol Motorolja"),
+])
+def test_fluid_candidates_never_reach_picker(title, brand):
+    fluid, good = pcand(title, brand=brand), pcand("Bosch Oljefilter, Filterinsats")
+    picker = recording()
+    assert choose(LINE, [fluid, good], RULES, picker) is good
+    assert picker.seen == [[good]]
+    assert rank_candidates([fluid], RULES) == []
+
+
+@pytest.mark.parametrize("title", ["Bosch Oljefilter, Filterinsats", "Luftfilter MANN-FILTER",
+                                   "Oil filter Hengst"])
+def test_filter_candidates_still_allowed(title):
+    good = pcand(title)
+    assert choose(LINE, [good], RULES, recording()) is good
+
+
+def test_preferred_subset_offered_first():
+    other, bosch = pcand("Oljefilter Hengst"), pcand("Bosch Oljefilter")
+    picker = recording((0, 0.95))
+    assert choose(LINE, [other, bosch], RULES, picker) is bosch
+    assert picker.seen == [[bosch]]
+
+
+def test_falls_back_to_all_when_preferred_declined():
+    other, bosch = pcand("Oljefilter Hengst"), pcand("Bosch Oljefilter")
+    seen = []
+
+    def picker(line, ranked):
+        seen.append(list(ranked))
+        return (0, 0.2) if len(seen) == 1 else (1, 0.9)
+
+    assert choose(LINE, [other, bosch], RULES, picker) is other
+    assert seen == [[bosch], [bosch, other]]
+
+
+def test_no_preferred_candidates_single_call():
+    a, b = pcand("Oljefilter Hengst"), pcand("Oljefilter Purflux")
+    picker = recording((1, 0.9))
+    assert choose(LINE, [a, b], RULES, picker) is b
+    assert picker.seen == [[a, b]]
+
+
+def test_all_preferred_single_call():
+    a, b = pcand("Bosch Oljefilter A"), pcand("Bosch Oljefilter B")
+    picker = recording((0, 0.1))
+    assert choose(LINE, [a, b], RULES, picker) is None
+    assert picker.seen == [[a, b]]
+
+
+def test_preference_never_shows_filtered_candidates_and_calls_at_most_twice():
+    bosch, other = pcand("Bosch Oljefilter"), pcand("Oljefilter Hengst")
+    banned = [pcand("ProMeister Oljefilter"), pcand("Castrol Motorolja 5W-30"),
+              pcand("Bosch Оljefilter")]
+    picker = recording((0, 0.1))
+    assert choose(LINE, banned + [other, bosch], RULES, picker) is None
+    assert picker.seen == [[bosch], [bosch, other]]
+
+
+def test_pick_system_mentions_brand_order_and_same_part():
+    text = parts_matcher.PICK_SYSTEM.lower()
+    assert "already ordered by brand preference" in text
+    assert "same part" in text

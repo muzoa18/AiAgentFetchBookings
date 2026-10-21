@@ -8,7 +8,7 @@ No I/O. Every check returns a short Swedish problem string, or None when OK.
 import math
 from collections import Counter
 
-from parts_matcher import is_forbidden
+from parts_matcher import has_non_latin, is_fluid, is_forbidden
 from rules import Rules
 
 PREPARE_HEADER = "Förbered (finns på lager):"
@@ -64,10 +64,16 @@ def total_problem(total, ceiling: int) -> str | None:
 
 
 def cart_problem(lines: list[dict], expected: list[dict], rules: Rules) -> str | None:
-    """Cart lines must be exactly the expected (chosen) lines, and never a forbidden brand."""
+    """Cart lines must be exactly the expected (chosen) lines, and never a forbidden brand,
+    a fluid or a title/brand with non-Latin letters (even if such a line was expected)."""
     for line in lines:
-        if is_forbidden({"title": line.get("title"), "brand": line.get("brand")}, rules):
-            return f"förbjudet märke i varukorgen: {line.get('title')}"
+        title, brand = line.get("title"), line.get("brand")
+        if is_forbidden({"title": title, "brand": brand}, rules):
+            return f"förbjudet märke i varukorgen: {title}"
+        if is_fluid(title or "") or is_fluid(brand or ""):
+            return f"olja/vätska i varukorgen (beställs aldrig automatiskt): {title}"
+        if has_non_latin(title) or has_non_latin(brand):
+            return f"okända tecken (ej latinska) i varukorgen: {title}"
     if len(lines) != len(expected):
         return f"varukorgen har {len(lines)} rader men {len(expected)} delar valdes"
     use_ids = all(x.get("url_or_id") for x in lines) and all(x.get("url_or_id") for x in expected)

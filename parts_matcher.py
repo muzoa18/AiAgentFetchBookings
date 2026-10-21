@@ -35,8 +35,10 @@ PICK_SCHEMA = {
 }
 
 PICK_SYSTEM = (
-    "You match a workshop booking line to a supplier catalogue. Pick the single best matching "
-    "candidate. If none truly matches, give a confidence below 0.5. Never guess."
+    "You match a workshop booking line to a supplier catalogue. The candidates are already "
+    "ordered by brand preference (preferred brands first). Pick the single candidate that is "
+    "the best match for the same part as the booking line; never pick a different part, even "
+    "from a preferred brand. If none truly matches, give a confidence below 0.5. Never guess."
 )
 
 
@@ -160,30 +162,29 @@ def is_forbidden(cand: dict, rules: Rules) -> bool:
     return any(f in h for f in forbidden for h in haystacks)
 
 
+def _brand_rank(cand: dict, rules: Rules) -> int:
+    """Index of the first rules.brand_prefer entry in the brand or title; len(prefer) if none."""
+    # pro.meca.se titles carry the brand ("Bosch Oljefilter, ..."); brand is usually "".
+    prefer = [_norm(b) for b in rules.brand_prefer]
+    haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
+    for i, p in enumerate(prefer):
+        if p and any(p in h for h in haystacks):
+            return i
+    return len(prefer)
+
+
 def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
+    """Allowed candidates, preferred brands first. Drops forbidden brands, non-Latin letters
+    and fluids (a fluid is never auto-ordered, whatever the booking line says)."""
     allowed = [c for c in candidates
                if not is_forbidden(c, rules)
-               and not any(has_non_latin(c.get(k)) for k in ("title", "brand", "placement"))]
-    prefer = [_norm(b) for b in rules.brand_prefer]
-
-    def rank(cand: dict) -> int:
-        # pro.meca.se titles carry the brand ("Bosch Oljefilter, ..."); brand is usually "".
-        haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
-        for i, p in enumerate(prefer):
-            if p and any(p in h for h in haystacks):
-                return i
-        return len(prefer)
-
-    return sorted(allowed, key=rank)  # sorted() is stable and returns a new list
+               and not any(has_non_latin(c.get(k)) for k in ("title", "brand", "placement"))
+               and not any(is_fluid(c.get(k) or "") for k in ("title", "brand"))]
+    return sorted(allowed, key=lambda c: _brand_rank(c, rules))  # stable, new list
 
 
-def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | None:
-    name = line.get("name", "")
-    if is_fluid(name) or has_non_latin(name):
-        return None
-    ranked = _placement_filter(name, rank_candidates(candidates, rules))
-    if not ranked:
-        return None
+def _pick(line: dict, ranked: list[dict], picker) -> dict | None:
+    """One picker call on `ranked`; the chosen candidate, or None unless valid and confident."""
     try:
         index, confidence = picker(line, ranked)
     except Exception:
@@ -196,6 +197,23 @@ def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | N
     if not math.isfinite(confidence) or confidence < MIN_CONFIDENCE:
         return None
     return ranked[index]
+
+
+def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | None:
+    """Best allowed candidate for a booking line, or None. Brand preference is enforced:
+    the picker sees the preferred-brand candidates first and the rest only if it declines."""
+    name = line.get("name", "")
+    if is_fluid(name) or has_non_latin(name):
+        return None
+    ranked = _placement_filter(name, rank_candidates(candidates, rules))
+    if not ranked:
+        return None
+    preferred = [c for c in ranked if _brand_rank(c, rules) < len(rules.brand_prefer)]
+    if preferred and len(preferred) < len(ranked):
+        chosen = _pick(line, preferred, picker)
+        if chosen is not None:
+            return chosen
+    return _pick(line, ranked, picker)
 
 
 def make_claude_picker(api_key: str, client=None):
