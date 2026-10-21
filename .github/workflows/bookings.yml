@@ -73,13 +73,13 @@ jobs:
           echo "Could not push state after 3 attempts."
           exit 1
 
-      - name: Upload logs & screenshots
+      # Logs only: screenshots (logs/*.png) show booking pages with customer data.
+      - name: Upload logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: meca-logs-${{ github.run_id }}
           path: |
             logs/*.log
-            logs/*.png
           if-no-files-found: ignore
           retention-days: 14

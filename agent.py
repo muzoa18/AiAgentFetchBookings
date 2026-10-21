@@ -262,15 +262,15 @@ def _notify(config: dict, booking: dict, seen_ids: set, counts: Counter) -> bool
 
     log.info("Sending Telegram message for %s (%s) ...", booking_id,
              booking.get("booking_type", "Bokning"))
-    log.info("─── Message Preview ───────────────────────────")
-    for line in message.splitlines():
-        log.info("  %s", line)
-    log.info("───────────────────────────────────────────────")
+    # Only the length: the text holds customer data and logs/agent.log is uploaded.
+    log.info("Message for %s (%s): %d characters.", booking_id,
+             booking.get("booking_nr") or "–", len(message))
 
     if not send_message(config, message):
         # Leave the id unseen so the next run retries; nothing else is done for it.
         log.error("Telegram notification failed for %s — skipping it this run.", booking_id)
-        log.error("Notification failure details: %s", booking)
+        log.error("Notification failure details: id=%s type=%s", booking_id,
+                  booking.get("booking_type", "Bokning"))
         counts["notify_failed"] += 1
         return False
 

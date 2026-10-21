@@ -296,7 +296,8 @@ def fetch_bookings(config: dict) -> list[dict]:
             if not booking_links:
                 log.warning("No booking links found on page.")
                 page.screenshot(path="logs/no_bookings.png")
-                log.info("Page text: %s", page.inner_text("body")[:500])
+                # Never the text itself: the page lists customer names (logs are uploaded).
+                log.info("Page text length: %d", len(page.inner_text("body") or ""))
                 return []
 
             # ── Step 7: Process each booking detail page ──────────────────────
@@ -501,7 +502,6 @@ def _extract_detail_page(page, booking_id: str) -> dict:
 
     log.info("  Type    : %s", booking_type)
     log.info("  Nr      : %s", booking_nr)
-    log.info("  Customer: %s  %s  %s", driver_name, driver_phone, driver_email)
     log.info("  Vehicle : %s  %s", reg_nr, vehicle)
     log.info("  Date    : %s", workshop_dt)
     log.info("  Services: %d  Parts: %d  Total: %s", len(services), len(parts), total_price)
@@ -762,13 +762,13 @@ def _detect_booking_type(page, full_text: str) -> tuple[str, bool]:
             for el in page.query_selector_all(sel):
                 t = (el.inner_text() or "").lower()
                 if "förfrågan" in t: 
-                    log.info("Detected type 'Förfrågan' from element text: %s", t[:50])
+                    log.info("Detected type 'Förfrågan' from element %s", sel)
                     return "Förfrågan", False
                 if "offert" in t: 
-                    log.info("Detected type 'Offert' from element text: %s", t[:50])
+                    log.info("Detected type 'Offert' from element %s", sel)
                     return "Offert", False
                 if "bokning" in t: 
-                    log.info("Detected type 'Bokning' from element text: %s", t[:50])
+                    log.info("Detected type 'Bokning' from element %s", sel)
                     return "Bokning", False
         except Exception:
             log.warning("Silenced exception in %s", __name__)
