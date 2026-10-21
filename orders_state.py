@@ -45,6 +45,9 @@ OPTIONAL_FIELDS = {
 }
 MAX_TRIES = 10
 REASON_MAX = 200
+# Block reasons that happen before anything is added to the cart. A legacy record (no
+# 'cart_touched' key, written before the field existed) is only re-staged for these.
+PRE_CART_REASONS = ("ingen säker träff", "inga delar")
 
 
 def _load() -> dict:
@@ -218,6 +221,7 @@ def restage(booking_id: str) -> bool:
     """Re-queue a 'blocked' order for one more automatic staging attempt.
 
     Only when the cart was never touched and fewer than MAX_TRIES retries were made.
+    A legacy record without a 'cart_touched' key qualifies only for PRE_CART_REASONS.
     The record becomes the queued marker (begin() then starts it as usual) with
     tries + 1 and the previous block reason kept as 'last_reason'.
     """
@@ -228,13 +232,17 @@ def restage(booking_id: str) -> bool:
             or record.get("cart_touched") is True
             or record.get("tries", 0) >= MAX_TRIES):
         return False
+    plan = record.get("plan")
+    reason = plan.get("reason") if isinstance(plan, dict) else None
+    if "cart_touched" not in record:
+        legacy_reason = reason if isinstance(reason, str) else record.get("last_reason") or ""
+        if not legacy_reason.startswith(PRE_CART_REASONS):
+            return False
     new = {
         **_extras(record),
         "status": "attempted", "plan": dict(QUEUED_PLAN), "message_id": None,
         "updated_at": _now(), "tries": record.get("tries", 0) + 1,
     }
-    plan = record.get("plan")
-    reason = plan.get("reason") if isinstance(plan, dict) else None
     if isinstance(reason, str):
         new["last_reason"] = reason[:REASON_MAX]
     data["bookings"][booking_id] = new

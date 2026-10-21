@@ -30,18 +30,36 @@ def save_seen_ids(seen_ids: set):
     log.debug("Saved %d seen booking ID(s).", len(seen_ids))
 
 
-# Bokningar whose type was only guessed and that showed no Hanterad button: agent.py
-# handles them like Offert/Förfrågan from then on (notified once, never marked Hanterad).
+# Bokningar whose type was only guessed and that showed no Hanterad button on two runs
+# in a row: agent.py handles them like Offert/Förfrågan from then on (never Hanterad).
 NO_BUTTON_FILE = Path("config/no_button_ids.txt")
+# Guessed-type Bokningar that showed no Hanterad button once (the last time they were tried).
+NO_BUTTON_SEEN_FILE = Path("config/no_button_seen_once.txt")
 
 
-def load_no_button_ids() -> set:
-    if not NO_BUTTON_FILE.exists():
+def _load_ids(path: Path) -> set:
+    if not path.exists():
         return set()
-    lines = NO_BUTTON_FILE.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     return {line.strip() for line in lines if line.strip()}
 
 
+def _save_ids(path: Path, ids: set):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(sorted(ids)), encoding="utf-8")
+
+
+def load_no_button_ids() -> set:
+    return _load_ids(NO_BUTTON_FILE)
+
+
 def save_no_button_ids(ids: set):
-    NO_BUTTON_FILE.parent.mkdir(parents=True, exist_ok=True)
-    NO_BUTTON_FILE.write_text("\n".join(sorted(ids)), encoding="utf-8")
+    _save_ids(NO_BUTTON_FILE, ids)
+
+
+def load_no_button_seen_once() -> set:
+    return _load_ids(NO_BUTTON_SEEN_FILE)
+
+
+def save_no_button_seen_once(ids: set):
+    _save_ids(NO_BUTTON_SEEN_FILE, ids)

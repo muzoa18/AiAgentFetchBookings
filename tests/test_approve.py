@@ -659,6 +659,17 @@ def test_persist_step_rebases_and_retries(name):
     assert "git rebase --abort 2>/dev/null || true" in persist["run"]
 
 
+def test_bookings_persist_step_commits_every_local_state_file():
+    persist = next(s for s in _steps(_workflow("bookings.yml")) if "git push" in s.get("run", ""))
+    run = persist["run"]
+    # each file is added on its own: one missing pathspec makes a multi-file git add stage nothing
+    loop = run[run.index("for f in"):run.index("done")]
+    assert 'git add "$f" 2>/dev/null || true' in loop
+    for name in ("config/seen_ids.txt", "config/orders.json", "logs/run_history.jsonl",
+                 "config/no_button_ids.txt", "config/no_button_seen_once.txt"):
+        assert name in loop.replace(";", " ").split()
+
+
 def test_daily_run_is_clear_of_the_approval_poll():
     wf = _workflow("bookings.yml")
     on = wf.get("on", wf.get(True))

@@ -20,8 +20,11 @@ Workflow (runs once a day on GitHub Actions; see .github/workflows/):
        re-staged (orders_state.restage, at most MAX_TRIES times); any other record
        is left alone. Staging runs after the loop so the parts portal's browser
        never overlaps the MECA portal's Hanterad browser.
-     - type only guessed by the scraper and no Hanterad button: handled like
-       Offert/Förfrågan from then on (config/no_button_ids.txt).
+     - specification not read completely (spec_fallback / spec_dropped): no parts
+       may be missing parts, so Hanterad is NOT pressed; reported instead.
+     - type only guessed by the scraper and no Hanterad button on two runs in a
+       row: one notice, then handled like Offert/Förfrågan
+       (config/no_button_seen_once.txt -> config/no_button_ids.txt).
 
 If a Telegram message fails, the booking stays unseen (retried next run), nothing
 else is done for it and run() returns exit code 1. A Hanterad that does not succeed
@@ -54,7 +57,8 @@ from parts_order import (give_up_if_capped, needs_portal, order_notify_failed, p
 from rules import load_rules
 from portal_scraper import PortalLoginError, fetch_bookings, mark_booking_handled
 from run_logger import log_run
-from state import load_no_button_ids, load_seen_ids, save_no_button_ids, save_seen_ids
+from state import (load_no_button_ids, load_no_button_seen_once, load_seen_ids,
+                   save_no_button_ids, save_no_button_seen_once, save_seen_ids)
 
 Path("logs").mkdir(exist_ok=True)
 logging.basicConfig(
@@ -72,7 +76,10 @@ LOGIN_FAILED_TEXT = ("MECA-inloggningen misslyckades – inga bokningar hämtade
                      "eller GitHub-secrets PORTAL_USERNAME/PORTAL_PASSWORD. Orsak: ")
 
 
-OFFER_TYPES = ("Förfrågan", "Offert")
+SPEC_INCOMPLETE_TEXT = ("Bokning {nr}: specifikationen kunde inte läsas fullständigt – jag har "
+                        "inte markerat den som Hanterad. Kontrollera delarna i portalen.")
+NO_BUTTON_TEXT = ("Bokning {nr} verkar sakna Hanterad-knapp (typen är osäker) – "
+                  "kontrollera den i portalen.")
 
 
 def _log_summary(bookings_found: int, counts: Counter, orders_staged: int, orders_failed: int,
@@ -83,7 +90,7 @@ def _log_summary(bookings_found: int, counts: Counter, orders_staged: int, order
         "notified":       counts["notified"],
         "notify_failed":  counts["notify_failed"],
         "orders_staged":  orders_staged,
-        "orders_failed":  orders_failed,
+        "orders_failed":  orders_failed + counts["give_up_failed"],
         "handled_failed": counts["handled_failed"],
         "login_failed":   login_failed,
     })
@@ -101,6 +108,7 @@ def run() -> int:
 
     seen_ids = load_seen_ids()
     no_button = load_no_button_ids()
+    no_button_once = load_no_button_seen_once()
     log.info("Previously notified bookings: %d", len(seen_ids))
     counts = Counter()
 
@@ -123,11 +131,12 @@ def run() -> int:
 
     log.info("Found %d booking(s) on the Nya tab.", len(bookings))
     to_order = []
-    no_button_before = set(no_button)
+    no_button_before, once_before = set(no_button), set(no_button_once)
 
     for booking in bookings:
         try:
-            _process_booking(config, booking, seen_ids, no_button, to_order, counts)
+            _process_booking(config, booking, seen_ids, (no_button, no_button_once),
+                             to_order, counts)
         except Exception:
             log.exception("Processing %s raised — continuing with the next booking.",
                           booking.get("id", "unknown"))
@@ -137,23 +146,29 @@ def run() -> int:
     save_seen_ids(seen_ids)
     if no_button != no_button_before:
         save_no_button_ids(no_button)
+    if no_button_once != once_before:
+        save_no_button_seen_once(no_button_once)
 
     orders_staged, orders_failed = _order_parts(config, to_order)
     orders_failed += swept_failed
 
     log.info("Done. Sent %d new notification(s), %d failed. Orders staged %d, failed %d. "
              "Hanterad failed %d. Booking errors %d.",
-             counts["notified"], counts["notify_failed"], orders_staged, orders_failed,
-             counts["handled_failed"], counts["errors"])
+             counts["notified"], counts["notify_failed"], orders_staged,
+             orders_failed + counts["give_up_failed"], counts["handled_failed"], counts["errors"])
     _log_summary(len(bookings), counts, orders_staged, orders_failed)
-    failed = (counts["notify_failed"] or orders_failed or counts["handled_failed"]
-              or counts["errors"])
+    failed = (counts["notify_failed"] or orders_failed or counts["give_up_failed"]
+              or counts["handled_failed"] or counts["errors"])
     return 1 if failed else 0
 
 
-def _process_booking(config: dict, booking: dict, seen_ids: set, no_button: set,
+def _process_booking(config: dict, booking: dict, seen_ids: set, no_button_lists: tuple,
                      to_order: list, counts: Counter) -> None:
-    """Decide what this run does for one booking listed on the Nya tab."""
+    """Decide what this run does for one booking listed on the Nya tab.
+
+    no_button_lists = (no_button ids, ids with one missing-button result so far).
+    """
+    no_button, no_button_once = no_button_lists
     booking_id   = booking.get("id", "unknown")
     detail_url   = booking.get("detail_url", "")
     booking_type = booking.get("booking_type", "Bokning")
@@ -178,7 +193,17 @@ def _process_booking(config: dict, booking: dict, seen_ids: set, no_button: set,
 
     order_lines, _ = split_lines(booking)
     if order_lines:
-        _plan_parts_order(config, booking, seen, to_order)
+        _plan_parts_order(config, booking, seen, to_order, counts)
+        return
+
+    # "No parts" is only trusted when the whole specification was read.
+    if _spec_incomplete(booking):
+        log.warning("Specification of %s was not read completely — not marking it Hanterad.",
+                    booking_id)
+        nr = booking.get("booking_nr") or booking_id
+        if not send_message(config, SPEC_INCOMPLETE_TEXT.format(nr=nr)):
+            log.error("Incomplete-specification message for %s was not delivered.", booking_id)
+        counts["handled_failed"] += 1
         return
 
     # No parts (fluids are only listed for the owner to prepare): Hanterad now.
@@ -186,10 +211,32 @@ def _process_booking(config: dict, booking: dict, seen_ids: set, no_button: set,
         log.warning("No detail URL for %s.", booking_id)
         return
     handled = _mark_handled(config, booking, retry=seen)
-    if handled is None:
-        no_button.add(booking_id)
-    elif handled is False:
+    if handled is not None:
+        no_button_once.discard(booking_id)   # "twice in a row" starts over
+        if handled is False:
+            counts["handled_failed"] += 1
+        return
+    if booking_id not in no_button_once:
+        log.info("No Hanterad button on %s (type guessed) — checking again next run.", booking_id)
+        no_button_once.add(booking_id)
+        return
+    nr = booking.get("booking_nr") or booking_id
+    if not send_message(config, NO_BUTTON_TEXT.format(nr=nr)):
+        log.error("No-button notice for %s was not delivered — trying again next run.",
+                  booking_id)
         counts["handled_failed"] += 1
+        return
+    log.info("No Hanterad button on %s twice in a row — handled like Offert/Förfrågan "
+             "from now on.", booking_id)
+    no_button_once.discard(booking_id)
+    no_button.add(booking_id)
+
+
+def _spec_incomplete(booking: dict) -> bool:
+    """True when the scraper says the specification was not read completely."""
+    dropped = booking.get("spec_dropped")
+    return bool(booking.get("spec_fallback")) or (
+        isinstance(dropped, int) and not isinstance(dropped, bool) and dropped > 0)
 
 
 def _notify(config: dict, booking: dict, seen_ids: set, counts: Counter) -> bool:
@@ -217,7 +264,8 @@ def _notify(config: dict, booking: dict, seen_ids: set, counts: Counter) -> bool
     return True
 
 
-def _plan_parts_order(config: dict, booking: dict, seen: bool, to_order: list) -> None:
+def _plan_parts_order(config: dict, booking: dict, seen: bool, to_order: list,
+                      counts: Counter) -> None:
     """A Bokning with parts: queue it, quietly re-stage a blocked order, or leave it alone."""
     booking_id = booking.get("id")
     try:
@@ -244,18 +292,20 @@ def _plan_parts_order(config: dict, booking: dict, seen: bool, to_order: list) -
             to_order.append(booking)
             return
         try:
-            give_up_if_capped(config, booking)
+            if give_up_if_capped(config, booking) is False:
+                counts["give_up_failed"] += 1   # not flagged: sent again next run
         except Exception:
             log.exception("Give-up check failed for %s.", booking_id)
+            counts["give_up_failed"] += 1
     log.info("Parts order for %s is '%s' — left alone.", booking_id, status)
 
 
 def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool | None:
     """Click Hanterad for a Bokning without parts.
 
-    True = marked. None = no Hanterad button on a booking whose type was only guessed:
-    treated as Offert/Förfrågan (logged, not reported). Anything else is reported to
-    the owner and returns False.
+    True = marked. None = no Hanterad button on a booking whose type was only guessed
+    (logged, not reported; the caller decides). Anything else is reported to the owner
+    and returns False.
     """
     booking_id = booking.get("id", "unknown")
     detail_url = booking.get("detail_url", "")
@@ -273,8 +323,7 @@ def _mark_handled(config: dict, booking: dict, retry: bool = False) -> bool | No
         return True
 
     if handled_ok is None and booking.get("booking_type_guess") is True:
-        log.info("No Hanterad button on %s and its type was only guessed — treating it as "
-                 "Offert/Förfrågan from now on.", booking_id)
+        log.info("No Hanterad button on %s and its type was only guessed.", booking_id)
         return None
 
     log.warning("Could not mark %s as Hanterad (%s). Handle manually at: %s",

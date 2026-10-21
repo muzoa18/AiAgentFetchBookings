@@ -782,6 +782,7 @@ GIVE_UP = ("Försöker inte mer automatiskt för OLRD-3630 – "
 
 def _blocked_then_restaged(reason, tries=0):
     orders_state.put("B1", "blocked", plan={"reason": reason, "booking_id": "B1"})
+    orders_state.update_fields("B1", cart_touched=False)
     if tries:
         orders_state.update_fields("B1", tries=tries)
     assert orders_state.restage("B1") is True
@@ -831,7 +832,7 @@ def test_cart_not_touched_when_blocked_before_adding(tg):
 
     assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
 
-    assert "cart_touched" not in orders_state.get("B1")
+    assert orders_state.get("B1")["cart_touched"] is False   # marked untouched (not legacy)
 
 
 def test_detail_url_is_stored_without_customer_data(tg, orders_file):
@@ -910,7 +911,7 @@ def test_retry_reaching_the_cap_sends_one_give_up_message(tg):
     assert rec["tries"] == orders_state.MAX_TRIES
     assert rec["gave_up"] is True
     assert orders_state.restage("B1") is False
-    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False  # once only
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is None  # once only
     assert tg["sent"] == [GIVE_UP]
 
 
@@ -928,7 +929,7 @@ def test_give_up_if_capped_sends_once_for_a_capped_record(tg):
     orders_state.update_fields("B1", tries=orders_state.MAX_TRIES)
 
     assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
-    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is None
     assert tg["sent"] == [GIVE_UP]
 
 
@@ -937,7 +938,7 @@ def test_give_up_if_capped_ignores_other_records(tg, fields):
     orders_state.put("B1", "blocked", plan={"reason": AIR_REASON})
     orders_state.update_fields("B1", **fields)
 
-    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is None
     assert tg["sent"] == []
 
 
@@ -948,5 +949,21 @@ def test_give_up_undelivered_is_tried_again_later(tg):
 
     assert parts_order.give_up_if_capped(CONFIG, BOOKING) is False
     assert "gave_up" not in orders_state.get("B1")
+    tg["send_ok"] = True
+    assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True
+
+
+# ── Review M3: an undelivered give-up message is a failure, retried later ────
+
+def test_retry_at_cap_with_undelivered_give_up_is_failed_but_stays_blocked(tg):
+    _blocked_then_restaged(AIR_REASON, tries=orders_state.MAX_TRIES - 1)
+    tg["send_ok"] = False
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "failed"
+
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"          # still blocked: the give-up is retried
+    assert "gave_up" not in rec
     tg["send_ok"] = True
     assert parts_order.give_up_if_capped(CONFIG, BOOKING) is True

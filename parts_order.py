@@ -133,13 +133,14 @@ def _block(config: dict, booking: dict, reason: str, fluids: list[dict],
 def give_up_if_capped(config: dict, booking: dict) -> bool:
     """Send the one give-up message for a blocked, untouched order out of retries.
 
-    Returns True only when the message was sent now (then flagged 'gave_up').
+    True = sent now (flagged 'gave_up'); None = nothing to send; False = not delivered
+    (a failure for the caller; not flagged, so it is sent again next run).
     """
     booking_id = booking.get("id")
     record = orders_state.get(booking_id)
     if (not record or record.get("status") != "blocked" or record.get("cart_touched") is True
             or record.get("tries", 0) < orders_state.MAX_TRIES or record.get("gave_up")):
-        return False
+        return None
     if not notifier.send_message(config, GIVE_UP_TEXT.format(label=_label(booking))):
         log.error("Give-up message for %s was not delivered.", booking_id)
         return False
@@ -181,9 +182,11 @@ def plan_and_stage(config: dict, booking: dict, portal, rules: Rules, picker) ->
         return _fail(config, booking_id, label, _why(e))
     if status == "blocked":
         try:
-            give_up_if_capped(config, booking)
+            if give_up_if_capped(config, booking) is False:
+                return "failed"  # record stays blocked; the message is retried next run
         except Exception:
             log.exception("Give-up check failed for %s", booking_id)
+            return "failed"
     return status
 
 
@@ -192,9 +195,12 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     record = orders_state.get(booking_id) or {}
     # A quiet retry (orders_state.restage) remembers the reason the last attempt blocked.
     quiet_reason = record.get("last_reason") if record.get("tries") else None
+    fields = {} if record.get("cart_touched") is True else {"cart_touched": False}
     detail_url = booking.get("detail_url")
     if isinstance(detail_url, str) and detail_url.strip():
-        orders_state.update_fields(booking_id, detail_url=detail_url.strip())
+        fields["detail_url"] = detail_url.strip()
+    if fields:  # cart_touched=False marks the record as not legacy (orders_state.restage)
+        orders_state.update_fields(booking_id, **fields)
     order_lines, fluids = split_lines(booking)
 
     def block(reason: str, **kw) -> str:

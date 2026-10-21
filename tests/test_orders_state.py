@@ -324,6 +324,7 @@ def test_restage_blocked_untouched_record():
 
 def test_restage_counts_tries_up_to_the_cap():
     orders_state.put("B1", "blocked", plan={"reason": "x"})
+    orders_state.update_fields("B1", cart_touched=False)
     for n in range(1, orders_state.MAX_TRIES + 1):
         assert orders_state.restage("B1") is True
         assert orders_state.get("B1")["tries"] == n
@@ -355,5 +356,36 @@ def test_restage_without_record_is_false(orders_file):
 
 def test_restage_last_reason_is_short():
     orders_state.put("B1", "blocked", plan={"reason": "x" * 1000})
+    orders_state.update_fields("B1", cart_touched=False)
     assert orders_state.restage("B1") is True
     assert len(orders_state.get("B1")["last_reason"]) <= 200
+
+
+# ── Review M1: legacy blocked records (no cart_touched key) ──────────────────
+
+@pytest.mark.parametrize("reason", ["ingen säker träff för 'Pollenfilter'",
+                                    "inga delar att beställa"])
+def test_legacy_blocked_record_with_pre_cart_reason_is_restaged(reason):
+    orders_state.put("B1", "blocked", plan={"reason": reason})
+    assert orders_state.restage("B1") is True
+
+
+@pytest.mark.parametrize("reason", ["varukorgen stämmer inte med de valda delarna",
+                                    "varukorgen är inte tom", "totalen 12000.00 SEK överstiger"])
+def test_legacy_blocked_record_with_other_reason_is_left_alone(reason):
+    orders_state.put("B1", "blocked", plan={"reason": reason})
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == "blocked"
+
+
+def test_legacy_rule_uses_last_reason_on_a_repeat_retry():
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'X'"})
+    assert orders_state.restage("B1") is True
+    orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'X'"})
+    assert orders_state.restage("B1") is True
+
+
+def test_new_record_marked_untouched_is_restaged_for_any_reason():
+    orders_state.put("B1", "blocked", plan={"reason": "varukorgen är inte tom"})
+    orders_state.update_fields("B1", cart_touched=False)
+    assert orders_state.restage("B1") is True

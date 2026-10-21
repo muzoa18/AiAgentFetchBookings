@@ -60,6 +60,7 @@ def env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
     monkeypatch.setattr(state, "NO_BUTTON_FILE", tmp_path / "no_button_ids.txt")
+    monkeypatch.setattr(state, "NO_BUTTON_SEEN_FILE", tmp_path / "no_button_seen_once.txt")
     rec["buttons"] = []
     monkeypatch.setattr(notifier, "send_with_buttons",
                         lambda config, text, buttons: rec["buttons"].append((text, buttons)) or 77)
@@ -676,25 +677,67 @@ def test_blocked_out_of_tries_sends_one_give_up_message_ever(env):
     assert env["staged"] == []
 
 
-def test_guessed_type_without_button_becomes_offert_like(env, monkeypatch, caplog):
+NO_BUTTON_NOTICE = ("Bokning OLRD-3630 verkar sakna Hanterad-knapp (typen är osäker) – "
+                    "kontrollera den i portalen.")
+
+
+def test_guessed_type_without_button_twice_becomes_offert_like(env, monkeypatch, caplog):
     caplog.set_level("INFO")
     _handled_returns(env, monkeypatch, None)
     env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": True}]
 
+    # first None: only logged and remembered, no message, no failure
     assert agent.run() == 0
-
-    assert len(env["sent"]) == 1      # the notification; no failure message
+    assert len(env["sent"]) == 1      # the notification only
     assert env["logged"]["handled_failed"] == 0
-    assert env["handled"] == ["http://x/B1"]
-    assert "B1" in state.load_no_button_ids()
+    assert "B1" not in state.load_no_button_ids()
 
-    # next run: seen + on the no-button list -> Offert/Förfrågan handling (PENDING only)
+    # second None in a row: added to the list, ONE notice
     env["seen"] = env["saved"]
     env["sent"].clear()
     assert agent.run() == 0
-    assert env["handled"] == ["http://x/B1"]   # no new attempt
+    assert env["sent"] == [NO_BUTTON_NOTICE]
+    assert "B1" in state.load_no_button_ids()
+    assert env["handled"] == ["http://x/B1"] * 2
+
+    # from then on: Offert/Förfrågan handling (PENDING only, no attempt, no message)
+    env["sent"].clear()
+    assert agent.run() == 0
+    assert env["handled"] == ["http://x/B1"] * 2
     assert env["sent"] == []
     assert "PENDING Bokning B1" in caplog.text
+
+
+def test_guessed_none_then_other_result_resets_the_count(env, monkeypatch):
+    env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": True}]
+    _handled_returns(env, monkeypatch, None)
+    agent.run()
+    env["seen"] = env["saved"]
+    _handled_returns(env, monkeypatch, False)
+    assert agent.run() == 1            # a real failure in between
+    _handled_returns(env, monkeypatch, None)
+    env["sent"].clear()
+    assert agent.run() == 0            # a first None again: no notice yet
+    assert env["sent"] == []
+    assert "B1" not in state.load_no_button_ids()
+
+
+def test_undelivered_no_button_notice_is_a_failure_and_retried(env, monkeypatch):
+    _handled_returns(env, monkeypatch, None)
+    env["bookings"] = [{**_no_parts("B1"), "booking_type_guess": True}]
+    agent.run()
+    env["seen"] = env["saved"]
+    env["send_ok"] = False
+
+    assert agent.run() == 1
+    assert env["logged"]["handled_failed"] == 1
+    assert "B1" not in state.load_no_button_ids()
+
+    env["send_ok"] = True
+    env["sent"].clear()
+    assert agent.run() == 0
+    assert env["sent"] == [NO_BUTTON_NOTICE]
+    assert "B1" in state.load_no_button_ids()
 
 
 def test_not_guessed_type_without_button_is_still_a_failure(env, monkeypatch):
@@ -797,6 +840,7 @@ def real_stage(env, monkeypatch):
 def test_blocked_order_quiet_retry(env, real_stage, old_reason, catalogue, messages, buttons):
     real_stage(catalogue)
     orders_state.put("B1", "blocked", plan={"reason": old_reason, "booking_id": "B1"})
+    orders_state.update_fields("B1", cart_touched=False)
     env["seen"] = {"B1"}
     env["bookings"] = [_booking("B1")]
 
@@ -812,3 +856,104 @@ def test_blocked_order_quiet_retry(env, real_stage, old_reason, catalogue, messa
     text = orders_state.ORDERS_FILE.read_text(encoding="utf-8")
     for sentinel in ("Mamadou Sowe", "+46739133124"):
         assert sentinel not in text
+
+
+# ── Review I1: never press Hanterad on an incompletely read specification ───
+
+SPEC_INCOMPLETE = ("Bokning OLRD-3630: specifikationen kunde inte läsas fullständigt – jag har "
+                   "inte markerat den som Hanterad. Kontrollera delarna i portalen.")
+
+
+def _no_hanterad(monkeypatch):
+    def boom(config, url):
+        raise AssertionError("Hanterad must not be pressed")
+    monkeypatch.setattr(agent, "mark_booking_handled", boom)
+
+
+@pytest.mark.parametrize("flags", [{"spec_fallback": True},
+                                   {"spec_dropped": 2},
+                                   {"spec_fallback": True, "spec_dropped": 1}])
+@pytest.mark.parametrize("seen", [False, True])
+def test_incomplete_spec_without_parts_is_not_marked_hanterad(env, monkeypatch, flags, seen):
+    _no_hanterad(monkeypatch)
+    if seen:
+        env["seen"] = {"B1"}
+    env["bookings"] = [{**_no_parts("B1"), **flags}]
+
+    assert agent.run() == 1
+
+    assert env["sent"][-1] == SPEC_INCOMPLETE
+    assert env["sent"].count(SPEC_INCOMPLETE) == 1
+    assert len(env["sent"]) == (1 if seen else 2)
+    if not seen:
+        assert "Obs:" in env["sent"][0]          # the notification keeps its warning
+    assert env["logged"]["handled_failed"] == 1
+    assert orders_state.get("B1") is None
+
+
+def test_incomplete_spec_warning_logs_no_row_text(env, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    _no_hanterad(monkeypatch)
+    env["bookings"] = [{**_no_parts("B1"), "spec_fallback": True,
+                        "fluids": [{"name": "Sentinel Vätska", "qty": "1"}]}]
+
+    agent.run()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("B1" in w and "specification" in w.lower() for w in warnings)
+    assert not any("Sentinel Vätska" in w for w in warnings)
+
+
+def test_incomplete_spec_with_parts_is_still_queued_and_staged(env, monkeypatch):
+    _no_hanterad(monkeypatch)
+    env["bookings"] = [{**_booking("B1"), "spec_fallback": True, "spec_dropped": 1}]
+
+    assert agent.run() == 0
+
+    assert [s[0] for s in env["staged"]] == ["B1"]
+    assert SPEC_INCOMPLETE not in env["sent"]
+
+
+@pytest.mark.parametrize("flags", [{}, {"spec_fallback": False, "spec_dropped": 0}])
+def test_clean_spec_without_parts_is_marked_hanterad(env, flags):
+    env["bookings"] = [{**_no_parts("B1"), **flags}]
+
+    assert agent.run() == 0
+    assert env["handled"] == ["http://x/B1"]
+    assert len(env["sent"]) == 1
+
+
+# ── Review M3: an undelivered give-up message fails the run ─────────────────
+
+def test_undelivered_give_up_fails_the_run_and_is_retried(env):
+    orders_state.put("B1", "blocked", plan={"reason": "x"})
+    orders_state.update_fields("B1", tries=orders_state.MAX_TRIES)
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+    env["send_ok"] = False
+
+    assert agent.run() == 1
+    assert env["logged"]["orders_failed"] == 1
+    assert "gave_up" not in orders_state.get("B1")
+
+    env["send_ok"] = True
+    env["sent"].clear()
+    assert agent.run() == 0
+    assert env["sent"] == [GIVE_UP]
+
+
+# ── Review M1: legacy blocked records through the agent ─────────────────────
+
+@pytest.mark.parametrize("reason,restaged", [
+    ("ingen säker träff för 'Pollenfilter'", True),
+    ("inga delar att beställa", True),
+    ("varukorgen stämmer inte med de valda delarna", False),
+])
+def test_legacy_blocked_record_restaged_only_for_pre_cart_reasons(env, reason, restaged):
+    orders_state.put("B1", "blocked", plan={"reason": reason})   # no cart_touched key
+    env["seen"] = {"B1"}
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 0
+
+    assert bool(env["staged"]) is restaged

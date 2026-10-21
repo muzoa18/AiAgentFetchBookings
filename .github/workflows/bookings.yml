@@ -51,7 +51,11 @@ jobs:
         run: |
           git config user.name  "meca-agent[bot]"
           git config user.email "meca-agent[bot]@users.noreply.github.com"
-          git add config/seen_ids.txt config/orders.json logs/run_history.jsonl 2>/dev/null || true
+          # One file per git add: a missing file must not stop the others being staged.
+          for f in config/seen_ids.txt config/orders.json logs/run_history.jsonl \
+                   config/no_button_ids.txt config/no_button_seen_once.txt; do
+            git add "$f" 2>/dev/null || true
+          done
           if git diff --cached --quiet; then
             echo "No state changes to commit."
             exit 0
