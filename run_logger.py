@@ -6,8 +6,7 @@ Saved to logs/run_history.jsonl (one line per run).
 
 improve.py reads this to understand patterns over time:
 - Which bookings failed?
-- Which parts searches failed?
-- How many emails processed?
+- How many parts orders were staged or failed, and how many Hanterad clicks failed?
 - Any recurring errors?
 """
 
@@ -26,7 +25,7 @@ def log_run(agent: str, summary: dict):
     Write a run summary to the history file.
 
     Args:
-        agent:   "booking_agent" | "email_agent" | "parts_agent"
+        agent:   "booking_agent" (agent.py, the only caller)
         summary: dict with run stats and any errors
     """
     Path("logs").mkdir(exist_ok=True)

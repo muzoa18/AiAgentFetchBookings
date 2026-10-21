@@ -1,8 +1,9 @@
 """
 state.py
 --------
-Persists the set of booking IDs we have already sent SMS for,
-so we don't send duplicate messages on each run.
+Persists the set of booking IDs the owner has already been notified about
+(Telegram), so each booking gets one message. seen_ids never means "handled":
+for a Bokning the MECA portal is the truth (see agent.py).
 
 Stored as a plain text file: config/seen_ids.txt
 """

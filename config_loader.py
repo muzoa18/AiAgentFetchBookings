@@ -35,38 +35,25 @@ REQUIRED_FIELDS = [
     ("telegram", "chat_id"),
 ]
 
-# Maps (section, key) -> environment variable name.
+# Maps (section, key) -> environment variable name. Only settings the code reads.
+# Other yaml sections (e.g. a retired sms:/email_agent: block in an old local
+# config.yaml) are loaded but ignored: they are never an error.
 ENV_MAP = {
     ("portal", "username"):            "PORTAL_USERNAME",
     ("portal", "password"):            "PORTAL_PASSWORD",
     ("portal", "bookings_path"):       "PORTAL_BOOKINGS_PATH",
     ("portal", "debug"):               "PORTAL_DEBUG",
     ("anthropic", "api_key"):          "ANTHROPIC_API_KEY",
-    ("sms", "provider"):               "SMS_PROVIDER",
-    ("sms", "recipient_number"):       "SMS_RECIPIENT_NUMBER",
-    ("sms", "sender_name"):            "SMS_SENDER_NAME",
-    ("sms", "api_user"):               "SMS_API_USER",
-    ("sms", "api_password"):           "SMS_API_PASSWORD",
-    ("sms", "twilio_account_sid"):     "TWILIO_ACCOUNT_SID",
-    ("sms", "twilio_auth_token"):      "TWILIO_AUTH_TOKEN",
-    ("sms", "twilio_from_number"):     "TWILIO_FROM_NUMBER",
     ("telegram", "bot_token"):         "TELEGRAM_BOT_TOKEN",
     ("telegram", "chat_id"):           "TELEGRAM_CHAT_ID",
     ("parts_portal", "username"):      "PARTS_PORTAL_USERNAME",
     ("parts_portal", "password"):      "PARTS_PORTAL_PASSWORD",
-    ("parts_portal", "test_email"):    "PARTS_PORTAL_TEST_EMAIL",
-    ("workshop", "phone"):             "WORKSHOP_PHONE",
-    ("workshop", "email"):             "WORKSHOP_EMAIL",
-    ("workshop", "name"):              "WORKSHOP_NAME",
-    ("workshop", "city"):              "WORKSHOP_CITY",
 }
 
 # Sensible defaults so the system runs with the minimum set of secrets.
 DEFAULTS = {
     ("portal", "bookings_path"): "/Booking/Index",
     ("portal", "debug"):         False,
-    ("sms", "provider"):         "46elks",
-    ("sms", "sender_name"):      "MECA",
 }
 
 _BOOL_FIELDS = {("portal", "debug")}
