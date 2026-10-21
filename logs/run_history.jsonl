@@ -130,3 +130,14 @@
 {"timestamp": "2026-10-13T08:58:16.211204", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-10-13T17:00:35.555370", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
 {"timestamp": "2026-10-14T17:00:34.765082", "agent": "booking_agent", "bookings_found": 0, "sms_sent": 0, "sms_failed": 0}
+{"timestamp": "2026-10-21T20:03:23.157844", "agent": "booking_agent", "bookings_found": 1, "notified": 1, "notify_failed": 0, "orders_staged": 1, "orders_failed": 0, "handled_failed": 0, "login_failed": false}
+{"timestamp": "2026-10-21T10:44:24.576651", "agent": "booking_agent", "bookings_found": 0, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0}
+{"timestamp": "2026-10-21T11:22:52.700777", "agent": "booking_agent", "bookings_found": 0, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0, "login_failed": true}
+{"timestamp": "2026-10-21T11:25:59.440741", "agent": "booking_agent", "bookings_found": 3, "notified": 3, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0}
+{"timestamp": "2026-10-21T11:40:18.712029", "agent": "booking_agent", "bookings_found": 2, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0, "handled_failed": 0}
+{"timestamp": "2026-10-21T11:45:54.891199", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0, "handled_failed": 0}
+{"timestamp": "2026-10-21T12:27:22.787051", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 1, "handled_failed": 0, "login_failed": false}
+{"timestamp": "2026-10-21T13:28:23.607677", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0, "handled_failed": 0, "login_failed": false}
+{"timestamp": "2026-10-21T13:32:12.440580", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 1, "handled_failed": 0, "login_failed": false}
+{"timestamp": "2026-10-21T13:59:43.672159", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 0, "orders_failed": 0, "handled_failed": 0, "login_failed": false}
+{"timestamp": "2026-10-21T14:29:00.070530", "agent": "booking_agent", "bookings_found": 1, "notified": 0, "notify_failed": 0, "orders_staged": 1, "orders_failed": 0, "handled_failed": 0, "login_failed": false}
