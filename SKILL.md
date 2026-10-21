@@ -76,10 +76,10 @@ reference or recreate them.
 
 ### Telegram message (booking notification)
 ```
-Ny Bokning - OLRD-3630
-Kund: Mamadou Sowe
-Tel: +46739133124
-Fordon: NXP168 VOLKSWAGEN PASSAT
+Ny Bokning - OLRD-0001
+Kund: Test Kund
+Tel: +46700000001
+Fordon: TST001 VOLKSWAGEN PASSAT
 Datum: 2026-04-01 (3 Dagar)
 ---
 Tjänster:

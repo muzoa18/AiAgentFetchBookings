@@ -24,10 +24,10 @@ RULES = Rules(("Bosch",), ("ProMeister",), 10000, "approve")
 PII = ("Sentinel Kund AB", "+46700000999", "sentinel@example.com", "Sentinel meddelande 42")
 
 BOOKING = {
-    "id": "B1", "booking_type": "Bokning", "booking_nr": "OLRD-3630",
+    "id": "B1", "booking_type": "Bokning", "booking_nr": "OLRD-0001",
     "driver_name": "Sentinel Kund AB", "driver_phone": "+46700000999",
     "driver_email": "sentinel@example.com", "booking_msg": "Sentinel meddelande 42",
-    "reg_nr": "NXP168", "vehicle": "VOLKSWAGEN PASSAT",
+    "reg_nr": "TST001", "vehicle": "VOLKSWAGEN PASSAT",
     "parts": [{"name": "Oljefilter", "qty": "1"}], "fluids": [{"name": "Olja 5W30", "qty": "5"}],
 }
 OIL_FILTER = {"title": "Bosch Oljefilter, Filterinsats", "brand": "", "price_sek": 189.0,
@@ -175,7 +175,7 @@ def test_stage_approve_and_order_end_to_end(world):
     assert buttons == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
     assert "- Oljefilter -> Bosch Oljefilter, Filterinsats (–) x1 à 189.00 SEK" in text
     assert "- Olja 5W30 x5" in text
-    assert portal.carts["NXP168"][0]["url_or_id"] == "10000001"
+    assert portal.carts["TST001"][0]["url_or_id"] == "10000001"
     assert "checkout" not in portal.calls
     for sentinel in PII:
         assert sentinel not in world["orders_file"].read_text(encoding="utf-8")
@@ -194,7 +194,7 @@ def test_stage_approve_and_order_end_to_end(world):
     assert world["cleared"] == [555]
     assert world["answers"] == [("cb1001", "Beställer…")]
     (done,) = world["sent"]
-    assert done.startswith("Beställd: OLRD-3630 (NXP168)\nOrdernummer: ORD-555")
+    assert done.startswith("Beställd: OLRD-0001 (TST001)\nOrdernummer: ORD-555")
     assert "- Oljefilter -> Bosch Oljefilter, Filterinsats" in done
     assert orders_state.last_update_id() == 1001
 
@@ -223,7 +223,7 @@ def test_stage_approve_and_order_end_to_end(world):
     assert record["handled"] is True and record["status"] == "ordered"
     assert world["answers"][-1] == ("cb1003", "Markerar som Hanterad…")
     assert world["cleared"] == [555, 601]
-    assert world["sent"][-1] == "Klar: bokning OLRD-3630 är markerad som Hanterad."
+    assert world["sent"][-1] == "Klar: bokning OLRD-0001 är markerad som Hanterad."
     assert orders_state.outstanding_klar() == []
     assert portal.calls.count("checkout") == 1
 

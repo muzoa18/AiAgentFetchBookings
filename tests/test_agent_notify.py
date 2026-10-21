@@ -18,10 +18,10 @@ RULES = Rules(("Bosch",), ("ProMeister",), 10000, "approve")
 
 BOOKING = {
     "booking_type": "Bokning",
-    "booking_nr": "OLRD-3630",
-    "driver_name": "Mamadou Sowe",
-    "driver_phone": "+46739133124",
-    "reg_nr": "NXP168",
+    "booking_nr": "OLRD-0001",
+    "driver_name": "Test Kund",
+    "driver_phone": "+46700000001",
+    "reg_nr": "TST001",
     "vehicle": "VOLKSWAGEN PASSAT",
     "workshop_dt": "2026-04-01 (3 Dagar)",
     "services": [{"name": "Servicekontroll 150 000 KM"}],
@@ -33,10 +33,10 @@ BOOKING = {
 
 def test_build_message_matches_existing_sms_format():
     assert agent.build_message(BOOKING) == "\n".join([
-        "Ny Bokning - OLRD-3630",
-        "Kund: Mamadou Sowe",
-        "Tel: +46739133124",
-        "Fordon: NXP168 VOLKSWAGEN PASSAT",
+        "Ny Bokning - OLRD-0001",
+        "Kund: Test Kund",
+        "Tel: +46700000001",
+        "Fordon: TST001 VOLKSWAGEN PASSAT",
         "Datum: 2026-04-01 (3 Dagar)",
         "---",
         "Tjänster:",
@@ -432,7 +432,7 @@ def test_failed_login_message_carries_portal_reason(env, monkeypatch):
 
 # ── Hanterad failures are reported; seen Bokningar still listed are retried ──
 
-HANDLED_FAILED = "Kunde inte markera bokning OLRD-3630 som Hanterad i portalen – gör det för hand: http://x/{}"
+HANDLED_FAILED = "Kunde inte markera bokning OLRD-0001 som Hanterad i portalen – gör det för hand: http://x/{}"
 
 
 def _handled_returns(env, monkeypatch, result):
@@ -544,7 +544,7 @@ def test_seen_forfragan_offert_are_not_retried(env):
 
 LOG_KEYS = {"bookings_found", "notified", "notify_failed", "orders_staged", "orders_failed",
             "handled_failed", "login_failed"}
-GIVE_UP = "Försöker inte mer automatiskt för OLRD-3630 – beställ för hand eller åtgärda orsaken."
+GIVE_UP = "Försöker inte mer automatiskt för OLRD-0001 – beställ för hand eller åtgärda orsaken."
 
 
 def test_seen_bokning_logs_already_notified_not_already_handled(env, caplog):
@@ -570,7 +570,7 @@ def test_unseen_no_parts_bokning_notified_once_then_hanterad(env, monkeypatch):
     assert agent.run() == 0
 
     assert [e[0] for e in events] == ["sent", "handled"]
-    assert events[0][1].startswith("Ny Bokning - OLRD-3630")
+    assert events[0][1].startswith("Ny Bokning - OLRD-0001")
     assert env["saved"] == {"B1"}
     assert orders_state.get("B1") is None
     assert env["staged"] == []
@@ -692,7 +692,7 @@ def test_blocked_out_of_tries_sends_one_give_up_message_ever(env):
     assert env["staged"] == []
 
 
-NO_BUTTON_NOTICE = ("Bokning OLRD-3630 verkar sakna Hanterad-knapp (typen är osäker) – "
+NO_BUTTON_NOTICE = ("Bokning OLRD-0001 verkar sakna Hanterad-knapp (typen är osäker) – "
                     "kontrollera den i portalen.")
 
 
@@ -869,13 +869,13 @@ def test_blocked_order_quiet_retry(env, real_stage, old_reason, catalogue, messa
     assert rec["status"] == ("pending" if buttons else "blocked")
     assert rec["detail_url"] == "http://x/B1"
     text = orders_state.ORDERS_FILE.read_text(encoding="utf-8")
-    for sentinel in ("Mamadou Sowe", "+46739133124"):
+    for sentinel in ("Test Kund", "+46700000001"):
         assert sentinel not in text
 
 
 # ── Review I1: never press Hanterad on an incompletely read specification ───
 
-SPEC_INCOMPLETE = ("Bokning OLRD-3630: specifikationen kunde inte läsas fullständigt – jag har "
+SPEC_INCOMPLETE = ("Bokning OLRD-0001: specifikationen kunde inte läsas fullständigt – jag har "
                    "inte markerat den som Hanterad. Kontrollera delarna i portalen.")
 
 
@@ -988,7 +988,7 @@ def test_ordering_setup_error_text_never_reaches_telegram(env, monkeypatch, capl
 
     assert orders_state.get("B1")["status"] == "failed"
     failures = [t for t in env["sent"] if "misslyckades" in t]
-    assert failures == ["Delbeställning misslyckades för OLRD-3630: kunde inte starta "
+    assert failures == ["Delbeställning misslyckades för OLRD-0001: kunde inte starta "
                         "beställningen. Beställ för hand."]
     assert all("SECRET-PAGE-TEXT" not in t and "RuntimeError" not in t for t in env["sent"])
     assert "SECRET-PAGE-TEXT" in caplog.text

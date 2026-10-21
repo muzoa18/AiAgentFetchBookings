@@ -15,12 +15,12 @@ PII = ("Sentinel Kund AB", "+46700000999", "sentinel@example.com", "Sentinel med
 BOOKING = {
     "id": "B1",
     "booking_type": "Bokning",
-    "booking_nr": "OLRD-3630",
+    "booking_nr": "OLRD-0001",
     "driver_name": "Sentinel Kund AB",
     "driver_phone": "+46700000999",
     "driver_email": "sentinel@example.com",
     "booking_msg": "Sentinel meddelande 42",
-    "reg_nr": "NXP168",
+    "reg_nr": "TST001",
     "vehicle": "VOLKSWAGEN PASSAT",
     "parts": [{"name": "Oljefilter", "qty": "2"}, {"name": "Luftfilter", "qty": "1"}],
     "fluids": [{"name": "Olja 5W30", "qty": "5"}],
@@ -179,7 +179,7 @@ def test_no_reg_number_is_blocked_and_messaged(tg, orders_file):
     assert portal.touched == []
     assert tg["buttons"] == []
     assert len(tg["sent"]) == 1
-    assert "OLRD-3630" in tg["sent"][0]
+    assert "OLRD-0001" in tg["sent"][0]
     assert "registreringsnummer" in tg["sent"][0]
     _assert_no_pii(orders_file)
 
@@ -314,7 +314,7 @@ def test_non_empty_cart_before_staging_is_blocked(tg):
     assert "checkout" not in portal.names()
     assert orders_state.get("B1")["status"] == "blocked"
     assert tg["sent"] == ["Varukorgen på pro.meca.se är inte tom (annan väntande beställning?). "
-                          "Hantera OLRD-3630 för hand."]
+                          "Hantera OLRD-0001 för hand."]
 
 
 @pytest.mark.parametrize("rules", [APPROVE, AUTO])
@@ -456,7 +456,7 @@ def test_approve_mode_sends_buttons_and_sets_pending(tg, orders_file):
     assert rec["message_id"] == 77
     plan = rec["plan"]
     assert plan["booking_id"] == "B1"
-    assert plan["reg_nr"] == "NXP168"
+    assert plan["reg_nr"] == "TST001"
     assert plan["total_sek"] == 490.0
     assert [(p["title"], p["qty"], p["url_or_id"]) for p in plan["parts"]] == [
         ("Bosch Oljefilter P7001", 2, "p1"), ("Bosch Luftfilter S0123", 1, "p2")]
@@ -477,7 +477,7 @@ def test_approval_message_undeliverable_is_failed(tg):
     assert status == "failed"
     assert orders_state.get("B1")["status"] == "failed"
     assert len(tg["sent"]) == 1
-    assert "OLRD-3630" in tg["sent"][0]
+    assert "OLRD-0001" in tg["sent"][0]
 
 
 def test_block_message_undeliverable_is_failed(tg):
@@ -538,7 +538,7 @@ def test_portal_exception_is_failed_and_messaged(tg, orders_file):
     assert orders_state.get("B1")["status"] == "failed"  # never left "attempted"
     assert len(tg["sent"]) == 1
     assert "misslyckades" in tg["sent"][0]
-    assert "OLRD-3630" in tg["sent"][0]
+    assert "OLRD-0001" in tg["sent"][0]
     _assert_no_pii(orders_file)
 
 
@@ -562,9 +562,9 @@ def test_record_failure_only_once(tg):
 def test_summary_lists_fluids_to_prepare():
     text = build_summary(BOOKING, _cart(490.0), BOOKING["fluids"], PARTS)
 
-    assert "OLRD-3630" in text
+    assert "OLRD-0001" in text
     assert "Sentinel Kund AB" in text
-    assert "NXP168 VOLKSWAGEN PASSAT" in text
+    assert "TST001 VOLKSWAGEN PASSAT" in text
     assert "Bosch Oljefilter P7001 (Bosch) x2" in text
     assert "120.00 SEK" in text
     assert "Totalt: 490.00 SEK" in text
@@ -641,7 +641,7 @@ def test_execute_order_cart_mismatch_no_checkout(tg):
 def test_execute_order_promeister_line_fails_closed(tg):
     # Even if the expected lines somehow contain a ProMeister item, never check it out.
     line = {"title": "ProMeister bromsskiva", "qty": 1, "url_or_id": "pm1"}
-    plan = {"booking_id": "B1", "booking_nr": "OLRD-3630", "reg_nr": "NXP168",
+    plan = {"booking_id": "B1", "booking_nr": "OLRD-0001", "reg_nr": "TST001",
             "parts": [], "expected_lines": [line], "total_sek": 500.0, "fluids": []}
     orders_state.put("B1", "pending", plan=plan)
     portal = FakePortal(carts=[_cart(500.0, [{"title": "ProMeister bromsskiva", "qty": 1,
@@ -740,7 +740,7 @@ def test_execute_order_other_mismatch_keeps_old_text(tg):
     assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "failed"
 
     (text,) = tg["sent"]
-    assert text.startswith("Beställning stoppad för OLRD-3630: varukorgen stämmer inte")
+    assert text.startswith("Beställning stoppad för OLRD-0001: varukorgen stämmer inte")
     assert text.endswith("Inget beställdes – beställ för hand.")
 
 
@@ -792,7 +792,7 @@ def test_approval_and_ordered_messages_show_line_names_and_stock(tg, orders_file
 
 NO_AIR = {**CATALOGUE, "Luftfilter": []}
 AIR_REASON = "ingen säker träff för 'Luftfilter'"
-GIVE_UP = ("Försöker inte mer automatiskt för OLRD-3630 – "
+GIVE_UP = ("Försöker inte mer automatiskt för OLRD-0001 – "
            "beställ för hand eller åtgärda orsaken.")
 
 
@@ -1003,7 +1003,7 @@ def test_blocked_message_carries_klar_and_stores_its_id(tg):
     assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
                                       confident) == "blocked"
 
-    mid = _klar_only(tg, "Delbeställning stoppad för OLRD-3630")
+    mid = _klar_only(tg, "Delbeställning stoppad för OLRD-0001")
     assert orders_state.get("B1")["klar_message_id"] == mid == 900
     assert tg["buttons"] == [] and tg["cleared"] == []
 
@@ -1051,7 +1051,7 @@ def test_ordered_message_carries_klar(tg):
 
     assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
 
-    mid = _klar_only(tg, "Beställd: OLRD-3630")
+    mid = _klar_only(tg, "Beställd: OLRD-0001")
     rec = orders_state.get("B1")
     assert rec["klar_message_id"] == mid
     assert rec["message_id"] == 77               # the approval message id is untouched
@@ -1068,7 +1068,7 @@ def test_auto_mode_ordered_message_carries_klar(tg):
     (lambda p: setattr(p, "fail_on", "checkout"), "kan ha lagts"),
     (lambda p: setattr(p, "fail_on", "login"), "Inget beställdes"),
     (lambda p: setattr(p, "carts", [{"lines": [], "total_sek": 0.0}]), "Varukorgen på pro.meca.se är tom"),
-    (lambda p: setattr(p, "cart", _cart(500.0)), "Beställning stoppad för OLRD-3630"),
+    (lambda p: setattr(p, "cart", _cart(500.0)), "Beställning stoppad för OLRD-0001"),
 ])
 def test_execute_order_failure_messages_carry_klar(tg, break_it, text):
     portal = FakePortal()
@@ -1088,7 +1088,7 @@ def test_klar_send_failure_falls_back_to_a_plain_message(tg):
 
     assert tg["klar"] == []
     (text,) = tg["sent"]
-    assert text.startswith("Delbeställning stoppad för OLRD-3630")
+    assert text.startswith("Delbeställning stoppad för OLRD-0001")
     assert text.endswith("\n(Klar-knappen kunde inte skickas – markera bokningen som "
                          "Hanterad i portalen.)")
     assert "klar_message_id" not in orders_state.get("B1")
@@ -1225,8 +1225,8 @@ class NoClearPortal(FakePortal):
 
 
 def _partial_text(in_cart, failed):
-    first = (f"Delbeställning för OLRD-3630: i varukorgen: {in_cart}." if in_cart
-             else "Delbeställning för OLRD-3630: Inget lades i varukorgen.")
+    first = (f"Delbeställning för OLRD-0001: i varukorgen: {in_cart}." if in_cart
+             else "Delbeställning för OLRD-0001: Inget lades i varukorgen.")
     return "\n".join([first, f"Kunde inte läggas till: {failed}.", PROMISE,
                       "Förbered (finns på lager):", "- Olja 5W30 x5"])
 
@@ -1321,7 +1321,7 @@ def test_exception_after_adding_keeps_the_cart_and_says_so(tg):
 
     assert portal.cleared == []
     (text,) = tg["sent"]
-    assert text == ("Delbeställning misslyckades för OLRD-3630: tekniskt fel (se loggen). "
+    assert text == ("Delbeställning misslyckades för OLRD-0001: tekniskt fel (se loggen). "
                     "Beställ för hand. Det som redan ligger i varukorgen är orört.")
 
 
@@ -1331,7 +1331,7 @@ def test_exception_before_adding_has_no_cart_promise(tg):
 
     assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "failed"
 
-    assert tg["sent"] == ["Delbeställning misslyckades för OLRD-3630: tekniskt fel (se loggen). "
+    assert tg["sent"] == ["Delbeställning misslyckades för OLRD-0001: tekniskt fel (se loggen). "
                           "Beställ för hand."]
 
 
@@ -1475,7 +1475,7 @@ def test_partly_added_part_is_listed_as_maybe_in_the_cart(tg):
     assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
 
     _assert_partial(tg, portal, "\n".join([
-        "Delbeställning för OLRD-3630: i varukorgen: Bosch Kupéfilter x1, Bosch Oljefilter x1, "
+        "Delbeställning för OLRD-0001: i varukorgen: Bosch Kupéfilter x1, Bosch Oljefilter x1, "
         "Bosch Oljepluggspackning x1, Bosch Luftfilter x1.",
         "Kan ligga delvis i varukorgen – kontrollera antalet: Tändstift "
         "(lade 1 av 2, varukorgen uppdaterades inte).",
@@ -1502,7 +1502,7 @@ def test_normal_and_partial_failures_together(tg):
     assert parts_order.plan_and_stage(CONFIG, FIVE_BOOKING, portal, APPROVE, confident) == "blocked"
 
     _assert_partial(tg, portal, "\n".join([
-        "Delbeställning för OLRD-3630: i varukorgen: Bosch Oljefilter x1, "
+        "Delbeställning för OLRD-0001: i varukorgen: Bosch Oljefilter x1, "
         "Bosch Oljepluggspackning x1, Bosch Luftfilter x1.",
         "Kunde inte läggas till: Kupéfilter (delen finns inte bland delarna som passar bilen).",
         "Kan ligga delvis i varukorgen – kontrollera antalet: Tändstift "
@@ -1518,7 +1518,7 @@ def test_only_a_partial_part_says_nothing_was_fully_added(tg):
     assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "blocked"
 
     (text,) = tg["sent"]
-    assert text.startswith("Delbeställning för OLRD-3630: ingen del lades helt i varukorgen.\n")
+    assert text.startswith("Delbeställning för OLRD-0001: ingen del lades helt i varukorgen.\n")
     assert "Inget lades i varukorgen" not in text
 
 
@@ -1531,7 +1531,7 @@ def test_lost_vehicle_or_login_stops_adding(tg, code, reason):
 
     assert [c[1] for c in portal.calls if c[0] == "add_to_cart"] == ["s1", "s2"]
     _assert_partial(tg, portal, "\n".join([
-        "Delbeställning för OLRD-3630: i varukorgen: Bosch Kupéfilter x1.",
+        "Delbeställning för OLRD-0001: i varukorgen: Bosch Kupéfilter x1.",
         f"Kunde inte läggas till: Oljefilter ({reason}).",
         "Inte försökt: Oljepluggspackning, Luftfilter, Tändstift.",
         PROMISE,

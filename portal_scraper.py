@@ -427,7 +427,7 @@ def _collect_booking_links(page) -> list[dict]:
 
         full_url = href if href.startswith("http") else PORTAL_BASE + href.split("#")[0]
 
-        # Prefer the booking number text (e.g. OLRD-3630) over the numeric ID
+        # Prefer the booking number text (e.g. OLRD-0001) over the numeric ID
         booking_id = text if text and not text[0].isdigit() else numeric_id
 
         log.info("  Booking: %s -> %s", booking_id, full_url)

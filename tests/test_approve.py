@@ -30,8 +30,8 @@ CART = {"lines": [{"title": "Bosch Oljefilter P7001", "qty": 2, "url_or_id": "p1
         "total_sek": 490.0}
 
 
-def plan_for(booking_id="B1", booking_nr="OLRD-3630"):
-    return {"booking_id": booking_id, "booking_nr": booking_nr, "reg_nr": "NXP168",
+def plan_for(booking_id="B1", booking_nr="OLRD-0001"):
+    return {"booking_id": booking_id, "booking_nr": booking_nr, "reg_nr": "TST001",
             "parts": [{"name": "Oljefilter", "title": "Bosch Oljefilter P7001", "brand": "Bosch",
                        "price_sek": 120.0, "qty": 2, "url_or_id": "p1"},
                       {"name": "Luftfilter", "title": "Bosch Luftfilter S0123", "brand": "Bosch",
@@ -40,7 +40,7 @@ def plan_for(booking_id="B1", booking_nr="OLRD-3630"):
             "created_at": T0.isoformat()}
 
 
-def stage(booking_id="B1", message_id=77, updated_at=None, booking_nr="OLRD-3630"):
+def stage(booking_id="B1", message_id=77, updated_at=None, booking_nr="OLRD-0001"):
     orders_state.put(booking_id, "pending", plan=plan_for(booking_id, booking_nr),
                      message_id=message_id)
     if updated_at is not None:
@@ -414,7 +414,7 @@ def test_approve_executes_once_and_second_tap_says_already_handled(tg):
     assert rec["plan"]["confirmation"] == "ORD-9"
     assert tg["answers"] == [("cb5", "Beställer…"), ("cb6", "Redan hanterad.")]
     assert tg["cleared"] == [77]
-    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställd: OLRD-3630")
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställd: OLRD-0001")
     assert orders_state.last_update_id() == 6
 
     # The same tap delivered again on a later poll changes nothing.
@@ -461,7 +461,7 @@ def test_cart_mismatch_marks_failed_and_notifies(tg, run_main):
 
     assert "checkout" not in factory.portal.calls
     assert status() == "failed"
-    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställning stoppad för OLRD-3630")
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställning stoppad för OLRD-0001")
     assert tg["cleared"] == [77]
     assert orders_state.last_update_id() == 5
 
@@ -487,7 +487,7 @@ def test_approve_when_portal_cannot_open_fails_closed(tg, run_main):
 
     assert status() == "failed"
     assert len(tg["sent"]) == 1
-    assert "OLRD-3630" in tg["sent"][0] and "Inget beställdes" in tg["sent"][0]
+    assert "OLRD-0001" in tg["sent"][0] and "Inget beställdes" in tg["sent"][0]
     assert orders_state.last_update_id() == 5
 
 
@@ -560,12 +560,12 @@ def test_cancel_sets_cancelled_and_clears_buttons(tg, clear_fails, open_fails, t
     assert tg["cleared"] == [77]
     assert tg["answers"] == [("cb5", "Avbruten.")]
     assert len(tg["sent"]) == 1
-    assert tg["sent"][0].startswith("Avbruten: OLRD-3630.")
+    assert tg["sent"][0].startswith("Avbruten: OLRD-0001.")
     assert tg["sent"][0].endswith(tail)
     assert "checkout" not in factory.portal.calls
     if not open_fails:
         assert factory.portal.calls == ["login", "clear_cart"]
-        assert factory.portal.cleared_regs == ["NXP168"]  # the cart is per vehicle
+        assert factory.portal.cleared_regs == ["TST001"]  # the cart is per vehicle
     assert orders_state.last_update_id() == 5
 
     # Approve tapped after cancel does nothing.
@@ -601,7 +601,7 @@ def test_expire_stale_after_48h_notifies(tg):
     assert tg["cleared"] == [77]
     assert len(tg["sent"]) == 1
     assert tg["sent"][0].startswith(
-        "Godkännandet för OLRD-3630 har gått ut (48 h). Beställ för hand om delarna behövs.")
+        "Godkännandet för OLRD-0001 har gått ut (48 h). Beställ för hand om delarna behövs.")
     assert "töm" in tg["sent"][0]
 
 
@@ -647,7 +647,7 @@ def test_cancel_message_carries_klar(tg):
     assert approve.handle_updates(CONFIG, PortalFactory(), APPROVE) == 1
 
     (text, buttons, mid), = tg["klar"]
-    assert buttons == KLAR and text.startswith("Avbruten: OLRD-3630.")
+    assert buttons == KLAR and text.startswith("Avbruten: OLRD-0001.")
     assert tg["sent"] == [text]
     assert orders_state.get("B1")["klar_message_id"] == mid
     assert tg["cleared"] == [77]  # only the approval buttons
@@ -695,7 +695,7 @@ def test_ordered_message_from_the_poller_carries_klar(tg):
     assert approve.handle_updates(CONFIG, PortalFactory(), APPROVE) == 1
 
     (text, buttons, mid), = tg["klar"]
-    assert buttons == KLAR and text.startswith("Beställd: OLRD-3630")
+    assert buttons == KLAR and text.startswith("Beställd: OLRD-0001")
     assert orders_state.get("B1")["klar_message_id"] == mid
 
 
@@ -715,8 +715,8 @@ def klar_tap(update_id, booking_id="B1", message_id=900, **kw):
     return tap(update_id, data=f"klar:{booking_id}", message_id=message_id, **kw)
 
 
-DONE = "Klar: bokning OLRD-3630 är markerad som Hanterad."
-NOT_DONE = f"Kunde inte markera bokning OLRD-3630 som Hanterad – gör det för hand: {URL}"
+DONE = "Klar: bokning OLRD-0001 är markerad som Hanterad."
+NOT_DONE = f"Kunde inte markera bokning OLRD-0001 som Hanterad – gör det för hand: {URL}"
 
 
 @pytest.mark.parametrize("status_", ["ordered", "blocked", "failed", "cancelled", "expired"])
@@ -809,7 +809,7 @@ def test_klar_without_detail_url_asks_for_manual_handling(tg, hanterad, run_main
     assert hanterad["calls"] == []
     assert tg["answers"] == [("cb5", "Saknar länk – markera bokningen som Hanterad i portalen.")]
     (text,) = tg["sent"]
-    assert "OLRD-3630" in text and "Hanterad i portalen" in text
+    assert "OLRD-0001" in text and "Hanterad i portalen" in text
     assert orders_state.get("B1").get("handled") is not True
 
 
@@ -910,7 +910,7 @@ def test_klar_double_tap_and_replay(tg, hanterad, run_main):
 def test_klar_for_a_blocked_record_due_for_quiet_restage(tg, hanterad):
     resolved(status_="blocked", cart_touched=False)
     orders_state.put("B1", "blocked", plan={"reason": "ingen säker träff för 'Luftfilter'",
-                                            "booking_id": "B1", "booking_nr": "OLRD-3630"})
+                                            "booking_id": "B1", "booking_nr": "OLRD-0001"})
     hanterad["result"] = True
     tg["updates"] = [klar_tap(5)]
 
@@ -1112,7 +1112,7 @@ def test_portal_open_failure_message_has_no_raw_exception_text(tg, run_main):
 
     (text,) = tg["sent"]
     assert "SECRET-PAGE-TEXT" not in text
-    assert text.startswith("Beställning misslyckades för OLRD-3630: kunde inte öppna pro.meca.se.")
+    assert text.startswith("Beställning misslyckades för OLRD-0001: kunde inte öppna pro.meca.se.")
     assert status() == "failed"
 
 
@@ -1169,7 +1169,7 @@ def test_expired_klar_is_closed_once_with_a_notice(tg, hanterad, run_main, monke
     assert run_main(PortalFactory(allowed=False)) == 0
 
     assert tg["cleared"] == [900]
-    assert tg["sent"] == ["Klar-knappen för OLRD-3630 har gått ut – markera bokningen som "
+    assert tg["sent"] == ["Klar-knappen för OLRD-0001 har gått ut – markera bokningen som "
                           "Hanterad i portalen."]
     assert orders_state.get("B1")["klar_closed"] is True
     assert hanterad["calls"] == []
