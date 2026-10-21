@@ -226,3 +226,32 @@
 - [ ] **Step 3: Implement** in `parts_matcher.py` / `parts_order.py` (term loop only).
 - [ ] **Step 4: Run full suite, expect PASS.**
 - [ ] **Step 5: Commit** `feat: placement, title-brand and search-term handling for pro.meca.se`.
+
+---
+
+## Wave 2 (2026-10-21, after the first real run) — owner-stated rules
+
+Rules (owner): (1) Pollenfilter = Kupéfilter (searching "pollenfilter" on pro.meca.se returns nothing; "kupéfilter" returns the linked parts). (2) The booking's "Delar" table gives an **Artikel-ID** per part (columns name, OEM No, Artikel-ID, Antal, Beställda, Pris, Rabatt, Totalt); it is the pro.meca.se "Art. Nr", usually a **ProMeister** part (never ordered) -> use it as the REFERENCE and find a similar linked part from another brand (Bosch preferred); a non-ProMeister Artikel-ID is itself a valid candidate (controller default, owner not yet asked: order exactly that article). Fluids have no Artikel-ID. Live facts: searching the Artikel-ID with the booking's vehicle loaded gives "Kopplade reservdelar (1)" plus an extra tab "Artikelnummer (1)"; the result card shows "Produktinformation" specs (e.g. Kupéfilter ProMeister 1025-PC40293: Utrustning: För fordon med AC, Filtertyp: Partikelfilter, Längd ...).
+
+### Task 10: Read Artikel-ID and OEM No from the booking's Delar table
+**Files:** Modify `portal_scraper.py` (`_extract_specification` and its part-row parsing), `tests/`; Create a small sanitised fixture `tests/fixtures/booking_delar.html` (derived from the saved page; no customer data).
+**Interfaces:** each item in `booking["parts"]` gains `article_id: str` and `oem_no: str` (empty string when absent); existing keys (`name`, `qty`, ...) unchanged; fluid rows (section "Vätskor / Oljor") keep empty ids.
+- [ ] Test-first: parse the fixture -> Pollenfilter (`1025-PC40293`), Oljefilter (`1025-F026407142`), Oljepluggspackning (`1500-49470236`), Luftfilter (`1025-ADG022137`), Tändstift x4 (`1015-0242135554`); fluids with empty ids; "Tjänster" rows (OEM "F00093") are NOT parts.
+- [ ] Commit `feat: read Artikel-ID and OEM No from the booking parts table`.
+
+### Task 11: Search synonyms (Pollenfilter = Kupéfilter)
+**Files:** Modify `parts_matcher.py` (`search_terms`), `tests/test_parts_matcher.py`.
+**Interfaces:** module constant `SEARCH_SYNONYMS: dict[str, tuple[str, ...]]` (`"pollenfilter": ("kupéfilter", "kupefilter")`, `"kupefilter": ("kupéfilter",)`, `"kupéfilter": ("kupefilter",)`); `search_terms(line_name)` returns synonyms FIRST (after normalisation), then the normalised term, then the original; no duplicates, never empty strings.
+- [ ] Test-first: `search_terms("Pollenfilter")` starts with `"kupéfilter"`; `"Pollenfilter fram x2"`; unknown words unaffected; dedupe; synonym lookup works on the plural-normalised/placement-stripped form.
+- [ ] Commit `feat: pollenfilter/kupéfilter search synonyms`.
+
+### Task 12: Artikel-ID reference lookup and similar-part matching
+**Files:** Modify `parts_portal.py` + `parts_portal_parse.py` (result cards also carry `specs` = the "Produktinformation" text and `tab`), `parts_matcher.py` (`choose`/picker accept a `reference`), `parts_order.py` (`_stage`), tests + fixtures.
+**Interfaces:** `PartsPortal.lookup_article(article_id: str) -> dict | None` (search the Artikel-ID with the vehicle loaded; return the card whose `article_nr` equals it from "Kopplade reservdelar" or the "Artikelnummer" tab, else None; read-only); candidate dicts gain `specs: str`; `choose(line, candidates, rules, picker, reference=None)` — when `reference` is given the picker prompt includes the reference title/brand/specs and asks for the best SIMILAR part (same part type, matching specs/dimensions), same confidence gate, same filters (ProMeister, fluids, placement, non-Latin, fitment); a reference that is itself an acceptable candidate (non-ProMeister, linked, not discontinued) is added to the candidate list; in `_stage`, for a line with `article_id`: `lookup_article` first -> pass as `reference`; if lookup returns None fall back to the normal name search; never order the ProMeister reference itself.
+- [ ] Test-first with fakes (ProMeister reference -> a Bosch similar part is chosen, reference never chosen; non-ProMeister reference -> chosen when preferred brand rules allow, else a preferred alternative; lookup None -> normal search; picker prompt contains the reference specs; ceiling/placement/fluid filters still apply).
+- [ ] Commit `feat: use the booking's Artikel-ID as a reference to find similar parts`.
+
+### Later Wave 2 projects (separate design + plan each)
+- **Task 13 Repair agent:** on a failed/blocked order or failed portal step, a bounded agent diagnoses (error, order state, screenshots, page structure) and may fix ONLY data-level things (selectors, search words/synonyms, text patterns in a data file `portal_selectors.json`) automatically after the test suite passes, with a Telegram report and a revert hint; logic changes are proposed as a pull request, never applied unattended; it never places orders and never touches rules/limits/safety code or workflows.
+- **Task 14 Order checker:** after approve/checkout, re-open pro.meca.se Orderöversikt and confirm the order exists and matches (lines, total); record the real confirmation reference; Telegram result.
+- **Task 15 Simple UI (Vercel):** read-only view of bookings/orders with confirm/cancel buttons triggering the approve workflow via the GitHub API; auth and exact scope to be designed with the owner.
