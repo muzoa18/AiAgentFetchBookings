@@ -7,7 +7,7 @@ THREE MODES:
 
   PR mode (GitHub Actions, .github/workflows/weekly-improve.yml, Mondays):
       python improve.py --apply-all
-      → Applies every proposal that does not touch a protected path, py_compiles
+      → Applies every proposal for an allowlisted file (allowed_path), py_compiles
         each changed .py (reverting any that fail), writes
         improve_reports/latest.md, and the workflow opens a Pull Request.
 
@@ -19,7 +19,8 @@ THREE MODES:
       python improve.py --auto
       → Applies only proposals marked auto_apply. Logs to logs/improve_auto.log.
 
-In every mode a proposal for a PROTECTED_PATHS file is never written (is_protected).
+In every mode a proposal may only write an allowlisted file (ALLOWED_FILES or a
+.py file directly under tests/); everything else is skipped and reported.
 """
 
 import sys
@@ -77,57 +78,116 @@ LOG_FILES = [
     ("logs/improve_auto.log", "AUTO-IMPROVE LOG"),
 ]
 
-# Paths a proposal may never write, enforced in code (is_protected) before any file
-# is touched, whatever the model says. An entry ending in "/" protects a directory.
-# The safety logic named in SYSTEM_PROMPT lives in whole files below, so those files
-# are protected entirely: a proposal for them is listed as "skipped (protected)" in
-# the report for a human to apply by hand.
-PROTECTED_PATHS = (
-    ".github/",                 # workflows, schedules, secrets wiring
-    ".claude/",                 # agent context
-    "config/",                  # config, state files (seen_ids.txt, orders.json)
-    "parts_rules.yaml",         # brand rules, 10,000 SEK ceiling, approve/auto mode
-    "rules.py",                 # validation of the rules file
-    "approve.py",               # approval authorisation (owner, private chat, message id)
-    "parts_matcher.py",         # ProMeister / fluid / placement / brand safety
-    "parts_order.py",           # ceiling and cart checks, attempted-before-checkout
-    "parts_order_helpers.py",   # cart and total checks
-    "orders_state.py",          # order-state validation (never order twice)
-    "improve.py",               # this file, including this list
+# The ONLY files a proposal may write, enforced in code (allowed_path) at write
+# time, whatever the model says: these existing modules, plus .py files directly
+# under tests/ (new or existing). Everything else (.git/, .github/, .claude/,
+# config/, parts_rules.yaml, the safety modules, agent.py, improve.py, docs, new
+# modules) is skipped and listed in the report as "skipped (not on the allowlist)".
+# Writing .git/ or .github/ would run code in CI before anyone reviews the PR.
+ALLOWED_FILES = (
+    "portal_scraper.py",
+    "parts_portal.py",
+    "parts_portal_parse.py",
+    "notifier.py",
+    "state.py",
+    "run_logger.py",
 )
+ALLOWED_TEST_DIR = "tests"
+NOT_ALLOWED = "skipped (not on the allowlist)"
 
 
-def is_protected(file: str) -> bool:
-    """True if a proposal may not write `file`. Fails closed: anything that is not
-    a plain relative path inside the repo (absolute, '..', empty) counts as protected.
-    Compared case-insensitively, with '\\' as a separator, before and after resolving
-    symlinks."""
-    raw = str(file or "").strip().replace("\\", "/")
-    # ":" covers drive letters and NTFS streams; a trailing dot/space names the
-    # same file on Windows ("parts_rules.yaml." == "parts_rules.yaml").
-    if not raw or raw.startswith("/") or ":" in raw:
-        return True
-    parts = [part for part in raw.split("/") if part not in ("", ".")]
-    if not parts or ".." in parts or any(part[-1] in ". " for part in parts):
-        return True
-    root = Path.cwd().resolve()
+def _repo_root() -> Path:
+    return Path.cwd().resolve()
+
+
+def allowed_path(file) -> str | None:
+    """The repo-relative path if a proposal may write `file`, else None.
+
+    Fails closed. Never allowed: a non-string or empty path, NUL, backslashes,
+    ':', absolute paths, empty / '.' / '..' components, any component starting with
+    '.' or ending with '.' or ' ', a path (or any parent directory) that is a
+    symlink, or a path whose resolved real path is not exactly that path inside
+    the repo root. Allowed: an existing regular file named exactly in
+    ALLOWED_FILES, or `tests/<name>.py` (existing regular file or new).
+    """
+    if not isinstance(file, str) or not file or file != file.strip():
+        return None
+    if any(bad in file for bad in ("\x00", "\\", ":")) or file.startswith("/"):
+        return None
+    parts = file.split("/")
+    if any(not part or part.startswith(".") or part[-1] in ". " for part in parts):
+        return None
+    rel = "/".join(parts)
+    if len(parts) == 1:
+        if rel not in ALLOWED_FILES:
+            return None
+    elif not (len(parts) == 2 and parts[0] == ALLOWED_TEST_DIR and parts[1].endswith(".py")):
+        return None
+
+    root = _repo_root()
+    target = root.joinpath(*parts)
     try:
-        resolved = (root / "/".join(parts)).resolve().relative_to(root).as_posix()
-    except (ValueError, OSError):
-        return True
-    return any(_matches_protected(rel) for rel in ("/".join(parts), resolved))
+        current = root
+        for part in parts:          # no symlink anywhere on the way
+            current = current / part
+            if current.is_symlink():
+                return None
+        if target.exists():
+            if not target.is_file():
+                return None
+        elif len(parts) == 1:
+            return None             # the allowed modules must already exist
+        elif not target.parent.is_dir():
+            return None
+        if target.resolve().relative_to(root).as_posix() != rel:
+            return None
+    except (OSError, ValueError):
+        return None
+    return rel
 
 
-def _matches_protected(rel: str) -> bool:
-    rel = rel.casefold()
-    for entry in PROTECTED_PATHS:
-        entry = entry.casefold()
-        if entry.endswith("/"):
-            if rel == entry.rstrip("/") or rel.startswith(entry):
-                return True
-        elif rel == entry:
-            return True
-    return False
+def _read_checked(file: str) -> tuple[str, str] | None:
+    """(text with '\\n' line ends, original line end) of an allowed existing file."""
+    rel = allowed_path(file)
+    if rel is None:
+        return None
+    path = _repo_root() / rel
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8", newline="") as f:
+        raw = f.read()
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    return raw.replace("\r\n", "\n"), eol
+
+
+def _write_checked(file: str, text: str, eol: str = "\n") -> bool:
+    """Write `text` only if `file` is allowed right now (checked again at write time,
+    and opened with O_NOFOLLOW where the OS has it). False if refused."""
+    rel = allowed_path(file)
+    if rel is None:
+        print(f"  REFUSED: {file!r} is not on the allowlist — not written.")
+        return False
+    data = text.replace("\r\n", "\n")
+    if eol == "\r\n":
+        data = data.replace("\n", "\r\n")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(_repo_root() / rel, flags, 0o644)
+    except OSError as exc:
+        print(f"  REFUSED: {file!r} could not be opened safely ({exc}).")
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(data)
+    return True
+
+
+def _delete_checked(file: str) -> bool:
+    """Delete a file the apply step created, only if it is allowed right now."""
+    rel = allowed_path(file)
+    if rel is None:
+        return False
+    os.unlink(_repo_root() / rel)
+    return True
 
 
 SYSTEM_PROMPT = """
@@ -169,19 +229,17 @@ THE SYSTEM:
 4. State — config/orders.json (orders_state.py): one status per booking so a
    booking is never ordered twice; "attempted" is written before checkout.
 
-PROTECTED AREAS — proposals must NOT touch:
-- anything under .github/ (workflows, schedules, secrets) or config/,
-- parts_rules.yaml and rules.py,
-- the approval authorisation in approve.py (owner / private chat / message id),
-- the ceiling, ProMeister, fluid and placement safety logic in parts_matcher.py,
-  parts_order.py and parts_order_helpers.py,
-- the validation in orders_state.py,
-- improve.py itself.
-This is enforced in code: a proposal for approve.py, parts_matcher.py,
-parts_order.py, parts_order_helpers.py, orders_state.py, rules.py, improve.py,
-parts_rules.yaml or any path under .github/ or config/ is NOT applied; it is
-listed in the report as "skipped (protected)" for a human to review. Only
-propose changes there for a real, clearly explained bug.
+FILES YOU MAY CHANGE (an allowlist, enforced in code):
+- portal_scraper.py, parts_portal.py, parts_portal_parse.py, notifier.py,
+  state.py, run_logger.py (existing files only),
+- .py files directly under tests/ (new or existing).
+A proposal for ANY other path is NOT applied and is listed in the report as
+"skipped (not on the allowlist)" for a human to review. That includes .github/,
+.git/, config/, parts_rules.yaml, rules.py, approve.py (approval authorisation),
+parts_matcher.py, parts_order.py, parts_order_helpers.py (ceiling, ProMeister,
+fluid and placement safety), orders_state.py (validation), agent.py,
+config_loader.py, improve.py, docs and new modules. Only propose such a change
+for a real, clearly explained bug, knowing a human must apply it.
 
 WELCOME: selector fixes and parsing robustness (portal_scraper.py,
 parts_portal.py, parts_portal_parse.py), logging, error handling, clearer
@@ -352,45 +410,50 @@ def show_diff(original: str, replacement: str, filename: str):
 
 
 def apply_proposal(proposal: dict) -> bool:
+    """Apply one proposal. Only allowlisted files are ever read for writing or
+    written (allowed_path, checked again at write time). False if not applied."""
     file    = proposal.get("file", "")
     ctype   = proposal.get("change_type", "")
-    find    = proposal.get("find", "")
-    replace = proposal.get("replacement", "")
-    path    = Path(file)
+    find    = (proposal.get("find", "") or "").replace("\r\n", "\n")
+    replace = (proposal.get("replacement", "") or "").replace("\r\n", "\n")
 
-    if is_protected(file):
-        print(f"  SKIPPED: {file} is a protected path — not written.")
-        return False
-
-    if not path.exists():
-        print(f"  ERROR: {file} not found.")
-        return False
-
-    current = path.read_text(encoding="utf-8")
-
-    if ctype == "replace_file":
-        path.write_text(replace, encoding="utf-8")
-        print(f"  Replaced entire {file}.")
+    if ctype == "config_change":
+        print(f"  Config change — apply manually (secrets / config.yaml), not written:")
+        print(f"  {replace}")
         return True
 
-    elif ctype in ("replace_function", "add_function"):
+    if allowed_path(file) is None:
+        print(f"  SKIPPED: {file!r} — {NOT_ALLOWED}.")
+        return False
+
+    existing = _read_checked(file)
+    if ctype == "replace_file":
+        eol = existing[1] if existing else "\n"
+        if _write_checked(file, replace, eol):
+            print(f"  Replaced entire {file}.")
+            return True
+        return False
+
+    if existing is None:
+        print(f"  ERROR: {file} not found.")
+        return False
+    current, eol = existing
+
+    if ctype in ("replace_function", "add_function"):
         if find and find in current:
-            path.write_text(current.replace(find, replace, 1), encoding="utf-8")
-            print(f"  Updated {file}.")
-            return True
+            if _write_checked(file, current.replace(find, replace, 1), eol):
+                print(f"  Updated {file}.")
+                return True
+            return False
         elif ctype == "add_function":
-            path.write_text(current.rstrip() + "\n\n" + replace + "\n", encoding="utf-8")
-            print(f"  Appended to {file}.")
-            return True
+            if _write_checked(file, current.rstrip() + "\n\n" + replace + "\n", eol):
+                print(f"  Appended to {file}.")
+                return True
+            return False
         else:
             print(f"  ERROR: Target code not found in {file}.")
             print(f"  Looking for: {find[:100]}...")
             return False
-
-    elif ctype == "config_change":
-        print(f"  Config change — apply manually to config/config.yaml:")
-        print(f"  {replace}")
-        return True
 
     return False
 
@@ -489,7 +552,7 @@ def run_interactive(api_key: str):
 def run_auto(api_key: str):
     """
     Silent mode — applies only auto_apply=true proposals.
-    Run by hand; protected paths are never written (apply_proposal).
+    Run by hand; only allowlisted files are ever written (apply_proposal).
     """
     log_path = Path("logs/improve_auto.log")
     Path("logs").mkdir(exist_ok=True)
@@ -567,52 +630,57 @@ def run_apply_all(api_key: str):
         _write_report([], [], [], [], [])
         return
 
-    # Snapshot originals so we can revert files that end up broken.
-    snapshots = {f: Path(f).read_text(encoding="utf-8")
-                 for f in SOURCE_FILES if Path(f).exists()}
+    # Snapshot each target before its first change so a broken file can be
+    # reverted (None = the file did not exist and is deleted on revert).
+    snapshots: dict[str, tuple[str, str] | None] = {}
 
-    applied, failed, skipped, protected = [], [], [], []
+    applied, failed, skipped, not_allowed = [], [], [], []
     for p in proposals:
         title = p.get("title", "?")
-        if is_protected(p.get("file", "")):
-            # Checked before anything is written (apply_proposal checks again).
-            protected.append(p)
-            print(f"  [PROTECTED] {title} ({p.get('file')}) — skipped (protected)")
-            continue
         if p.get("change_type") == "config_change":
             # Config lives in GitHub Secrets, not in the repo — can't auto-apply.
             skipped.append(p)
             print(f"  [SKIP] {title} (config_change — apply manually in Secrets)")
             continue
-        if apply_proposal(p):
-            applied.append(p)
+        rel = allowed_path(p.get("file", ""))
+        if rel is None:
+            not_allowed.append(p)
+            print(f"  [SKIP] {title} ({p.get('file')!r}) — {NOT_ALLOWED}")
+            continue
+        if rel not in snapshots:
+            snapshots[rel] = _read_checked(rel)
+        if apply_proposal({**p, "file": rel}):
+            applied.append({**p, "file": rel})
             print(f"  [APPLY] {title}")
         else:
             failed.append(p)
-            print(f"  [FAIL]  {title} (target not found)")
+            print(f"  [FAIL]  {title} (not applied)")
 
     # Syntax-check every changed Python file; revert the broken ones.
     reverted = []
-    for fname, original in snapshots.items():
-        path = Path(fname)
-        if not fname.endswith(".py") or not path.exists():
+    for rel, original in snapshots.items():
+        if not rel.endswith(".py"):
             continue
-        if path.read_text(encoding="utf-8") == original:
+        now = _read_checked(rel)
+        if now == original:
             continue  # unchanged
         try:
-            py_compile.compile(fname, doraise=True)
+            py_compile.compile(str(_repo_root() / rel), doraise=True)
         except py_compile.PyCompileError as exc:
-            path.write_text(original, encoding="utf-8")
-            reverted.append((fname, str(exc)))
-            applied = [p for p in applied if p.get("file") != fname]
-            print(f"  [REVERT] {fname} — does not compile, reverted.")
+            if original is None:
+                _delete_checked(rel)
+            else:
+                _write_checked(rel, original[0], original[1])
+            reverted.append((rel, str(exc)))
+            applied = [p for p in applied if p.get("file") != rel]
+            print(f"  [REVERT] {rel} — does not compile, reverted.")
 
     save_proposal_log(proposals, list(range(len(applied))), "apply_all")
-    _write_report(proposals, applied, skipped + failed, reverted, protected)
+    _write_report(proposals, applied, skipped + failed, reverted, not_allowed)
     print(f"\nApplied {len(applied)} change(s). Reverted {len(reverted)} broken file(s).")
 
 
-def _write_report(proposals, applied, not_applied, reverted, protected=()):
+def _write_report(proposals, applied, not_applied, reverted, not_allowed=()):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"# Weekly improve report — {ts}", ""]
@@ -634,11 +702,11 @@ def _write_report(proposals, applied, not_applied, reverted, protected=()):
                 lines.append(f"- **{p.get('title')}** (`{p.get('file')}`, "
                              f"{p.get('change_type')}) — {p.get('reason')}")
             lines.append("")
-        if protected:
-            lines.append("## 🔒 Skipped (protected) — NOT applied, review by hand")
-            for p in protected:
-                lines.append(f"- **{p.get('title')}** (`{p.get('file')}`) — "
-                             f"skipped (protected) — {p.get('reason')}")
+        if not_allowed:
+            lines.append("## 🔒 Skipped (not on the allowlist) — NOT applied, review by hand")
+            for p in not_allowed:
+                lines.append(f"- **{p.get('title')}** (`{p.get('file')!r}`) — "
+                             f"{NOT_ALLOWED} — {p.get('reason')}")
             lines.append("")
         if reverted:
             lines.append("## ⛔ Reverted (failed to compile)")

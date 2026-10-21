@@ -19,6 +19,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # No git credentials on disk while proposals are applied; the PR step
+          # authenticates with its own token input.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
