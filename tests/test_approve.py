@@ -1227,7 +1227,8 @@ def today() -> str:
     return approve._local_date(datetime.now(timezone.utc)).isoformat()
 
 
-def sent_row(supplier_no, model, numbers, day=None, reg=""):
+def sent_row(supplier_no, model, numbers, day=None, reg=None):
+    """reg=None: as if the table had no registration column (model matching)."""
     return {"supplier_no": supplier_no, "status": "", "date": day or today(), "reg_nr": reg,
             "model": model, "order_numbers": numbers, "order_status": "Bekräftad"}
 
@@ -1505,3 +1506,88 @@ def test_main_polls_when_only_an_unverified_order_is_open(tg, run_main):
     factory = PortalFactory(SentPortal([]))
     assert run_main(factory) == 0
     assert factory.portal.calls == ["list_sent_orders"]
+
+
+# ── Review round 1: several records per run, plates, stored numbers ──────────
+
+def _set_reg(booking_id, reg):
+    data = json.loads(orders_state.ORDERS_FILE.read_text(encoding="utf-8"))
+    data["bookings"][booking_id]["plan"]["reg_nr"] = reg
+    orders_state.ORDERS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_two_orders_for_one_car_and_one_row_verify_nothing_yet(tg, run_main):
+    placed("B1")
+    placed("B2", booking_nr="OLRD-0002")
+    rows = [sent_row("90000002", RIO, "01000011/01000012", reg="TST001")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert tg["sent"] == []
+    for bid in ("B1", "B2"):
+        assert "verified_at" not in orders_state.get(bid)
+        assert "verify_warned" not in orders_state.get(bid)
+
+
+def test_two_orders_for_one_car_and_two_rows_are_ambiguous_for_both(tg, run_main):
+    placed("B1")
+    placed("B2", booking_nr="OLRD-0002")
+    rows = [sent_row("90000002", RIO, "01000011/01000012", reg="TST001"),
+            sent_row("90000003", RIO, "01000021/01000022", reg="TST001")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert len(tg["sent"]) == 2
+    for text, nr in zip(tg["sent"], ("OLRD-0001", "OLRD-0002")):
+        assert text.startswith("Flera ordrar för") and f"som är {nr}:" in text
+        assert "90000002 (01000011/01000012), 90000003 (01000021/01000022)" in text
+    assert all(orders_state.get(b)["verify_warned"] is True for b in ("B1", "B2"))
+    assert all("verified_at" not in orders_state.get(b) for b in ("B1", "B2"))
+
+
+def test_two_cars_in_one_run_are_each_verified(tg, run_main):
+    placed("B1")
+    placed("B2", booking_nr="OLRD-0002", model="OPELASTRA (J)")
+    _set_reg("B2", "TST002")
+    rows = [sent_row("90000002", RIO, "01000011/01000012", reg="TST001"),
+            sent_row("90000004", ASTRA, "01000031/01000032", reg="TST002")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert orders_state.get("B1")["verified_numbers"].startswith("90000002")
+    assert orders_state.get("B2")["verified_numbers"].startswith("90000004")
+
+
+def test_with_a_plate_an_empty_registration_row_is_not_our_order(tg, run_main):
+    placed()
+    rows = [sent_row("90000002", RIO, "01000011/01000012", reg=""),
+            sent_row("90000003", ASTRA, "01000021/01000022", reg="TST009")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert tg["sent"] == [] and "verified_at" not in orders_state.get("B1")
+
+
+def test_a_plate_match_verifies_whatever_the_model_naming(tg, run_main):
+    placed(model="MERCEDESC220 (W205)")
+    rows = [sent_row("90000002", "MERCEDES-BENZ, C-Klass (W205), 14-21", "01000011",
+                     reg="TST001")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert tg["sent"] == ["Beställning verifierad: OLRD-0001 – MERCEDES-BENZ, C-Klass (W205), "
+                          "14-21, ordernummer 90000002 (01000011)."]
+
+
+def test_a_plate_match_without_a_model_in_the_row_names_the_booking_model(tg, run_main):
+    placed()
+    rows = [sent_row("90000002", "", "01000011", reg="TST001")]
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert tg["sent"] == ["Beställning verifierad: OLRD-0001 – KIARIO (III)(2014), "
+                          "ordernummer 90000002 (01000011)."]
+
+
+def test_long_numbers_are_stored_cut_and_claimed_the_same_way_next_run(tg, run_main):
+    long = "/".join(f"0100{i:04d}" for i in range(17))             # 152 characters
+    rows = [sent_row("90000002", RIO, long, reg="TST001")]
+    placed("B1")
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    stored = orders_state.get("B1")["verified_numbers"]
+    assert len(stored) <= orders_state.NUMBERS_MAX and stored.startswith("90000002 · ")
+    assert not stored.endswith(("/", "·", " "))
+    assert approve._claimed() == set(stored.replace("·", " ").replace("/", " ").split())
+    # Next run: a second order for the same car must not get the already used row.
+    placed("B2", booking_nr="OLRD-0002")
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert "verified_at" not in orders_state.get("B2") and len(tg["sent"]) == 1
+

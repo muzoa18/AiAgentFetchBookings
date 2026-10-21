@@ -415,11 +415,12 @@ def _numbers_text(row: dict) -> str:
 
 
 def _claimed() -> set[str]:
-    """Order numbers already stored on verified records (never given to another order)."""
-    import re
+    """Order numbers already stored on verified records (never given to another order).
+    Read back with order_match.claim_tokens from the same cut text that was stored."""
+    from order_match import claim_tokens
     taken = set()
     for _, rec in orders_state.by_status("ordered"):
-        taken.update(re.findall(r"[0-9A-Za-z-]+", str(rec.get("verified_numbers") or "")))
+        taken |= claim_tokens(rec.get("verified_numbers"))
     return taken
 
 
@@ -438,60 +439,64 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
     """Find unverified placed orders in pro.meca.se "Skickade Beställningar" (read-only).
 
     The portal is opened (once, through `session`) only when a record can be matched (a
-    car model or a registration number). Returns True when a message was not delivered.
+    car model or a registration number). All records are matched together
+    (order_match.resolve_orders), so two orders for the same car never swap rows.
+    Returns True when a message was not delivered. An undelivered "verified" message is
+    NOT sent again: the stored state is correct and the run exits 1 so it shows.
     """
     import notifier
-    from order_match import match_sent_order
+    from order_match import numbers_text, resolve_orders
     from parts_order_helpers import error_code
 
     todo = _to_verify()
     if not todo:
         return False
-    rows, portal_failed, problem = None, False, False
-    claimed = _claimed()
+    facts = {}  # booking_id -> (label, model, reg, since or None)
     for booking_id, record in todo:
-        label = _label(booking_id, record)
         plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
-        model = record.get("vehicle_model") or ""
         reg = plan.get("reg_nr") if isinstance(plan.get("reg_nr"), str) else None
         try:
             since = datetime.fromisoformat(record["updated_at"])
             since = since if since.tzinfo is not None else None
         except Exception:
             since = None
-        too_old = since is None or now - since > VERIFY_WARN_AFTER
+        facts[booking_id] = (_label(booking_id, record), record.get("vehicle_model") or "",
+                             reg, since)
+    checkable = {bid: (model, _local_date(since), reg)
+                 for bid, (_, model, reg, since) in facts.items()
+                 if since is not None and (model or reg)}
+    results = {}
+    if checkable:
+        try:
+            rows = session.get().list_sent_orders()
+        except Exception as e:  # retried next run; never raw page text in the log
+            code = error_code(e)
+            log.warning("Could not read Skickade Beställningar (%s%s); retried on the "
+                        "next run.", type(e).__name__, f", {code}" if code else "")
+        else:
+            results = resolve_orders(checkable, rows, _claimed())
 
-        result = None
-        if since is not None and (model or reg) and not portal_failed:
-            if rows is None:
-                try:
-                    rows = session.get().list_sent_orders()
-                except Exception as e:  # retried next run; never raw page text in the log
-                    portal_failed = True
-                    code = error_code(e)
-                    log.warning("Could not read Skickade Beställningar (%s%s); retried on the "
-                                "next run.", type(e).__name__, f", {code}" if code else "")
-            if rows is not None:
-                result = match_sent_order(rows, model, _local_date(since), claimed, reg_nr=reg)
+    problem = False
+    for booking_id, (label, model, reg, since) in facts.items():
+        result = results.get(booking_id)
         status = result.status if result is not None else "unchecked"
         log.info("Order checker: %s -> %s.", booking_id, status)
-
+        too_old = since is None or now - since > VERIFY_WARN_AFTER
         if status == "verified":
             row = result.row
-            numbers = f"{row['supplier_no']} · {row.get('order_numbers') or ''}".strip(" ·")
             orders_state.update_fields(booking_id, verified_at=now.isoformat(),
-                                       verified_numbers=numbers[:orders_state.NUMBERS_MAX])
-            claimed.update(n for n in numbers.replace("/", " ").split() if n != "·")
-            text = VERIFIED_TEXT.format(label=label, model=row["model"],
+                                       verified_numbers=numbers_text(row))
+            text = VERIFIED_TEXT.format(label=label, model=row.get("model") or model or "–",
                                         numbers=_numbers_text(row))
-            if not notifier.send_message(config, text):
+            if not notifier.send_message(config, text):  # not resent: the state is right
                 log.error("Verified message for %s was not delivered.", booking_id)
                 problem = True
         elif status == "ambiguous":
             listed = ", ".join(_numbers_text(r) for r in result.rows[:AMBIGUOUS_LIST_MAX])
-            text = AMBIGUOUS_TEXT.format(model=result.rows[0]["model"], label=label, rows=listed)
+            shown = next((r["model"] for r in result.rows if r.get("model")), model or "bilen")
+            text = AMBIGUOUS_TEXT.format(model=shown, label=label, rows=listed)
             problem = not _send_once(config, booking_id, text) or problem
-        elif too_old:  # not found (or not checkable) for 3 days
+        elif too_old:  # not found, waiting, not checkable or portal error for 3 days
             problem = not _send_once(config, booking_id,
                                      NOT_VERIFIED_TEXT.format(label=label)) or problem
     return problem

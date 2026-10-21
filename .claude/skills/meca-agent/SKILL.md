@@ -55,6 +55,33 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
 - Verify a Python change with `python -m py_compile <file>`; the improve job applies the same check.
 - `agent.py` and `portal_scraper.py` are committed with CRLF line endings; keep them that way.
 
+## Order checker (approve.py, after the taps)
+- A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the
+  final click); the Beställd message then says "Ordernummer: bekräftas senare (kolla Skickade
+  Beställningar i pro.meca.se)". The real order shows up later in Orderöversikt → tab
+  "Skickade Beställningar" (columns: Ordernummer, Status, Datum, Registreringsnummer (hidden),
+  Bilmodell, Ordernummer (portal, "01681392/01681393"), …, Beställningsstatus).
+- Each approve run (daily 06:00 UTC, or by hand) checks every `ordered` record without
+  `verified_at` that has not been warned about: `PartsPortal.list_sent_orders()` (read-only; the
+  only click is the tab `li.order-tabs__item[data-filter=sent]`; only the first ~50 rows are
+  read, so it is meant for recent orders) → `order_match.resolve_orders`.
+- A candidate row is dated on or after the order's Swedish date, has a supplier number and is not
+  already claimed by another record's `verified_numbers`. With a plate (`plan.reg_nr`) and a
+  registration column, ONLY a row with the same plate counts (the model is ignored: naming
+  differs, e.g. MERCEDES-BENZ vs MERCEDESC220; an empty-registration row never counts).
+  Without a plate or without the column, the Bilmodell must start with the booking's brand +
+  whole model words (`KIARIO (III)(2014)` ↔ `KIA, Rio Kombi-sedan (III), 12-16`).
+- All unverified records are matched together, nothing is claimed while matching. Records that
+  share candidate rows form a group: one record + one row → verified; one record + several
+  rows → ambiguous; several records with fewer rows than records → wait (silent); several
+  records with as many rows or more → ambiguous for each (never paired by guess).
+- Verified → `verified_at` + `verified_numbers` (cut at a number boundary to 120 chars) stored,
+  message "Beställning verifierad: …" (not resent if undelivered; run exits 1). Ambiguous → ONE
+  message listing the rows (max 5). Not found / waiting / portal error for 3 days (by
+  `updated_at`) → ONE warning. `verify_warned` stops repeats. Portal errors are logged without
+  page text and retried next run.
+- `plan_and_stage` stores the booking's car model as `vehicle_model` (sanitised, ≤ 80 chars).
+
 ## Parts vocabulary and lookup rules (owner-confirmed 2026-10-21)
 - **Pollenfilter = Kupéfilter.** Searching "pollenfilter" on pro.meca.se returns NOTHING; "kupéfilter" returns the linked parts. Treat both words (and "kupefilter") as the same part and search "kupéfilter".
 - **Artikel-ID.** On the booking page the "Delar" table has the columns name, OEM No, Artikel-ID, Antal, Beställda, Pris, Rabatt, Totalt (e.g. `Pollenfilter | 1025-PC40293 | 1025-PC40293 | 1`). The Artikel-ID is the pro.meca.se "Art. Nr" (searching it finds exactly that article, in the extra "Artikelnummer" tab and in "Kopplade reservdelar" when it fits the car). Fluids/oils ("Vätskor / Oljor") have no Artikel-ID.

@@ -481,7 +481,8 @@ def _body_rows(table: Node) -> list[Node]:
 def parse_sent_orders(html: str) -> list[dict]:
     """Rows of the "Skickade Beställningar" table, positions taken from its headers:
     {"supplier_no", "status", "date", "reg_nr", "model", "order_numbers", "order_status"}.
-    A model shown as "-" (not filled in yet) is "". reg_nr is "" without that column.
+    A model shown as "-" (not filled in yet) is "". reg_nr is None when the table has no
+    registration column ("" = the column is there but empty for that row).
     Detail rows (one wide cell) are skipped. Raises PartsPortalError(code "parse") when
     the table or one of its required headers is missing."""
     table, columns = _sent_table(parse_html(html))
@@ -494,7 +495,7 @@ def parse_sent_orders(html: str) -> list[dict]:
         if len(cells) < width:
             continue
         row = {key: _clean_cell(cells[i].text()) for key, i in columns.items()}
-        row.setdefault("reg_nr", "")
+        row.setdefault("reg_nr", None)
         if row["model"] == "-":
             row["model"] = ""
         out.append(row)
@@ -509,21 +510,26 @@ def _sent_tab_active(root: Node) -> bool:
             and not any(t.has_class("active") for t in others))
 
 
-def sent_orders_ready(html: str) -> bool:
+def sent_orders_ready(html: str, allow_empty: bool = False) -> bool:
     """True when the page shows the sent-orders view: the "Skickade Beställningar" tab is
-    the active one, the order table has its headers, and every order row links to the
-    sent view (view=sent; the open carts link view=open)."""
+    the active one, the order table has its headers, every order row links to the sent
+    view (view=sent; the open carts link view=open) and at least one row does. A table
+    without such a row (still loading, or really empty) counts only with allow_empty:
+    list_sent_orders accepts an empty list only after its whole polling budget."""
     root = parse_html(html)
     if not _sent_tab_active(root):
         return False
     table, _ = _sent_table(root)
     if table is None:
         return False
+    sent_rows = 0
     for tr in _body_rows(table):
         link = tr.get("data-url")
-        if link is not None and "view=sent" not in link:
-            return False
-    return True
+        if link is not None:
+            if "view=sent" not in link:
+                return False
+            sent_rows += 1
+    return allow_empty or sent_rows > 0
 
 
 def has_order_tabs(html: str) -> bool:

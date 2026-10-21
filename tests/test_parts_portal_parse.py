@@ -289,7 +289,8 @@ def test_parse_sent_orders_follows_the_header_order():
 def test_parse_sent_orders_without_a_registration_column():
     html = SENT.replace("&#8206;Registreringsnummer", "&#8206;Servicetyp")
     row = parse_sent_orders(html)[1]
-    assert row["reg_nr"] == "" and row["model"].startswith("KIA, Rio")
+    assert row["reg_nr"] is None and row["model"].startswith("KIA, Rio")   # column absent
+    assert parse_sent_orders(SENT)[0]["reg_nr"] == ""                    # column there, empty
 
 
 def test_parse_sent_orders_empty_table_is_empty_list():
@@ -327,3 +328,15 @@ def test_sent_orders_ready_only_for_the_active_sent_tab_with_sent_rows():
     assert not sent_orders_ready(SENT.replace("90000001&amp;view=sent", "90000001&amp;view=open"))
     assert not sent_orders_ready(SENT.replace("&#8206;Bilmodell", "&#8206;Fordon"))
     assert not sent_orders_ready("<html><body>laddar…</body></html>")
+
+
+def _empty(html):
+    start, end = html.index("<tbody>"), html.index("</tbody>")
+    return html[:start] + "<tbody>" + html[end:]
+
+
+def test_an_empty_sent_table_is_only_ready_when_empty_is_allowed():
+    assert not sent_orders_ready(_empty(SENT))                  # may still be loading
+    assert sent_orders_ready(_empty(SENT), allow_empty=True)
+    rows_without_links = SENT.replace("data-url=", "data-x=")
+    assert not sent_orders_ready(rows_without_links)            # no row proves the sent view

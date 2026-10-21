@@ -11,11 +11,14 @@ and the booking's leading token (the text before the first "(") must equal the r
 brand words followed by at least one whole model word: "kiario" = "kia" + "rio". So a bare
 brand ("KIA") never matches, and "KIARION" does not match "KIA, Rio".
 
-The live table also has a (hidden) registration column. When both sides have a
-registration a mismatch excludes the row; without a usable model the registration alone
-can identify the row.
+The live table also has a (hidden) registration column. When the record has a plate and
+the table has that column, ONLY a row showing the same plate counts (model naming differs
+between booking and shop, so the plate alone is enough; a row with an empty registration
+never counts). The model is used only without a plate or without the column.
 
-Never guesses: two or more candidate rows -> "ambiguous".
+Several unverified records are resolved together (resolve_orders): rows are never claimed
+while matching, records that share candidate rows form a group, and only a group of ONE
+record with ONE row is verified. Never guesses: otherwise "ambiguous" or "waiting".
 """
 
 import re
@@ -24,11 +27,12 @@ from dataclasses import dataclass, field
 from datetime import date
 
 MODEL_MAX = 80
+NUMBERS_MAX = 120   # same limit as orders_state.NUMBERS_MAX (verified_numbers)
 
 
 @dataclass(frozen=True)
 class MatchResult:
-    status: str                       # verified | ambiguous | not_found | no_model
+    status: str                       # verified | ambiguous | waiting | not_found | no_model
     rows: list = field(default_factory=list)   # the candidate rows (one when verified)
 
     @property
@@ -98,41 +102,102 @@ def _row_date(row: dict) -> date | None:
         return None
 
 
-def match_sent_order(rows: list[dict], vehicle_model, order_date: date, claimed: set,
-                     reg_nr=None) -> MatchResult:
-    """Find the one sent-orders row that is this order.
+def numbers_text(row: dict) -> str:
+    """What is stored as verified_numbers: "<supplier no> · <portal order numbers>", cut at a
+    number boundary to NUMBERS_MAX characters. claim_tokens() reads the same text back, so
+    a cut never leaves half a number behind."""
+    text = str(row.get("supplier_no") or "").strip()
+    numbers = [n for n in re.split(r"[\s/,]+", str(row.get("order_numbers") or "")) if n]
+    for i in range(len(numbers), 0, -1):
+        candidate = f"{text} · {'/'.join(numbers[:i])}"
+        if len(candidate) <= NUMBERS_MAX:
+            return candidate
+    return text[:NUMBERS_MAX]
 
-    A candidate row is dated on or after `order_date`, has a supplier number and a car model
-    ("" = not filled in yet), is not `claimed` (its supplier or portal order number is
-    stored on another record), and matches the booking's model token (see module doc).
-    `reg_nr`: when given, a row showing another registration is never a candidate, and
-    with no usable model a row showing this registration is.
-    """
+
+def claim_tokens(verified_numbers) -> set[str]:
+    """The supplier and portal order numbers in a stored verified_numbers text."""
+    return set(re.findall(r"[0-9A-Za-z-]+", str(verified_numbers or "")))
+
+
+def _has_reg_column(rows) -> bool:
+    return any(row.get("reg_nr") is not None for row in rows or [])
+
+
+def candidates(rows: list[dict], vehicle_model, order_date: date, claimed: set,
+               reg_nr=None) -> list[dict] | None:
+    """The rows that could be this order (None = nothing to match by: no model, no plate).
+
+    Every candidate is dated on or after `order_date`, has a supplier number and is not
+    `claimed` (its supplier or a portal order number is stored on another record). Then:
+    with a plate and a registration column, the row's registration must equal it; else the
+    row must have a model matching the booking's model token (see module doc)."""
     token = model_token(vehicle_model)
     reg = _norm_reg(reg_nr)
-    if not token and not reg:
-        return MatchResult("no_model")
+    by_plate = bool(reg) and _has_reg_column(rows)
+    if not by_plate and not token:
+        return None
     claimed = {str(c) for c in (claimed or ())}
-    candidates = []
+    out = []
     for row in rows or []:
         day = _row_date(row)
         supplier = str(row.get("supplier_no") or "").strip()
-        model = str(row.get("model") or "").strip()
-        if day is None or day < order_date or not supplier or not model or model == "-":
+        if day is None or day < order_date or not supplier:
             continue
         if supplier in claimed or _numbers(row) & claimed:
             continue
-        row_reg = _norm_reg(row.get("reg_nr"))
-        if reg and row_reg and row_reg != reg:
-            continue
-        if token:
-            if not _model_matches(token, model):
+        if by_plate:
+            if _norm_reg(row.get("reg_nr")) != reg:
                 continue
-        elif row_reg != reg:
-            continue
-        candidates.append(row)
-    if not candidates:
-        return MatchResult("not_found")
-    if len(candidates) > 1:
-        return MatchResult("ambiguous", candidates)
-    return MatchResult("verified", candidates)
+        else:
+            model = str(row.get("model") or "").strip()
+            if not model or model == "-" or not _model_matches(token, model):
+                continue
+        out.append(row)
+    return out
+
+
+def match_sent_order(rows: list[dict], vehicle_model, order_date: date, claimed: set,
+                     reg_nr=None) -> MatchResult:
+    """One record on its own: exactly one candidate -> verified, more -> ambiguous."""
+    return resolve_orders({"_": (vehicle_model, order_date, reg_nr)}, rows, claimed)["_"]
+
+
+def resolve_orders(orders: dict, rows: list[dict], claimed: set) -> dict:
+    """{booking_id: (vehicle_model, order_date, reg_nr)} -> {booking_id: MatchResult}.
+
+    Candidates are computed for every record first, without claiming anything. Records
+    whose candidate rows overlap form a group (rows are identified by supplier number):
+      * one record, one row       -> verified
+      * one record, several rows  -> ambiguous
+      * several records, fewer rows than records -> waiting (not all rows shown yet)
+      * several records, at least as many rows    -> ambiguous for each (cannot be paired)
+    No candidates -> not_found; nothing to match by -> no_model."""
+    found = {bid: candidates(rows, model, day, claimed, reg)
+             for bid, (model, day, reg) in orders.items()}
+    results = {bid: MatchResult("no_model") for bid, rows_ in found.items() if rows_ is None}
+    results.update({bid: MatchResult("not_found") for bid, rows_ in found.items()
+                    if rows_ is not None and not rows_})
+    pending = [bid for bid in orders if bid not in results]
+    keys = {bid: {str(r["supplier_no"]).strip() for r in found[bid]} for bid in pending}
+    while pending:
+        group = [pending.pop(0)]
+        group_keys = set(keys[group[0]])
+        grew = True
+        while grew:
+            grew = False
+            for bid in list(pending):
+                if keys[bid] & group_keys:
+                    group.append(bid)
+                    group_keys |= keys[bid]
+                    pending.remove(bid)
+                    grew = True
+        if len(group) == 1:
+            bid = group[0]
+            status = "verified" if len(found[bid]) == 1 else "ambiguous"
+            results[bid] = MatchResult(status, list(found[bid]))
+        else:
+            status = "waiting" if len(group_keys) < len(group) else "ambiguous"
+            for bid in group:
+                results[bid] = MatchResult(status, list(found[bid]))
+    return results

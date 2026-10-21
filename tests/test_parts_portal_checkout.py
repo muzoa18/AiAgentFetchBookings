@@ -1242,3 +1242,28 @@ def test_list_sent_orders_overview_that_never_loads_is_a_timeout():
         sent_portal(page).list_sent_orders()
     assert e.value.code == "search_timeout"
     assert page.clicks == []
+
+
+def _empty_table(html):
+    start, end = html.index("<tbody>"), html.index("</tbody>")
+    return html[:start] + "<tbody>" + html[end:]
+
+
+def test_list_sent_orders_does_not_take_a_still_empty_table_for_the_result():
+    page = make_sent_page(after=(_empty_table(SENT), _empty_table(SENT), SENT))
+    assert len(sent_portal(page).list_sent_orders()) == 7
+
+
+def test_list_sent_orders_accepts_an_empty_sent_list_only_after_the_full_budget():
+    page = make_sent_page(after=(_empty_table(SENT),))
+    portal = sent_portal(page)
+    assert portal.list_sent_orders() == []
+    assert portal.clock.now >= parts_portal.RESULTS_WAIT_S
+
+
+def test_list_sent_orders_already_on_an_empty_sent_tab_waits_the_budget_too():
+    page = make_sent_page(start=_empty_table(SENT))
+    portal = sent_portal(page)
+    assert portal.list_sent_orders() == []
+    assert page.clicks == [] and portal.clock.now >= parts_portal.RESULTS_WAIT_S
+

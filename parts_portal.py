@@ -428,15 +428,19 @@ class PartsPortal:
         (not even that when it is already the active tab), then polls (RESULTS_WAIT_S) until
         the sent-orders view is shown: that tab active, the order table with its headers,
         order rows linking to view=sent, and a first row that differs from the table shown
-        before the click. No vehicle needs to be loaded. Raises PartsPortalError:
+        before the click. An empty sent table is accepted only after the whole budget.
+        Only the first page of the tab is read (about 50 rows, newest first): meant for
+        recent orders (the checker's 3-day window). No vehicle needs to be loaded. Raises PartsPortalError:
         "login", "search_timeout" (the page or table did not appear), "parse"."""
         self.login()
         html = self._goto(ORDER_OVERVIEW_URL, ready=lambda h, u: has_order_tabs(h))
         if not has_order_tabs(html):
             raise PartsPortalError("the order overview did not load", "search_timeout")
         if not sent_orders_ready(html):
-            before = first_order_row(html)
-            self._sent_tab().click()
+            before = None
+            if not sent_orders_ready(html, allow_empty=True):  # another tab is shown: switch
+                before = first_order_row(html)
+                self._sent_tab().click()
 
             def ready(page_html: str, url: str) -> bool:
                 return sent_orders_ready(page_html) and (
@@ -444,6 +448,12 @@ class PartsPortal:
 
             html = self._poll(ready)
             if html is None:
+                last = self._last_html
+                # Empty for the whole budget on the sent tab: the sent list really is empty.
+                if (last is not None and sent_orders_ready(last, allow_empty=True)
+                        and first_order_row(last) is None):
+                    log.info("Sent orders: the list is empty.")
+                    return []
                 raise PartsPortalError("the sent orders table did not appear", "search_timeout")
         rows = parse_sent_orders(html)
         log.info("Sent orders: %d row(s) read.", len(rows))
