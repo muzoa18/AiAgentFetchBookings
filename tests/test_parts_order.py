@@ -1170,3 +1170,21 @@ def test_send_with_klar_survives_a_failing_clear(tg, monkeypatch):
     monkeypatch.setattr(notifier, "clear_buttons", broken)
     assert parts_order.send_with_klar(CONFIG, "B1", "Ny text") is True
     assert orders_state.get("B1")["klar_message_id"] == 900
+
+
+# ── Fix wave: search_term never leaks into the plan or messages ─────────────
+
+def test_search_term_tag_is_not_persisted_or_shown(tg, orders_file):
+    tagged = {term: [{**c, "search_term": "SENTINEL-TERM"} for c in cands]
+              for term, cands in CATALOGUE.items()}
+    portal = FakePortal(catalogue=tagged)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+
+    plan = orders_state.get("B1")["plan"]
+    assert all("search_term" not in p for p in plan["parts"])
+    assert all("search_term" not in x for x in plan["expected_lines"])
+    assert "SENTINEL-TERM" not in orders_file.read_text(encoding="utf-8")
+    assert all("SENTINEL-TERM" not in text for text, _ in tg["buttons"])
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+    assert all("SENTINEL-TERM" not in text for text in tg["sent"])

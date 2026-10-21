@@ -348,3 +348,149 @@ def test_login_still_on_login_form_raises():
     page.click = submit
     with pytest.raises(PartsPortalError):
         portal.login()
+
+
+# ── add_to_cart repeats the search that found the part (live bug UNKW-9240) ──
+
+class AddEl:
+    def __init__(self, page, selector):
+        self.page, self.selector = page, selector
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return self.page.count(self.selector)
+
+    def get_attribute(self, name):
+        return "tab-section__btn tab-section__btn--open"
+
+    def locator(self, sub):
+        return AddEl(self.page, f"{self.selector} {sub}")
+
+    def _sku(self):
+        return self.selector.split("data-sku='")[1].split("'")[0]
+
+    def input_value(self):
+        return f"{self.page.qty.get(self._sku(), 0)} st"
+
+    def click(self, **_):
+        assert "qty-wrapper__increase" in self.selector
+        sku = self._sku()
+        self.page.qty[sku] = self.page.qty.get(sku, 0) + 1
+
+
+class _Response:
+    ok = True
+
+
+class _Expect:
+    value = _Response()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class AddPage:
+    """A search-results page: `catalogue` maps a search term to the skus listed for it."""
+
+    def __init__(self, catalogue, in_cart=None):
+        self.catalogue = catalogue
+        self.term = None
+        self.searches = []
+        self.qty = dict(in_cart or {})
+
+    def fill(self, selector, value):
+        assert selector == parts_portal.SEL_SEARCH
+        self._typed = value
+
+    def press(self, selector, key):
+        self.term = self._typed
+        self.searches.append(self.term)
+
+    def wait_for_load_state(self, *_, **__):
+        pass
+
+    def wait_for_timeout(self, *_):
+        pass
+
+    def content(self):
+        return f"<html>{self.term}</html>"
+
+    def locator(self, selector):
+        return AddEl(self, selector)
+
+    def count(self, selector):
+        return int(any(f"data-sku='{sku}'" in selector
+                       for sku in self.catalogue.get(self.term, ())))
+
+    def expect_response(self, *_, **__):
+        return _Expect()
+
+
+@pytest.fixture
+def add_page(monkeypatch):
+    def make(catalogue, in_cart=None):
+        page = AddPage(catalogue, in_cart)
+        monkeypatch.setattr(parts_portal, "current_plate", lambda html: "ABC123")
+        monkeypatch.setattr(parts_portal, "linked_tab_id", lambda html: "t1")
+        monkeypatch.setattr(parts_portal, "parse_search_results", lambda html: [
+            {"title": f"Del {sku}", "url_or_id": sku} for sku in catalogue.get(page.term, ())])
+        return page, portal_with(page)
+    return make
+
+
+def test_search_tags_every_candidate_with_its_term(add_page):
+    page, portal = add_page({"Kupéfilter": ["10087157", "10087158"]})
+    found = portal.search("  Kupéfilter ")
+    assert [c["search_term"] for c in found] == ["Kupéfilter", "Kupéfilter"]
+
+
+def test_add_to_cart_repeats_the_candidates_own_search(add_page):
+    page, portal = add_page({"Kupéfilter": ["10087157"], "Tändstift": ["20000001"]})
+    (kupe,) = portal.search("Kupéfilter")
+    (spark,) = portal.search("Tändstift")
+
+    portal.add_to_cart(kupe, 1)        # not on the Tändstift page: search Kupéfilter again
+    portal.add_to_cart(spark, 2)       # not on the Kupéfilter page any more
+
+    assert page.searches == ["Kupéfilter", "Tändstift", "Kupéfilter", "Tändstift"]
+    assert page.qty == {"10087157": 1, "20000001": 2}
+
+
+def test_add_to_cart_on_the_current_page_does_not_search(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]})
+    (cand,) = portal.search("Oljefilter")
+    portal.add_to_cart(cand, 1)
+    assert page.searches == ["Oljefilter"]
+
+
+def test_add_to_cart_without_search_term_falls_back_to_the_last_search(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"], "Luftfilter": ["p2"]})
+    portal.search("Oljefilter")
+    page.term = "elsewhere"            # the page moved on (e.g. the cart was shown)
+
+    portal.add_to_cart({"title": "Del p1", "url_or_id": "p1"}, 1)
+
+    assert page.searches == ["Oljefilter", "Oljefilter"]
+    assert page.qty == {"p1": 1}
+
+
+def test_add_to_cart_unknown_sku_still_raises(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]})
+    (cand,) = portal.search("Oljefilter")
+    page.term = "elsewhere"
+    with pytest.raises(PartsPortalError, match="not found among linked parts"):
+        portal.add_to_cart({**cand, "url_or_id": "p999"}, 1)
+    assert page.qty == {}
+
+
+def test_add_to_cart_part_already_in_cart_raises(add_page):
+    page, portal = add_page({"Oljefilter": ["p1"]}, in_cart={"p1": 1})
+    (cand,) = portal.search("Oljefilter")
+    with pytest.raises(PartsPortalError, match="already in the cart"):
+        portal.add_to_cart(cand, 1)

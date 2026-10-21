@@ -203,11 +203,16 @@ class PartsPortal:
         return html
 
     def search(self, term: str) -> list[dict]:
-        """Linked ("Kopplade reservdelar") candidates only; [] if none."""
+        """Linked ("Kopplade reservdelar") candidates only; [] if none.
+
+        Each candidate carries 'search_term' (the term used), so add_to_cart can bring
+        its own result page back after other searches."""
         term = str(term or "").strip()
         if not term:
             raise ValueError("empty search term")
         result = parse_search_results(self._run_search(term))
+        for candidate in result:
+            candidate["search_term"] = term
         log.info("Search %r: %d linked candidate(s).", term, len(result))
         return result
 
@@ -229,9 +234,12 @@ class PartsPortal:
         self._require_vehicle()
         tab_sel, form_sel = self._quick_form(sku)
         if not form_sel or self._count(form_sel) == 0:
-            if not self._last_search:
+            # Parts are matched before any is added, so the page usually shows the LAST
+            # search: repeat the search that found this candidate (fallback: the last one).
+            again = str(candidate.get("search_term") or "").strip() or self._last_search
+            if not again:
                 raise PartsPortalError(f"part {sku} is not on the current page and no search to repeat")
-            self._run_search(self._last_search)
+            self._run_search(again)
             tab_sel, form_sel = self._quick_form(sku)
             if not form_sel or self._count(form_sel) == 0:
                 raise PartsPortalError(f"part {sku} not found among linked parts")
