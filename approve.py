@@ -21,14 +21,16 @@ never re-ordered (agent.py's start-of-run sweep reports it).
 A Klar tap is accepted with the same checks (owner, private chat, the booking's
 stored klar_message_id) and only once the order is resolved: never while it is
 "pending" or "attempted". A failed Hanterad keeps the button so the owner can tap
-again.
+again; a missing Hanterad button counts as already handled by hand. A Klar button
+older than 14 days is withdrawn once with a notice (orders_state.expired_klar).
 
 The Telegram offset (last_update_id) is only advanced after an update was fully
 handled. An update that raised while its booking is still "pending" is left
 unconfirmed and retried on the next poll; nothing after it is processed.
 
   python approve.py --check   prints has_pending=true|false (stdlib only); true when an
-                              order awaits approval or a Klar button is outstanding
+                              order awaits approval or a Klar button is
+                              outstanding or due to be withdrawn
   python approve.py           handles taps; exit 1 if anything failed
 """
 
@@ -156,6 +158,26 @@ def _expire(config: dict, now: datetime) -> tuple[int, bool]:
     return expired, problem
 
 
+def _close_expired_klar(config: dict, now: datetime) -> bool:
+    """Withdraw Klar buttons older than orders_state.KLAR_MAX_AGE. True = a problem."""
+    import notifier
+    problem = False
+    for booking_id, record in orders_state.expired_klar(now):
+        try:
+            notifier.clear_buttons(config, record["klar_message_id"])
+        except Exception:
+            log.exception("Could not clear the expired Klar button of %s.", booking_id)
+        if not notifier.send_message(
+                config, f"Klar-knappen för {_label(booking_id, record)} har gått ut – "
+                        "markera bokningen som Hanterad i portalen."):
+            log.error("Klar expiry notice for %s was not delivered; retried next run.", booking_id)
+            problem = True
+            continue
+        orders_state.update_fields(booking_id, klar_closed=True)
+        log.info("Klar button for %s expired.", booking_id)
+    return problem
+
+
 def expire_stale(config: dict, now: datetime) -> int:
     """Expire pending approvals older than 48 h (strictly). Returns the number expired."""
     return _expire(config, now)[0]
@@ -217,6 +239,9 @@ def _klar(config, booking_id, record, cb, mark) -> tuple[int, bool]:
         notifier.answer_callback(config, cb, "Redan hanterad.")
         notifier.clear_buttons(config, record["klar_message_id"])
         return 0, False
+    if record.get("klar_closed") is True:  # withdrawn (no link, or expired)
+        notifier.answer_callback(config, cb, "Knappen är inte längre giltig.")
+        return 0, False
     if record.get("status") == "pending":
         notifier.answer_callback(config, cb, "Godkänn eller avbryt beställningen först.")
         return 0, False
@@ -230,6 +255,8 @@ def _klar(config, booking_id, record, cb, mark) -> tuple[int, bool]:
                 config, f"Saknar länk till bokning {label} – markera bokningen som Hanterad "
                         "i portalen."):
             log.error("Missing-link message for %s was not delivered.", booking_id)
+        notifier.clear_buttons(config, record["klar_message_id"])
+        orders_state.update_fields(booking_id, klar_closed=True)  # reported once, not every run
         return 0, True
     notifier.answer_callback(config, cb, "Markerar som Hanterad…")
     try:
@@ -237,6 +264,17 @@ def _klar(config, booking_id, record, cb, mark) -> tuple[int, bool]:
     except Exception:
         log.exception("Marking %s Hanterad raised.", booking_id)
         result = False
+    if result is None:
+        # Logged in and on the booking, but no Hanterad button: most likely handled by hand.
+        log.info("No Hanterad button for %s; treating it as already handled.", booking_id)
+        orders_state.update_fields(booking_id, handled=True)
+        notifier.clear_buttons(config, record["klar_message_id"])
+        if not notifier.send_message(
+                config, "Hanterad-knappen finns inte – bokningen verkar redan vara hanterad "
+                        f"(kontrollera i portalen: {url})"):
+            log.error("Already-handled message for %s was not delivered.", booking_id)
+            return 1, True
+        return 1, False
     if result is not True:
         log.error("Could not mark %s Hanterad (result %r); the Klar button stays.",
                   booking_id, result)
@@ -351,7 +389,8 @@ def make_portal(config: dict):
 
 def _check() -> int:
     try:
-        has_pending = bool(orders_state.pending()) or bool(orders_state.outstanding_klar())
+        has_pending = (bool(orders_state.pending()) or bool(orders_state.outstanding_klar())
+                       or bool(orders_state.expired_klar()))
     except Exception as e:
         print(f"Order state unreadable: {e}", file=sys.stderr)
         return 1
@@ -375,7 +414,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])
     try:
-        if not orders_state.pending() and not orders_state.outstanding_klar():
+        if not (orders_state.pending() or orders_state.outstanding_klar()
+                or orders_state.expired_klar()):
             log.info("No pending approvals and no outstanding Klar buttons.")
             return 0
     except Exception:
@@ -397,6 +437,11 @@ def main(argv=None) -> int:
         _, expire_problem = _expire(config, datetime.now(timezone.utc))
     except Exception:
         log.exception("Expiring stale approvals failed.")
+        expire_problem = True
+    try:
+        expire_problem = _close_expired_klar(config, datetime.now(timezone.utc)) or expire_problem
+    except Exception:
+        log.exception("Withdrawing expired Klar buttons failed.")
         expire_problem = True
     actions, problem = _handle(config, lambda: make_portal(config), rules)
     log.info("Approval poll done: %d action(s).", actions)

@@ -10,7 +10,7 @@ Stored as config/orders.json (committed back to the repo by the workflows):
      "bookings": {"<booking_id>": {"status", "plan", "message_id", "updated_at",
                                    optional: "cart_touched", "tries", "detail_url",
                                    "handled", "last_reason", "gave_up",
-                                   "klar_message_id"}}}
+                                   "klar_message_id", "klar_sent_at", "klar_closed"}}}
 
 Optional fields (absent in older records) are kept by put()/begin() and set with
 update_fields(). Unknown record keys are rejected. Never store customer data here.
@@ -25,7 +25,7 @@ an empty state would allow a booking to be ordered again.
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -44,7 +44,10 @@ OPTIONAL_FIELDS = {
     "last_reason": str,     # block reason before the latest re-stage (short, no customer data)
     "gave_up": bool,        # the "no more automatic tries" message was sent
     "klar_message_id": int,  # Telegram message carrying the booking's current Klar button
+    "klar_sent_at": str,    # when that Klar message was sent (ISO 8601 with time zone)
+    "klar_closed": bool,    # the Klar button was withdrawn (no link, or it expired)
 }
+KLAR_MAX_AGE = timedelta(days=14)
 MAX_TRIES = 10
 REASON_MAX = 200
 # Block reasons that happen before anything is added to the cart. A legacy record (no
@@ -98,7 +101,17 @@ def _field_problem(key: str, value) -> str | None:
         return "'tries' is negative"
     if key == "klar_message_id" and value < 1:
         return "'klar_message_id' is not positive"
+    if key == "klar_sent_at" and _parse_time(value) is None:
+        return "'klar_sent_at' is not an ISO time with a time zone"
     return None
+
+
+def _parse_time(value: str) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return when if when.tzinfo is not None else None
 
 
 def _extras(record: dict | None) -> dict:
@@ -269,12 +282,31 @@ def pending() -> list[tuple[str, dict]]:
             if bookings[bid].get("status") == "pending"]
 
 
-def outstanding_klar() -> list[tuple[str, dict]]:
-    """Records whose Klar button is out and not yet acted on (not marked Hanterad)."""
+def _open_klar(now: datetime | None) -> tuple[list, list]:
+    """(outstanding, expired) records with a live Klar button: not handled, not closed."""
+    now = now or datetime.now(timezone.utc)
     bookings = _load()["bookings"]
-    return [(bid, bookings[bid]) for bid in sorted(bookings)
-            if type(bookings[bid].get("klar_message_id")) is int
-            and bookings[bid].get("handled") is not True]
+    outstanding, expired = [], []
+    for bid in sorted(bookings):
+        rec = bookings[bid]
+        if (type(rec.get("klar_message_id")) is not int or rec.get("handled") is True
+                or rec.get("klar_closed") is True):
+            continue
+        sent = rec.get("klar_sent_at")
+        # A record from before klar_sent_at existed never expires.
+        too_old = isinstance(sent, str) and now - _parse_time(sent) > KLAR_MAX_AGE
+        (expired if too_old else outstanding).append((bid, rec))
+    return outstanding, expired
+
+
+def outstanding_klar(now: datetime | None = None) -> list[tuple[str, dict]]:
+    """Records whose Klar button is out and not yet acted on (not handled, closed or expired)."""
+    return _open_klar(now)[0]
+
+
+def expired_klar(now: datetime | None = None) -> list[tuple[str, dict]]:
+    """Records whose Klar button is older than KLAR_MAX_AGE and not yet closed."""
+    return _open_klar(now)[1]
 
 
 def last_update_id() -> int | None:

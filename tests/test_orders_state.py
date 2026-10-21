@@ -448,3 +448,65 @@ def test_restage_refuses_a_handled_record():
     orders_state.update_fields("B1", cart_touched=False, handled=True)
     assert orders_state.restage("B1") is False
     assert orders_state.get("B1")["status"] == "blocked"
+
+
+# ── Fix wave: klar_closed, klar_sent_at and Klar expiry ─────────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("klar_closed", True), ("klar_closed", False),
+    ("klar_sent_at", "2026-10-21T09:25:58+00:00"), ("klar_sent_at", "2026-10-21T09:25:58.123+02:00")])
+def test_new_klar_fields_load(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    assert orders_state.get("B1")[field] == value
+
+
+@pytest.mark.parametrize("field,value", [
+    ("klar_closed", 1), ("klar_closed", "true"), ("klar_closed", None),
+    ("klar_sent_at", 5), ("klar_sent_at", "yesterday"), ("klar_sent_at", ""),
+    ("klar_sent_at", "2026-10-21T09:25:58"), ("klar_sent_at", None)])
+def test_bad_new_klar_fields_raise(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+def test_update_fields_rejects_a_naive_klar_sent_at(orders_file):
+    orders_state.put("B1", "blocked")
+    with pytest.raises(ValueError):
+        orders_state.update_fields("B1", klar_sent_at="2026-10-21T09:25:58")
+
+
+def _klar_record(bid, sent_at=None, **fields):
+    orders_state.put(bid, "ordered")
+    extra = {"klar_message_id": 900, **fields}
+    if sent_at is not None:
+        extra["klar_sent_at"] = sent_at.isoformat()
+    orders_state.update_fields(bid, **extra)
+
+
+def test_outstanding_klar_excludes_closed_and_expired_records():
+    _klar_record("B1", NOW - timedelta(days=13, hours=23))
+    _klar_record("B2", NOW - timedelta(days=14, seconds=1))
+    _klar_record("B3", NOW - timedelta(days=1), klar_closed=True)
+    _klar_record("B4")                                     # pre-fix record: no klar_sent_at
+    _klar_record("B5", NOW - timedelta(days=30), handled=True)
+
+    assert [b for b, _ in orders_state.outstanding_klar(NOW)] == ["B1", "B4"]
+    assert [b for b, _ in orders_state.expired_klar(NOW)] == ["B2"]
+
+
+def test_outstanding_klar_defaults_to_now():
+    _klar_record("B1", datetime.now(timezone.utc))
+    _klar_record("B2", datetime.now(timezone.utc) - timedelta(days=20))
+    assert [b for b, _ in orders_state.outstanding_klar()] == ["B1"]
+    assert [b for b, _ in orders_state.expired_klar()] == ["B2"]
+
+
+def test_old_records_have_no_expired_klar(orders_file):
+    _write(orders_file, {"B1": OLD_RECORD})
+    assert orders_state.outstanding_klar(NOW) == [] and orders_state.expired_klar(NOW) == []

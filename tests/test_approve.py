@@ -737,7 +737,7 @@ def test_klar_tap_marks_hanterad(tg, hanterad, run_main, status_):
     assert orders_state.last_update_id() == 5
 
 
-@pytest.mark.parametrize("result", [False, None, RuntimeError("browser died")])
+@pytest.mark.parametrize("result", [False, RuntimeError("browser died")])
 def test_klar_hanterad_failure_keeps_the_button_and_exits_1(tg, hanterad, run_main, result):
     resolved()
     hanterad["result"] = result
@@ -1114,3 +1114,102 @@ def test_portal_open_failure_message_has_no_raw_exception_text(tg, run_main):
     assert "SECRET-PAGE-TEXT" not in text
     assert text.startswith("Beställning misslyckades för OLRD-3630: kunde inte öppna pro.meca.se.")
     assert status() == "failed"
+
+
+
+# ── Fix wave: Klar follow-ups ────────────────────────────────────────────────
+
+def test_klar_with_hanterad_button_absent_counts_as_already_handled(tg, hanterad, run_main):
+    resolved()
+    hanterad["result"] = None
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert hanterad["calls"] == [URL]
+    assert tg["sent"] == ["Hanterad-knappen finns inte – bokningen verkar redan vara hanterad "
+                          f"(kontrollera i portalen: {URL})"]
+    assert tg["cleared"] == [900]
+    assert orders_state.get("B1")["handled"] is True
+    assert orders_state.outstanding_klar() == []
+
+
+def test_klar_without_detail_url_closes_the_button_once(tg, hanterad, run_main):
+    resolved(detail_url=None)
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 1
+
+    assert tg["cleared"] == [900]
+    rec = orders_state.get("B1")
+    assert rec["klar_closed"] is True and rec.get("handled") is not True
+    assert orders_state.outstanding_klar() == []
+    assert len(tg["sent"]) == 1
+
+    # A replayed tap on the closed button changes nothing and is not a failure.
+    tg["updates"] = [klar_tap(6)]
+    assert approve._handle(CONFIG, PortalFactory(allowed=False), APPROVE) == (0, False)
+    assert tg["answers"][-1] == ("cb6", "Knappen är inte längre giltig.")
+    assert len(tg["sent"]) == 1
+    assert hanterad["calls"] == []
+
+
+def _klar_sent(days_ago, booking_id="B1", **fields):
+    resolved(booking_id, **fields)
+    when = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    orders_state.update_fields(booking_id, klar_sent_at=when.isoformat())
+
+
+def test_expired_klar_is_closed_once_with_a_notice(tg, hanterad, run_main, monkeypatch, capsys):
+    _klar_sent(15)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    assert approve.main(["--check"]) == 0            # the run must happen once to close it
+    assert "has_pending=true" in capsys.readouterr().out
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert tg["cleared"] == [900]
+    assert tg["sent"] == ["Klar-knappen för OLRD-3630 har gått ut – markera bokningen som "
+                          "Hanterad i portalen."]
+    assert orders_state.get("B1")["klar_closed"] is True
+    assert hanterad["calls"] == []
+
+    assert approve.main(["--check"]) == 0
+    assert "has_pending=false" in capsys.readouterr().out
+    assert approve.main([]) == 0                     # early exit: nothing more is sent
+    assert len(tg["sent"]) == 1
+
+
+def test_expired_klar_tap_in_the_same_run_is_refused(tg, hanterad, run_main):
+    _klar_sent(15)
+    tg["updates"] = [klar_tap(5)]
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+
+    assert hanterad["calls"] == []
+    assert tg["answers"] == [("cb5", "Knappen är inte längre giltig.")]
+
+
+def test_expired_klar_notice_undelivered_is_retried(tg, hanterad, run_main):
+    _klar_sent(15)
+    tg["send_ok"] = False
+
+    assert run_main(PortalFactory(allowed=False)) == 1
+    assert orders_state.get("B1").get("klar_closed") is not True
+    assert [b for b, _ in orders_state.expired_klar()] == ["B1"]
+
+
+def test_recent_klar_is_not_expired(tg, hanterad, run_main):
+    _klar_sent(13)
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert tg["sent"] == [] and tg["cleared"] == []
+    assert [b for b, _ in orders_state.outstanding_klar()] == ["B1"]
+
+
+def test_handled_or_closed_records_get_no_expiry_notice(tg, run_main):
+    _klar_sent(30, "B1", handled=True)
+    _klar_sent(30, "B2", klar_closed=True)
+    stage("B3", message_id=78)  # something pending so the run goes on
+
+    assert run_main(PortalFactory(allowed=False)) == 0
+    assert tg["sent"] == [] and tg["cleared"] == []

@@ -111,8 +111,9 @@ def _why(exc: Exception) -> str:
 def send_with_klar(config: dict, booking_id, text: str) -> bool:
     """Send a resolution message with a Klar button; True if the owner got the text.
 
-    The new message id is stored as the record's klar_message_id and the buttons of
-    an older Klar message are cleared (best effort). Without a record, or if the
+    The new message id is stored as the record's klar_message_id (with klar_sent_at),
+    then the buttons of an older Klar message are cleared (best effort). A failed store
+    returns False. Without a record, or if the
     button message cannot be sent, a plain message asks the owner to mark the
     booking Hanterad by hand.
     """
@@ -128,16 +129,20 @@ def send_with_klar(config: dict, booking_id, text: str) -> bool:
         if record is not None:
             log.error("Klar message for %s could not be sent — sending it plain.", booking_id)
         return bool(notifier.send_message(config, text + KLAR_FALLBACK))
+    # Store first: if that fails the old button stays the valid one (and this counts as a
+    # delivery problem for the caller), so the owner is never left without a working Klar.
+    try:
+        orders_state.update_fields(booking_id, klar_message_id=mid, klar_closed=False,
+                                   klar_sent_at=datetime.now(timezone.utc).isoformat())
+    except Exception:
+        log.exception("Could not store the Klar message id of %s.", booking_id)
+        return False
     old = record.get("klar_message_id")
     if type(old) is int and old != mid:
         try:
             notifier.clear_buttons(config, old)
         except Exception:
             log.exception("Could not clear the old Klar button of %s.", booking_id)
-    try:
-        orders_state.update_fields(booking_id, klar_message_id=mid)
-    except Exception:
-        log.exception("Could not store the Klar message id of %s.", booking_id)
     return True
 
 

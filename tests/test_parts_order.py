@@ -1401,3 +1401,51 @@ def test_secret_exception_text_never_reaches_telegram_when_ordering(tg, step):
     setattr(portal, step, boom)
     assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "failed"
     assert tg["sent"] and all(SECRET not in t for t in _all_text(tg))
+
+
+# ── Fix wave: send_with_klar stores before it clears; klar_sent_at ──────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def test_send_with_klar_stores_the_new_id_before_clearing_the_old(tg, monkeypatch):
+    orders_state.put("B1", "blocked")
+    orders_state.update_fields("B1", klar_message_id=500, klar_closed=True)
+    seen = []
+    monkeypatch.setattr(notifier, "clear_buttons", lambda config, mid: seen.append(
+        (mid, orders_state.get("B1")["klar_message_id"])))
+
+    assert parts_order.send_with_klar(CONFIG, "B1", "Ny text") is True
+
+    assert seen == [(500, 900)]          # the new id was already stored
+    rec = orders_state.get("B1")
+    assert rec["klar_closed"] is False   # a new button is live again
+    sent_at = datetime.fromisoformat(rec["klar_sent_at"])
+    assert sent_at.tzinfo is not None
+    assert abs(datetime.now(timezone.utc) - sent_at) < timedelta(minutes=1)
+
+
+def test_send_with_klar_failed_store_is_a_problem_and_keeps_the_old_button(tg, monkeypatch):
+    orders_state.put("B1", "blocked")
+    orders_state.update_fields("B1", klar_message_id=500)
+
+    def broken(booking_id, **fields):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(orders_state, "update_fields", broken)
+    assert parts_order.send_with_klar(CONFIG, "B1", "Ny text") is False
+    assert tg["cleared"] == []
+    assert orders_state.get("B1")["klar_message_id"] == 500
+
+
+def test_block_whose_klar_id_cannot_be_stored_is_failed(tg, monkeypatch):
+    real = orders_state.update_fields
+
+    def broken(booking_id, **fields):
+        if "klar_message_id" in fields:
+            raise OSError("disk full")
+        return real(booking_id, **fields)
+
+    monkeypatch.setattr(orders_state, "update_fields", broken)
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(catalogue=NO_AIR), APPROVE,
+                                      confident) == "failed"
