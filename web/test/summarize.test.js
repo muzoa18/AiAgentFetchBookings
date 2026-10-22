@@ -38,6 +38,7 @@ test('every status lands in the right tile', () => {
   assert.equal(vm.orders.length, 12);
   assert.deepEqual(vm.counts, {
     attempted: 1, pending: 2, ordered: 5, blocked: 1, failed: 1, cancelled: 1, expired: 1,
+    waiting: 2, klar: 1, needsAction: 3,
   });
 });
 
@@ -333,4 +334,65 @@ test('last-success threshold: 52 h (no Sunday run), separate from the 36 h commi
   assert.equal(LAST_SUCCESS_STALE_HOURS, 52);
   assert.equal(STALE_HOURS, 36);
   assert.equal(summarize({ now: NOW }).lastSuccessStaleHours, LAST_SUCCESS_STALE_HOURS);
+});
+
+test('orders expose portalStatus and verifiedNumbers, whitelisted and length-limited', () => {
+  const vm = summarize({
+    ordersText: orders({
+      a: rec('ordered', { portal_status: 'Skickad\u0000från lager', verified_numbers: 'L-123 / 456' }),
+      b: rec('ordered', { portal_status: 'x'.repeat(200), verified_numbers: 'y'.repeat(500) }),
+      c: rec('ordered', { portal_status: { evil: 1 }, verified_numbers: 42 }),
+      d: rec('pending'),
+      e: rec('ordered', { verified_at: '2026-10-21T10:00:00Z', verified_numbers: ['100200', 300400] }),
+    }),
+    commit, now: NOW,
+  });
+  const by = Object.fromEntries(vm.orders.map((o) => [o.bookingId, o]));
+  assert.equal(by.a.portalStatus, 'Skickad från lager');
+  assert.equal(by.a.verifiedNumbers, 'L-123 / 456');
+  assert.equal(by.b.portalStatus.length, 80);
+  assert.equal(by.b.verifiedNumbers.length, 120);
+  assert.equal(by.c.portalStatus, null);
+  assert.equal(by.c.verifiedNumbers, '42');
+  assert.equal(by.d.portalStatus, null);
+  assert.equal(by.d.verifiedNumbers, null);
+  assert.equal(by.e.verifiedNumbers, '100200, 300400', 'a list is joined');
+});
+
+test('counts follow the daily Telegram summary rules', () => {
+  const day = (d) => new Date(NOW - d * 86_400_000).toISOString();
+  const klar = (extra = {}) => ({ klar_message_id: 9, klar_sent_at: day(1), ...extra });
+  const vm = summarize({
+    ordersText: orders({
+      p1: rec('pending'),
+      p2: rec('pending'),
+      o1: rec('ordered'),
+      o2: rec('ordered', klar()),
+      o3: rec('ordered', klar({ klar_sent_at: day(15) })),
+      o4: rec('ordered', klar({ handled: true })),
+      o5: rec('ordered', klar({ klar_closed: true })),
+      b1: rec('blocked', klar()),                       // Klar only, not needs-action
+      b2: rec('blocked', { updated_at: day(2) }),       // needs action
+      b3: rec('blocked', { updated_at: day(8) }),       // too old
+      f1: rec('failed', { updated_at: day(6) }),
+      x1: rec('expired', { updated_at: day(7.5) }),
+      x2: rec('expired', { updated_at: undefined }),    // unknown age: counted
+      c1: rec('cancelled'),
+    }),
+    commit, now: NOW,
+  });
+  assert.equal(vm.counts.waiting, 2);
+  assert.equal(vm.counts.klar, 2, 'o2 and b1');
+  assert.equal(vm.counts.ordered, 5, 'status ordered, Klar or not');
+  assert.equal(vm.counts.needsAction, 3, 'b2, f1, x2');
+  const by = Object.fromEntries(vm.orders.map((o) => [o.bookingId, o]));
+  assert.equal(by.o2.klarOpen, true);
+  assert.equal(by.o3.klarOpen, false);
+  assert.equal(by.o4.klarOpen, false);
+  assert.equal(by.o1.klarOpen, false);
+  // Existing per-status counts are kept.
+  assert.equal(vm.counts.pending, 2);
+  assert.equal(vm.counts.blocked, 3);
+  const empty = summarize({ ordersText: null, now: NOW });
+  assert.deepEqual([empty.counts.waiting, empty.counts.klar, empty.counts.ordered, empty.counts.needsAction], [0, 0, 0, 0]);
 });

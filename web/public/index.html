@@ -42,6 +42,7 @@
         <div id="freshness"></div>
         <h1 id="headline" class="headline"></h1>
         <div id="tiles"></div>
+        <div id="counts"></div>
         <p class="sr-only" id="announce" aria-live="polite"></p>
       </section>
 
@@ -52,6 +53,25 @@
           <div class="panel-head">
             <h2 id="orders-title">Delbeställningar</h2>
             <span class="muted small" id="orders-count"></span>
+          </div>
+          <div class="order-filter">
+            <div class="field">
+              <label for="order-search">Sök</label>
+              <input id="order-search" type="search" autocomplete="off" maxlength="80" placeholder="Bokning, registreringsnummer, status, ordernummer">
+            </div>
+            <div class="field">
+              <label for="order-status-filter">Status</label>
+              <select id="order-status-filter">
+                <option value="">Alla</option>
+                <option value="attempted">Förbereds</option>
+                <option value="pending">Väntar på godkännande</option>
+                <option value="ordered">Beställd</option>
+                <option value="blocked">Stoppad</option>
+                <option value="failed">Misslyckad</option>
+                <option value="expired">Utgången</option>
+                <option value="cancelled">Avbruten</option>
+              </select>
+            </div>
           </div>
           <div id="orders"></div>
         </section>

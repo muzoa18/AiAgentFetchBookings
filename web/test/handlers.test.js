@@ -504,3 +504,11 @@ test('demo mode shows one warning and one error alert', async () => {
   assert.deepEqual(s.json.alerts.map((a) => a.severity).sort(), ['error', 'warning']);
   assert.equal(typeof s.json.lastSuccessAgeHours, 'number');
 });
+
+test('demo data: one order carries a portal status', async () => {
+  const { createDemoSource } = await import('../lib/demo.js');
+  const { summarize } = await import('../lib/summarize.js');
+  const src = createDemoSource();
+  const vm = summarize({ ordersText: await src.getFile('config/orders.json') });
+  assert.ok(vm.orders.some((o) => typeof o.portalStatus === 'string' && o.portalStatus));
+});

@@ -135,6 +135,49 @@ export function tiles(doc, vm) {
   }));
 }
 
+/** The daily summary's four numbers, from vm.counts. */
+export function countsRow(doc, vm) {
+  const c = vm.counts ?? {};
+  const items = [
+    ['waiting', 'Väntar på godkännande', 'wait'],
+    ['klar', 'Väntar på Klar', 'neutral'],
+    ['ordered', 'Beställda', 'ok'],
+    ['needsAction', 'Kräver åtgärd', 'alert'],
+  ];
+  return h(doc, 'ul', { class: 'counts', role: 'list', 'aria-label': 'Antal bokningar' }, items.map(([key, label, tone]) => {
+    const n = Number.isFinite(c[key]) ? c[key] : 0;
+    return h(doc, 'li', { class: `count tone-${tone}${n === 0 ? ' is-zero' : ''}` },
+      h(doc, 'span', { class: 'count-n' }, String(n)),
+      h(doc, 'span', { class: 'count-label' }, label));
+  }));
+}
+
+function haystack(o) {
+  const label = (STATUS[o.status] ?? STATUS.unknown).label;
+  const parts = [o.bookingId, o.bookingNr, o.regNr, o.status, label, o.portalStatus, o.verifiedNumbers]
+    .filter((v) => typeof v === 'string' && v);
+  // A plate typed with a space ("ABC 123") also matches "ABC123".
+  const joined = parts.join('\n').toLowerCase();
+  return `${joined}\n${joined.replace(/\s+/g, '')}`;
+}
+
+/**
+ * Pure: the orders matching a case-insensitive substring `query` (over booking id and
+ * number, plate, status, portal status and verified numbers) and an exact `status`
+ * ('' or missing = any). Never mutates its input.
+ */
+export function filterOrders(list, { query = '', status = '' } = {}) {
+  if (!Array.isArray(list)) return [];
+  const q = String(query ?? '').trim().toLowerCase();
+  const compact = q.replace(/\s+/g, '');
+  return list.filter((o) => {
+    if (status && o.status !== status) return false;
+    if (!q) return true;
+    const text = haystack(o);
+    return text.includes(q) || (compact !== '' && text.includes(compact));
+  });
+}
+
 function runCounts(run) {
   const parts = [];
   for (const [key, forms] of Object.entries(COUNTER_LABELS)) {
@@ -243,6 +286,10 @@ export function orderCard(doc, o, vm, now) {
         o.handled ? h(doc, 'span', { class: 'chip' }, 'Hanterad') : null,
         o.updatedAt ? h(doc, 'span', { class: 'muted small' }, 'Uppdaterad ', time(doc, o.updatedAt, now)) : null),
       verification(doc, o),
+      o.portalStatus ? h(doc, 'p', { class: 'portal-status' },
+        h(doc, 'strong', {}, 'Portalstatus: '), o.portalStatus) : null,
+      o.verifiedNumbers && !(o.verification?.numbers?.length) ? h(doc, 'p', { class: 'muted small' },
+        `Ordernummer: ${o.verifiedNumbers}`) : null,
       reason ? h(doc, 'p', { class: 'reason' },
         h(doc, 'strong', {}, o.status === 'blocked' ? 'Orsak: ' : 'Anledning: '), reason,
         o.tries ? h(doc, 'span', { class: 'muted' }, ` (försök ${o.tries})`) : null) : null,
@@ -252,11 +299,13 @@ export function orderCard(doc, o, vm, now) {
         (o.status === 'ordered' || o.status === 'pending') ? link(doc, vm.links?.orderOverview, 'Orderöversikt på pro.meca.se') : null)));
 }
 
-export function orders(doc, vm, now) {
+export function orders(doc, vm, now, filter = {}) {
   if (!vm.orders?.length) {
     return h(doc, 'p', { class: 'empty' }, 'Inga delbeställningar ännu. Nya bokningar med reservdelar dyker upp här.');
   }
-  return h(doc, 'ul', { class: 'orders', role: 'list' }, vm.orders.map((o) => orderCard(doc, o, vm, now)));
+  const shown = filterOrders(vm.orders, filter);
+  if (!shown.length) return h(doc, 'p', { class: 'empty' }, 'Inga träffar');
+  return h(doc, 'ul', { class: 'orders', role: 'list' }, shown.map((o) => orderCard(doc, o, vm, now)));
 }
 
 /** Banner of active alerts, or null when there are none. */

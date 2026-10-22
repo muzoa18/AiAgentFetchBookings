@@ -6,6 +6,17 @@ failed orders and why, bookings waiting for Klar, and the recent run history.
 It also has two buttons that start the `approve.yml` and `bookings.yml`
 workflows immediately instead of waiting for the schedule.
 
+At the top it shows the same four counts as the daily Telegram summary:
+waiting for approval (status `pending`), waiting for Klar (ordered or blocked
+with an open Klar button: not handled, not closed, sent within 14 days; each
+booking once), ordered (status `ordered`, Klar or not) and needs action
+(blocked, failed or expired, updated within 7 days or of unknown age, and not
+already counted under Klar). Above the orders list, a search box and a status
+filter narrow the loaded orders (up to 200) in the browser: a case-insensitive
+substring over booking id and number, plate, status, the portal's order status
+(`portal_status`) and order numbers (`verified_numbers`). Typing never
+re-fetches; "Inga träffar" is shown when nothing matches.
+
 Approving, cancelling and Klar stay in Telegram. The dashboard never changes
 the agent's state files.
 

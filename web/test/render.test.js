@@ -177,3 +177,64 @@ test('the render thresholds come from the server view model', () => {
   assert.equal(vm.lastSuccessStaleHours, 52);
   assert.ok(R.freshness(doc, vm, Date.parse('2026-10-21T12:00:00Z')).textContent.includes('över 52 timmar'));
 });
+
+const ORDERS = [
+  { bookingId: 'B-1', bookingNr: '880142', regNr: 'QXA112', status: 'pending', portalStatus: null, verifiedNumbers: null },
+  { bookingId: 'B-2', bookingNr: '880151', regNr: 'QLM48K', status: 'ordered', portalStatus: 'Levererad', verifiedNumbers: '4471093, 4471094' },
+  { bookingId: 'B-3', bookingNr: null, regNr: null, status: 'blocked', portalStatus: 'Restad', verifiedNumbers: null },
+];
+const ids = (list) => list.map((o) => o.bookingId);
+
+test('filterOrders: query is a case-insensitive substring over id, number, plate, status, portal status and numbers', () => {
+  assert.deepEqual(ids(R.filterOrders(ORDERS, {})), ['B-1', 'B-2', 'B-3']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: '  ' })), ['B-1', 'B-2', 'B-3']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'b-2' })), ['B-2']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: '88014' })), ['B-1']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'qlm' })), ['B-2']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'QLM 48K' })), ['B-2'], 'plate with a space');
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'levererad' })), ['B-2']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: '4471094' })), ['B-2']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'blocked' })), ['B-3']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { query: 'stoppad' })), ['B-3'], 'Swedish status label');
+});
+
+test('filterOrders: status filter, both together, no match, and purity', () => {
+  const copy = JSON.stringify(ORDERS);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { status: 'ordered' })), ['B-2']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { status: '' })), ['B-1', 'B-2', 'B-3']);
+  assert.deepEqual(ids(R.filterOrders(ORDERS, { status: 'ordered', query: 'levererad' })), ['B-2']);
+  assert.deepEqual(R.filterOrders(ORDERS, { status: 'pending', query: 'levererad' }), []);
+  assert.deepEqual(R.filterOrders(ORDERS, { query: 'finns inte' }), []);
+  assert.deepEqual(R.filterOrders(null, { query: 'x' }), []);
+  assert.equal(JSON.stringify(ORDERS), copy, 'input is not mutated');
+});
+
+test('orders list shows "Inga träffar" when the filter matches nothing, and portal status as text', () => {
+  const vm = vmWith({ portal_status: EVIL });
+  const none = R.orders(doc, vm, NOW, { query: 'zzzz' });
+  assert.equal(none.textContent, 'Inga träffar');
+  assert.equal(R.orders(doc, { orders: [] }, NOW, { query: 'zzzz' }).textContent.includes('Inga delbeställningar'), true);
+  const some = R.orders(doc, vm, NOW, { query: 'qab' });
+  assert.equal(all(some).filter((e) => e.tagName === 'li' && /\border\b/.test(e.className)).length, 1);
+  assert.ok(some.textContent.includes(EVIL), 'portal status shown verbatim as text');
+  assert.ok(all(some).every((e) => e.tagName !== 'img'));
+});
+
+test('counts row renders the four counts', () => {
+  const vm = { counts: { waiting: 2, klar: 1, ordered: 5, needsAction: 0 } };
+  const el = R.countsRow(doc, vm);
+  assert.match(el.textContent, /2/);
+  assert.equal(all(el).filter((e) => e.tagName === 'li').length, 4);
+  assert.equal(R.countsRow(doc, {}).textContent.includes('NaN'), false);
+});
+
+test('search UI: inputs exist, no re-fetch on typing, only DOM APIs', () => {
+  const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  assert.match(html, /id="order-search"/);
+  assert.match(html, /id="order-status-filter"/);
+  assert.match(html, /id="counts"/);
+  const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const handler = app.match(/function onFilter[\s\S]*?\n}\n/)?.[0] ?? '';
+  assert.ok(handler && !/load\(|api\(|fetch\(/.test(handler), 'filtering does not fetch');
+  assert.match(app, /addEventListener\('input'/);
+});

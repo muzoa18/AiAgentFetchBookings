@@ -21,6 +21,11 @@ export const ALERTS_LIMIT = 20;
 
 export const STATUSES = ['attempted', 'pending', 'ordered', 'blocked', 'failed', 'cancelled', 'expired'];
 const NEEDS_ACTION = new Set(['blocked', 'failed', 'expired']);
+// Same windows as the daily Telegram summary (summary.py ACTION_WINDOW, KLAR_MAX_AGE).
+const ACTION_WINDOW_MS = 7 * 86_400_000;
+const KLAR_MAX_AGE_MS = 14 * 86_400_000;
+const PORTAL_STATUS_MAX = 80;
+const VERIFIED_NUMBERS_MAX = 120;
 // Run counters shown in the history, in display order.
 const RUN_COUNTERS = ['bookings_found', 'notified', 'orders_staged', 'orders_failed',
   'notify_failed', 'handled_failed'];
@@ -152,7 +157,28 @@ function isWaitingKlar(r) {
   return Number.isInteger(r.klar_message_id) && r.handled !== true && r.klar_closed !== true;
 }
 
-function order(id, r) {
+// Mirror of orders_state._open_klar "outstanding" (and summary.klar_outstanding): int
+// klar_message_id, not handled, not klar_closed, and klar_sent_at not older than 14 days.
+// A missing or zone-less klar_sent_at never expires.
+function isKlarOpen(r, now) {
+  if (!isWaitingKlar(r)) return false;
+  const sent = r.klar_sent_at;
+  if (typeof sent === 'string' && /([zZ]|[+-]\d\d:?\d\d)$/.test(sent)) {
+    const ms = Date.parse(sent);
+    if (Number.isFinite(ms) && now - ms > KLAR_MAX_AGE_MS) return false;
+  }
+  return true;
+}
+
+// verified_numbers is a list from the agent's order check, or text; shown as one string.
+function verifiedNumbersText(value) {
+  if (Array.isArray(value)) {
+    return str(value.map((n) => str(n, 40)).filter(Boolean).slice(0, 10).join(', '), VERIFIED_NUMBERS_MAX);
+  }
+  return str(value, VERIFIED_NUMBERS_MAX);
+}
+
+function order(id, r, now) {
   const plan = obj(r.plan) ?? {};
   const status = STATUSES.includes(r.status) ? r.status : 'unknown';
   const verifiedAt = time(r.verified_at);
@@ -183,6 +209,9 @@ function order(id, r) {
     tries: Number.isInteger(r.tries) ? r.tries : 0,
     handled: r.handled === true,
     waitingKlar: isWaitingKlar(r),
+    klarOpen: isKlarOpen(r, now),
+    portalStatus: str(r.portal_status, PORTAL_STATUS_MAX),
+    verifiedNumbers: verifiedNumbersText(r.verified_numbers),
     detailUrl: safeHref(r.detail_url),
   };
 }
@@ -236,11 +265,19 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
   now = Date.now(), historyLimit = HISTORY_LIMIT } = {}) {
   const problems = [];
 
-  const all = parseOrders(ordersText, problems).map(([id, r]) => [order(id, r), r]);
+  const all = parseOrders(ordersText, problems).map(([id, r]) => [order(id, r, now), r]);
   const tiles = { pending: 0, orderedVerified: 0, orderedUnverified: 0, needsAction: 0, waitingKlar: 0 };
-  const counts = Object.fromEntries(STATUSES.map((s) => [s, 0]));
+  // Per-status counts plus the daily summary's four numbers: waiting (pending), klar
+  // (ordered/blocked with an open Klar button; each booking once, so a blocked one with an
+  // open Klar is not also needsAction), ordered (status ordered, Klar or not) and needsAction
+  // (blocked/failed/expired, updated within 7 days or of unknown age).
+  const counts = Object.fromEntries([...STATUSES, 'waiting', 'klar', 'needsAction'].map((s) => [s, 0]));
   for (const [o] of all) {
-    if (o.status in counts) counts[o.status] += 1;
+    if (o.status === 'pending') counts.waiting += 1;
+    if ((o.status === 'ordered' || o.status === 'blocked') && o.klarOpen) counts.klar += 1;
+    else if (NEEDS_ACTION.has(o.status)
+      && (o.updatedAt == null || now - Date.parse(o.updatedAt) <= ACTION_WINDOW_MS)) counts.needsAction += 1;
+    if (STATUSES.includes(o.status)) counts[o.status] += 1;
     if (o.status === 'pending') tiles.pending += 1;
     if (o.verification.state === 'verified') tiles.orderedVerified += 1;
     if (o.verification.state === 'unverified') tiles.orderedUnverified += 1;

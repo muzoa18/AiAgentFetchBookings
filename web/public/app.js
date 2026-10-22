@@ -22,6 +22,7 @@ const RUNS = {
 let lastLoad = 0;
 let loading = false;
 let timer = null;
+let lastVm = null;
 
 function api(path, options = {}) {
   const init = { credentials: 'same-origin', cache: 'no-store', ...options };
@@ -58,9 +59,9 @@ function render(vm) {
   $('alerts').replaceChildren(...(banner ? [banner] : []));
   $('headline').textContent = R.headline(vm);
   replace('tiles', R.tiles(document, vm));
-  replace('orders', R.orders(document, vm, now));
-  $('orders-count').textContent = vm.totalOrders > vm.orders.length
-    ? `${vm.orders.length} av ${vm.totalOrders}` : R.plural(vm.orders.length, ['bokning', 'bokningar']);
+  replace('counts', R.countsRow(document, vm));
+  lastVm = vm;
+  renderOrders();
   replace('lastrun', R.lastRun(document, vm, now));
   replace('history', R.history(document, vm, now));
   const foot = [`${vm.seenCount} bokningar sedda totalt`];
@@ -70,6 +71,21 @@ function render(vm) {
   if (vm.problems?.includes('watchdog_alerts_unreadable')) foot.push('watchdog_alerts.json kunde inte läsas');
   $('foot').textContent = foot.join('. ') + '.';
   document.body.classList.toggle('is-demo', Boolean(vm.demo));
+}
+
+// Client-side filter over the loaded orders; never fetches.
+function renderOrders() {
+  if (!lastVm) return;
+  const filter = { query: $('order-search').value, status: $('order-status-filter').value };
+  replace('orders', R.orders(document, lastVm, Date.now(), filter));
+  const total = lastVm.orders.length;
+  const shown = R.filterOrders(lastVm.orders, filter).length;
+  $('orders-count').textContent = shown !== total ? `${shown} av ${total}`
+    : lastVm.totalOrders > total ? `${total} av ${lastVm.totalOrders}` : R.plural(total, ['bokning', 'bokningar']);
+}
+
+function onFilter() {
+  renderOrders();
 }
 
 async function load({ announce = false, justLoggedIn = false } = {}) {
@@ -219,6 +235,8 @@ async function onRun(event) {
 
 $('login-form').addEventListener('submit', onLogin);
 $('logout').addEventListener('click', onLogout);
+$('order-search').addEventListener('input', onFilter);
+$('order-status-filter').addEventListener('change', onFilter);
 $('refresh').addEventListener('click', () => load({ announce: true }));
 for (const b of document.querySelectorAll('[data-workflow]')) b.addEventListener('click', onRun);
 document.addEventListener('visibilitychange', () => {

@@ -38,7 +38,7 @@ function ordersFile(now) {
     'DEMO-B1': {
       status: 'ordered', message_id: 3, updated_at: t(20), cart_touched: true,
       detail_url: 'https://meca.promeisterportal.com/demo/booking/DEMO-B1', vehicle_model: 'Volkswagen Golf 1.4 TSI 2015',
-      verified_at: t(14), verified_numbers: ['4471093'],
+      verified_at: t(14), verified_numbers: ['4471093'], portal_status: 'Skickad från leverantör',
       klar_message_id: 31, klar_sent_at: t(14),
       plan: {
         booking_id: 'DEMO-B1', booking_nr: '880097', reg_nr: 'QRT305', total_sek: 1032.0, confirmation: '4471093',
