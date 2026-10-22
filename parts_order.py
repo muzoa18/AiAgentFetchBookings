@@ -61,7 +61,7 @@ from parts_matcher import (Choice, allowed_for_line, choose_with_alternatives, i
 from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (ALTERNATIVE_FIELDS, TECHNICAL, UNVERIFIED_PREFIX,
                                  alternative_entry, build_summary, cart_problem, clean_fluids,
-                                 margin_line,
+                                 margin_line_for, parts_price,
                                  error_code, is_transient, norm_title, order_body,
                                  owner_reason, parse_qty, prepare_section, reference_line,
                                  replaced_entry, total_problem)
@@ -436,6 +436,15 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
     if fields:  # cart_touched=False marks the record as not legacy (orders_state.restage)
         orders_state.update_fields(booking_id, **fields)
     order_lines, fluids = split_lines(booking)
+    # What the booking charges for the ORDERED rows only (ex VAT); a swap booking carries no
+    # prices, so the figure stored with the first staging is reused.
+    if swap:
+        old_plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+        parts_price_sek = old_plan.get("parts_price_sek")
+        if isinstance(parts_price_sek, bool) or not isinstance(parts_price_sek, (int, float)):
+            parts_price_sek = None
+    else:
+        parts_price_sek = parts_price(order_lines)
     if deadline is None:
         deadline = _clock() + STAGE_BUDGET_S
 
@@ -593,6 +602,7 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
         "expected_lines": expected,
         "total_sek": cart.get("total_sek"),
         "fluids": fluids,
+        "parts_price_sek": parts_price_sek,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if swap:
@@ -608,7 +618,8 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
 
     text, buttons = _approval_message(booking_id, booking, cart, fluids, parts,
                                       record.get("swaps"), rules,
-                                      margin=margin_line(booking, cart.get("total_sek"), rules))
+                                      margin=margin_line_for(parts_price_sek, cart.get("total_sek"),
+                                                             rules))
     message_id = notifier.send_with_buttons(config, text, buttons)
     if message_id is None:
         if swap:

@@ -259,12 +259,15 @@ def reference_line(ref) -> str:
 # The MECA booking page lists prices EXCLUDING VAT ("Totalt exklusive moms"; fixture
 # booking_delar.html: 6 285,64 ex vs "Att betala" 7 857 = x 1.25), and a part row's `price` is
 # that row's TOTAL (unit x qty, e.g. 4 x 143,90 = 575,60). The pro.meca.se cart total is
-# INCLUDING 25 % Swedish VAT, so it is divided by VAT_FACTOR before it is compared.
+# INCLUDING 25 % Swedish VAT, so it is divided by VAT_FACTOR before it is compared. The cart
+# total is "exkl. avgifter": fees added at checkout are not in the purchase figure, so a loss
+# can be understated slightly.
 VAT_FACTOR = 1.25
 
 
-def _booking_parts_price(parts) -> float | None:
-    """Sum of the booking's part row totals (ex VAT), or None when any row is unusable."""
+def parts_price(parts) -> float | None:
+    """Sum of the part row totals (ex VAT), or None when any row is unusable. `parts` must be
+    exactly the ordered rows (parts_order.split_lines(booking)[0]): fluid rows never count."""
     if not isinstance(parts, list) or not parts:
         return None
     total = 0.0
@@ -282,26 +285,30 @@ def _booking_parts_price(parts) -> float | None:
 
 
 def margin_line(booking: dict, cart_total, rules: Rules) -> str | None:
+    """margin_line_for the price of booking["parts"] (callers pass the ordered rows only)."""
+    return margin_line_for(parts_price(booking.get("parts") if isinstance(booking, dict)
+                                       else None), cart_total, rules)
+
+
+def margin_line_for(customer, cart_total, rules: Rules) -> str | None:
     """Informational warning for the approval message, or None. Compares the purchase (cart
-    total incl. VAT, converted to ex VAT) with what the booking charges for the parts (ex
-    VAT). A loss gives "OBS: inköp exkl. moms X SEK över bokningens delpris Y SEK"; else a
-    margin under rules.min_margin_pct (when > 0) gives "OBS: marginal N % (under M %)".
-    Anything unknown (a missing or unparsable price on any row, other currency, bad total)
-    gives None: never a false alarm. Never blocks anything."""
+    total incl. VAT, converted to ex VAT) with `customer`, what the booking charges for the
+    ordered parts (ex VAT, from parts_price; None = unknown). A loss gives "OBS: inköp exkl.
+    moms X SEK över bokningens delpris Y SEK"; else a margin under rules.min_margin_pct
+    (when > 0) gives "OBS: marginal N,N % (under M %)" (margin rounded DOWN to one decimal,
+    so the text never contradicts itself). Anything unknown gives None: never a false alarm.
+    Never blocks anything."""
     if isinstance(cart_total, bool) or not isinstance(cart_total, (int, float)) \
-            or not math.isfinite(cart_total) or cart_total < 0:
-        return None
-    customer = _booking_parts_price(booking.get("parts") if isinstance(booking, dict) else None)
-    if customer is None:
+            or not math.isfinite(cart_total) or cart_total < 0 or customer is None:
         return None
     purchase = round(cart_total / VAT_FACTOR, 2)
     if purchase > customer:
         return (f"OBS: inköp exkl. moms {purchase:.2f} SEK över bokningens delpris "
                 f"{customer:.2f} SEK")
     minimum = rules.min_margin_pct
-    margin = (customer - purchase) / customer * 100
+    margin = math.floor((customer - purchase) / customer * 1000 + 1e-9) / 10
     if minimum > 0 and margin < minimum:
-        return f"OBS: marginal {margin:.0f} % (under {minimum} %)"
+        return f"OBS: marginal {margin:.1f} % (under {minimum} %)".replace(".", ",", 1)
     return None
 
 

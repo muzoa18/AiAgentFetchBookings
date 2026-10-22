@@ -3488,7 +3488,7 @@ def test_margin_line_under_minimum():
     rules = Rules(("Bosch",), (), 10000, "approve", min_margin_pct=30)
     # purchase ex VAT 80, customer 100: margin 20 % < 30 %
     assert margin_line(_mbooking(("1", "100,00 SEK")), 100.0, rules) \
-        == "OBS: marginal 20 % (under 30 %)"
+        == "OBS: marginal 20,0 % (under 30 %)"
 
 
 def test_margin_line_at_or_above_minimum_is_none():
@@ -3583,7 +3583,7 @@ def test_stage_message_min_margin_line_and_no_block(tg):
 
     assert parts_order.plan_and_stage(CONFIG, booking, portal, rules, confident) == "pending"
 
-    assert "OBS: marginal 35 % (under 50 %)" in tg["buttons"][0][0].splitlines()
+    assert "OBS: marginal 34,6 % (under 50 %)" in tg["buttons"][0][0].splitlines()
 
 
 def test_stage_without_booking_prices_has_no_margin_line(tg):
@@ -3635,3 +3635,63 @@ def test_build_summary_puts_the_margin_after_the_total_before_fluids():
     assert lines[lines.index("Totalt: 490.00 SEK") + 1] == "OBS: test"
     assert lines.index("OBS: test") < lines.index("Förbered (finns på lager):")
     assert "OBS" not in build_summary(BOOKING, _cart(490.0), [], PARTS)
+
+
+def test_margin_line_ignores_fluid_rows_in_delar():
+    # Motorolja is a fluid: split_lines moves it out of the order, so only Oljefilter (106)
+    # is compared with the purchase 500 incl VAT = 400 ex VAT.
+    booking = _mbooking(("1", "106,00 SEK"), ("x4", "1 280,00 SEK"))
+    booking["parts"][0]["name"], booking["parts"][1]["name"] = "Oljefilter", "Motorolja"
+    ordered, _ = parts_order.split_lines(booking)
+    assert [p["name"] for p in ordered] == ["Oljefilter"]
+    assert margin_line({"parts": ordered}, 500.0, MARGIN_RULES) \
+        == "OBS: inköp exkl. moms 400.00 SEK över bokningens delpris 106.00 SEK"
+
+
+def test_stage_ignores_fluid_rows_in_delar_for_the_margin(tg):
+    portal = FakePortal(cart=_cart(500.0, [{"title": "Bosch Oljefilter P7001", "qty": 2,
+                                            "price_sek": 250.0}]))
+    booking = {**BOOKING, "parts": [
+        {"name": "Oljefilter", "qty": "2", "price": "106,00 SEK"},
+        {"name": "Motorolja", "qty": "x4", "price": "1 280,00 SEK"}]}
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "pending"
+    assert "OBS: inköp exkl. moms 400.00 SEK över bokningens delpris 106.00 SEK" \
+        in tg["buttons"][0][0].splitlines()
+    assert orders_state.get("B1")["plan"]["parts_price_sek"] == 106.0
+
+
+def test_margin_percentage_never_contradicts_its_threshold():
+    rules = Rules(("Bosch",), (), 10000, "approve", min_margin_pct=20)
+    # purchase 80.4 ex VAT vs customer 100: margin 19.6 %, shown as 19,6 (not "20 % (under 20 %)")
+    line = margin_line(_mbooking(("1", "100,00 SEK")), 100.5, rules)
+    assert line == "OBS: marginal 19,6 % (under 20 %)"
+
+
+def test_margin_line_on_the_real_scraper_output_of_the_fixture():
+    from tests.test_portal_spec import spec
+    _, parts, _, _ = spec()
+    prices = [p["price"] for p in parts]
+    assert prices[-1] == "575,60 SEK"        # Tändstift x4: the row total, not the unit price
+    customer = 286.20 + 106.00 + 5.50 + 143.90 + 575.60          # 1117.20 ex VAT
+    ex_vat = round(customer, 2)
+    # cart 1396.50 incl VAT = 1117.20 ex VAT: equal -> no line; one krona more ex VAT -> loss
+    assert margin_line({"parts": parts}, ex_vat * VAT_FACTOR, MARGIN_RULES) is None
+    assert margin_line({"parts": parts}, (ex_vat + 1) * VAT_FACTOR, MARGIN_RULES) \
+        == "OBS: inköp exkl. moms 1118.20 SEK över bokningens delpris 1117.20 SEK"
+
+
+def test_swap_restage_message_keeps_the_margin_line(tg):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+    booking = {**_priced_booking("100,00 SEK", "100,00 SEK"), "detail_url": "https://m/b/B1"}
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+    record = orders_state.get("B1")
+    assert record["plan"]["parts_price_sek"] == 200.0
+    orders_state.put("B1", "attempted")
+    orders_state.update_fields("B1", swaps=1, cart_touched=True)
+    tg["buttons"].clear()
+    assert _restage(record, FakePortal(catalogue={"Oljefilter": [OOS, MANN],
+                                                  "Luftfilter": LUFT})) == "pending"
+    lines = tg["buttons"][0][0].splitlines()
+    assert any(ln.startswith("OBS: inköp exkl. moms") and ln.endswith("delpris 200.00 SEK")
+               for ln in lines)
