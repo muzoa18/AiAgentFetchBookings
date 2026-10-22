@@ -541,11 +541,13 @@ def main(argv=None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])
+    import alerts
     import preflight  # lazy: --check above stays stdlib only
     if preflight.state_problems():
         import config_loader
         preflight.check_state_or_alert(config_loader.load_config())
         return 1
+    alerts.resolve(preflight.STATE_ALERT_KEY)  # a repaired file clears the dashboard alert
 
     try:
         if not (orders_state.pending() or orders_state.outstanding_klar()

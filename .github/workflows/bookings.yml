@@ -46,6 +46,17 @@ jobs:
           PARTS_PORTAL_PASSWORD: ${{ secrets.PARTS_PORTAL_PASSWORD }}
         run: python agent.py
 
+      # Covers failures outside our Python code (pip/playwright install, the
+      # 15 min timeout, a crash before agent.py starts). Stdlib only: nothing
+      # needs installing. Runs before the persist step so config/alerts.json is
+      # committed.
+      - name: Alert on failure
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python alerts_cli.py workflow-failed "${{ github.workflow }}"
+
       - name: Persist state back to repo
         if: ${{ always() }}
         run: |
@@ -53,7 +64,7 @@ jobs:
           git config user.email "meca-agent[bot]@users.noreply.github.com"
           # One file per git add: a missing file must not stop the others being staged.
           for f in config/seen_ids.txt config/orders.json logs/run_history.jsonl \
-                   config/no_button_ids.txt config/no_button_seen_once.txt; do
+                   config/no_button_ids.txt config/no_button_seen_once.txt config/alerts.json; do
             git add "$f" 2>/dev/null || true
           done
           if git diff --cached --quiet; then

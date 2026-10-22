@@ -1610,3 +1610,16 @@ def test_main_stops_before_telegram_when_orders_json_missing(monkeypatch, run_ma
 
     assert approve.main([]) == 1
     assert [a["text"] for a in alerts.active()] == ["config/orders.json saknas"]
+
+
+def test_main_resolves_the_state_alert_when_the_state_is_readable(monkeypatch, run_main, orders_file, tmp_path):
+    import alerts
+    import preflight
+    monkeypatch.setattr(alerts, "ALERTS_FILE", tmp_path / "a.json")
+    monkeypatch.setattr(notifier, "send_message", lambda config, text: True)
+    alerts.raise_alert({"telegram": {}}, preflight.STATE_ALERT_KEY, "trasig")
+    assert [a["key"] for a in alerts.active()] == [preflight.STATE_ALERT_KEY]
+    monkeypatch.setattr(config_loader, "load_config", lambda: CONFIG)
+
+    assert approve.main([]) == 0   # nothing pending: stops early, after the guard
+    assert alerts.active() == []
