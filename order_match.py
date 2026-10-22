@@ -28,6 +28,8 @@ from datetime import date, datetime, timezone
 
 MODEL_MAX = 80
 NUMBERS_MAX = 120   # same limit as orders_state.NUMBERS_MAX (verified_numbers)
+# The owner's message for a verified order (approve.py's checker, parts_order.verify_now).
+VERIFIED_TEXT = "Beställning verifierad: {label} – {model}, ordernummer {numbers}."
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,32 @@ def numbers_text(row: dict) -> str:
         if len(candidate) <= NUMBERS_MAX:
             return candidate
     return text[:NUMBERS_MAX]
+
+
+def display_numbers(row: dict) -> str:
+    """A row's numbers as the owner's messages show them: "<supplier no> (<order numbers>)"."""
+    numbers = str(row.get("order_numbers") or "").strip()
+    return f"{row['supplier_no']} ({numbers})" if numbers else str(row["supplier_no"])
+
+
+def verified_text(label: str, row: dict, vehicle_model) -> str:
+    """VERIFIED_TEXT for a verified row (the row's model, else the booking's, else "–")."""
+    return VERIFIED_TEXT.format(label=label, model=row.get("model") or vehicle_model or "–",
+                                numbers=display_numbers(row))
+
+
+def row_has_number(row: dict, ref) -> bool:
+    """True if `ref` (a checkout reference) is the row's supplier number or one of its
+    portal order numbers."""
+    ref = str(ref or "").strip()
+    return bool(ref) and (ref == str(row.get("supplier_no") or "").strip()
+                          or ref in _numbers(row))
+
+
+def plate_matchable(rows, reg_nr) -> bool:
+    """True if `rows` can be matched by plate: the record has a plate and the table has the
+    registration column (candidates() then counts only rows showing that plate)."""
+    return bool(_norm_reg(reg_nr)) and _has_reg_column(rows)
 
 
 def claim_tokens(verified_numbers) -> set[str]:

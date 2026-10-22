@@ -62,8 +62,14 @@ log = logging.getLogger(__name__)
 
 EXPIRY = timedelta(hours=48)
 VERIFY_WARN_AFTER = timedelta(days=3)
+# The approve step has 8 minutes: an immediate verification after an approved checkout
+# (parts_order.verify_now, up to ~90 s each) may only START within this many seconds of the
+# run start (_run_start, a parts_order._clock() value set by main), so the order checker
+# and the state push still fit. Without a run start it is counted from the tap.
+VERIFY_START_S = 270
+_run_start: float | None = None
 AMBIGUOUS_LIST_MAX = 5
-VERIFIED_TEXT = "Beställning verifierad: {label} – {model}, ordernummer {numbers}."
+# The verified-order text is order_match.VERIFIED_TEXT (shared with parts_order.verify_now).
 AMBIGUOUS_TEXT = ("Flera ordrar för {model} i Skickade Beställningar – kontrollera vilken som "
                   "är {label}: {rows}.")
 NOT_VERIFIED_TEXT = ("Kunde inte verifiera beställningen för {label} i Skickade Beställningar "
@@ -233,7 +239,9 @@ def _approve(config, session, booking_id, record, rules, cb) -> bool:
                 "kunde inte öppna pro.meca.se. Inget beställdes – beställ för hand."):
             log.error("Failure message for %s was not delivered.", booking_id)
         return True
-    result = parts_order.execute_order(config, portal, booking_id, record["plan"], rules)
+    start = _run_start if _run_start is not None else parts_order._clock()
+    result = parts_order.execute_order(config, portal, booking_id, record["plan"], rules,
+                                       deadline=start + VERIFY_START_S)
     log.info("Approved order for %s: %s", booking_id, result)
     return result != "ordered" or parts_order.order_notify_failed(booking_id)
 
@@ -485,8 +493,8 @@ def _local_date(when: datetime):
 
 
 def _numbers_text(row: dict) -> str:
-    numbers = str(row.get("order_numbers") or "").strip()
-    return f"{row['supplier_no']} ({numbers})" if numbers else str(row["supplier_no"])
+    from order_match import display_numbers
+    return display_numbers(row)
 
 
 def _claimed() -> set[str]:
@@ -520,7 +528,7 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
     NOT sent again: the stored state is correct and the run exits 1 so it shows.
     """
     import notifier
-    from order_match import match_key, numbers_text, order_facts, resolve_orders
+    from order_match import match_key, numbers_text, order_facts, resolve_orders, verified_text
     from parts_order_helpers import error_code
 
     todo = _to_verify()
@@ -552,8 +560,7 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
             row = result.row
             orders_state.update_fields(booking_id, verified_at=now.isoformat(),
                                        verified_numbers=numbers_text(row))
-            text = VERIFIED_TEXT.format(label=label, model=row.get("model") or model or "–",
-                                        numbers=_numbers_text(row))
+            text = verified_text(label, row, model)
             if not notifier.send_message(config, text):  # not resent: the state is right
                 log.error("Verified message for %s was not delivered.", booking_id)
                 problem = True
@@ -604,6 +611,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.check:
         return _check()
+    global _run_start
+    import parts_order  # lazy: not needed by --check
+    _run_start = parts_order._clock()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout)])

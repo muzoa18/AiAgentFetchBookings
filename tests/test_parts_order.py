@@ -3012,6 +3012,10 @@ def test_alternative_placement_is_stored_clean_and_only_when_present():
 
 # ── Task 5: immediate verification of the placed order ───────────────────────
 
+UNVERIFIED_REF = "UNVERIFIED-20261022T101010Z"
+LATER_LINE = "Ordernummer: bekräftas senare (kolla Skickade Beställningar i pro.meca.se)"
+
+
 def _today_se():
     from zoneinfo import ZoneInfo
     return datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Stockholm")).date().isoformat()
@@ -3022,11 +3026,19 @@ def _today_row(supplier_no="S-91001", order_numbers="71001/71002", reg_nr="TST00
                         **kw), "date": _today_se()}
 
 
+def _verified_text(row=None, label="OLRD-0001"):
+    from order_match import VERIFIED_TEXT
+    row = row or _today_row()
+    return VERIFIED_TEXT.format(label=label, model=row["model"],
+                                        numbers=f"{row['supplier_no']} ({row['order_numbers']})")
+
+
 class Polled(FakePortal):
     """list_sent_orders returns the next entry of `polls` (rows, or an exception to raise);
     the duplicate-order guard during staging sees no rows."""
 
     def __init__(self, polls=(), **kw):
+        kw.setdefault("ref", UNVERIFIED_REF)
         super().__init__(**kw)
         self.polls = list(polls)
         self.staged = False
@@ -3041,6 +3053,12 @@ class Polled(FakePortal):
         return [dict(r) for r in item]
 
 
+def _polled(polls):
+    portal = Polled(polls=polls)
+    portal.staged = True
+    return portal
+
+
 @pytest.fixture
 def sleeps(monkeypatch):
     calls = []
@@ -3048,11 +3066,11 @@ def sleeps(monkeypatch):
     return calls
 
 
-def _place(tg, portal, rules=APPROVE):
+def _place(tg, portal, rules=APPROVE, **kw):
     plan = _staged_plan(tg, portal)
     portal.staged = True
     portal.sent_calls = 0
-    return parts_order.execute_order(CONFIG, portal, "B1", plan, rules)
+    return parts_order.execute_order(CONFIG, portal, "B1", plan, rules, **kw)
 
 
 def _ordered_record(**kw):
@@ -3061,9 +3079,14 @@ def _ordered_record(**kw):
             "updated_at": datetime.now(timezone.utc).isoformat(), **kw}
 
 
-def test_unique_match_on_the_second_poll_is_stored_and_shown(tg, sleeps):
+def _verify(portal, record=None, others=(), **kw):
+    kw.setdefault("sleep", lambda s: None)
+    return parts_order.verify_now(portal, "B1", record or _ordered_record(), list(others), **kw)
+
+
+def test_unique_plate_match_on_the_second_poll_is_stored_and_sent_separately(tg, sleeps):
     row = _today_row()
-    portal = Polled(polls=[[], [row]], ref="ORD-9")
+    portal = Polled(polls=[[], [row]])
 
     assert _place(tg, portal) == "ordered"
 
@@ -3073,14 +3096,16 @@ def test_unique_match_on_the_second_poll_is_stored_and_shown(tg, sleeps):
     assert rec["status"] == "ordered"
     assert rec["verified_numbers"] == numbers_text(row) == "S-91001 · 71001/71002"
     assert datetime.fromisoformat(rec["verified_at"]).tzinfo is not None
-    lines = tg["sent"][0].splitlines()
-    assert lines[:2] == ["Beställd: OLRD-0001 (TST001)",
-                         "Ordernummer: S-91001 · 71001/71002 (verifierad)"]
+    # the Beställd message is exactly the pre-verification text; the check is its own message
+    assert len(tg["sent"]) == 2
+    assert tg["sent"][0].splitlines()[:2] == ["Beställd: OLRD-0001 (TST001)", LATER_LINE]
+    assert "verifierad" not in tg["sent"][0]
+    assert tg["sent"][1] == _verified_text(row)
     assert parts_order.order_notify_failed("B1") is False
 
 
-def test_no_match_after_three_polls_keeps_the_text(tg, sleeps):
-    portal = Polled(polls=[[], [], []], ref="UNVERIFIED-20261022T101010Z")
+def test_no_match_after_three_polls_sends_only_the_ordered_message(tg, sleeps):
+    portal = Polled(polls=[[], [], []])
 
     assert _place(tg, portal) == "ordered"
 
@@ -3088,28 +3113,30 @@ def test_no_match_after_three_polls_keeps_the_text(tg, sleeps):
     assert sleeps == [10, 10]                       # no sleep after the last try
     rec = orders_state.get("B1")
     assert "verified_at" not in rec and "verified_numbers" not in rec
-    assert ("Ordernummer: bekräftas senare (kolla Skickade Beställningar i pro.meca.se)"
-            in tg["sent"][0].splitlines())
+    assert len(tg["sent"]) == 1 and LATER_LINE in tg["sent"][0].splitlines()
 
 
 def test_verify_now_returns_none_after_all_tries():
     calls = []
-    portal = Polled(polls=[[], [], []])
-    portal.staged = True
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
-                                  sleep=calls.append) is None
+    portal = _polled([[], [], []])
+    assert _verify(portal, sleep=calls.append) is None
     assert portal.sent_calls == 3 and calls == [10, 10]
+
+
+def test_verify_now_without_sleep_uses_the_module_sleep(sleeps):
+    portal = _polled([[], [], []])
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), []) is None
+    assert sleeps == [10, 10]
 
 
 def test_two_candidate_rows_are_ambiguous(tg, sleeps):
     rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
-    portal = Polled(polls=[rows, rows, rows], ref="ORD-9")
+    portal = Polled(polls=[rows, rows, rows])
 
     assert _place(tg, portal) == "ordered"
 
-    rec = orders_state.get("B1")
-    assert "verified_at" not in rec
-    assert tg["sent"][0].splitlines()[1] == "Ordernummer: ORD-9"
+    assert "verified_at" not in orders_state.get("B1")
+    assert len(tg["sent"]) == 1
 
 
 def test_another_records_claimed_numbers_are_excluded(tg, sleeps):
@@ -3117,7 +3144,7 @@ def test_another_records_claimed_numbers_are_excluded(tg, sleeps):
     orders_state.update_fields("B2", verified_at=datetime.now(timezone.utc).isoformat(),
                                verified_numbers="S-91001 · 71001/71002")
     rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
-    portal = Polled(polls=[rows], ref="ORD-9")
+    portal = Polled(polls=[rows])
 
     assert _place(tg, portal) == "ordered"
 
@@ -3127,36 +3154,77 @@ def test_another_records_claimed_numbers_are_excluded(tg, sleeps):
 
 def test_verify_now_excludes_claimed_numbers_directly():
     rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
-    portal = Polled(polls=[rows])
-    portal.staged = True
     others = [("B2", _ordered_record(verified_at=datetime.now(timezone.utc).isoformat(),
                                      verified_numbers="S-91001 · 71001/71002"))]
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), others,
-                                  sleep=lambda s: None) == "S-91002 · 71003"
+    assert _verify(_polled([rows]), others=others) == "S-91002 · 71003"
 
 
-def test_verify_now_older_row_does_not_count():
-    portal = Polled(polls=[[_sent_row(days_ago=1)]] * 3)
-    portal.staged = True
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
-                                  sleep=lambda s: None) is None
+def test_same_plate_row_before_the_order_date_is_excluded():
+    assert _verify(_polled([[_sent_row(days_ago=1)]] * 3)) is None
 
 
-def test_verify_now_matches_by_model_without_the_registration_column():
-    row = _today_row(reg_nr=None)
-    portal = Polled(polls=[[row]])
-    portal.staged = True
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
-                                  sleep=lambda s: None) == numbers_text(row)
+def test_without_the_registration_column_nothing_is_verified():
+    # Reviewer probe: a foreign hand-placed order for the same model, no registration
+    # column, this order's own row not listed yet -> never taken as this order's number.
+    foreign = _today_row(reg_nr=None, supplier_no="S-1", order_numbers="0168",
+                         model="VOLKSWAGEN, Passat Variant")
+    portal = _polled([[foreign]] * 3)
+    assert _verify(portal) is None
+    assert portal.sent_calls == 1                   # no column: no point in reading again
+
+
+def test_without_the_registration_column_nothing_is_stored(tg, sleeps):
+    portal = Polled(polls=[[_today_row(reg_nr=None)]] * 3)
+
+    assert _place(tg, portal) == "ordered"
+
+    assert "verified_at" not in orders_state.get("B1")
+    assert len(tg["sent"]) == 1
+
+
+def test_a_record_without_a_plate_is_not_verified():
+    portal = _polled([[_today_row()]])
+    assert _verify(portal, _ordered_record(plan={"reg_nr": "  "})) is None
+    assert portal.sent_calls == 0
+
+
+def test_another_plate_does_not_match():
+    assert _verify(_polled([[_today_row(reg_nr="XYZ999")]] * 3)) is None
+
+
+def test_a_real_reference_must_be_in_the_row():
+    row = _today_row()
+    assert _verify(_polled([[row]] * 3), ref="4500012345") is None
+    assert _verify(_polled([[row]]), ref="71002") == numbers_text(row)
+    assert _verify(_polled([[row]]), ref="S-91001") == numbers_text(row)
+
+
+def test_an_unverified_placeholder_needs_no_cross_check():
+    row = _today_row()
+    assert _verify(_polled([[row]]), ref=UNVERIFIED_REF) == numbers_text(row)
+    assert _verify(_polled([[row]]), ref=None) == numbers_text(row)
+
+
+def test_ref_mismatch_stores_nothing(tg, sleeps):
+    portal = Polled(polls=[[_today_row()]] * 3, ref="4500012345")
+
+    assert _place(tg, portal) == "ordered"
+
+    assert "verified_at" not in orders_state.get("B1")
+    assert tg["sent"][0].splitlines()[1] == "Ordernummer: 4500012345"
+    assert len(tg["sent"]) == 1
+
+
+def test_ref_in_the_row_is_stored(tg, sleeps):
+    portal = Polled(polls=[[_today_row()]], ref="71001")
+    assert _place(tg, portal) == "ordered"
+    assert orders_state.get("B1")["verified_numbers"] == "S-91001 · 71001/71002"
+    assert tg["sent"][0].splitlines()[1] == "Ordernummer: 71001"
 
 
 def test_verify_now_another_unverified_order_for_the_car_is_not_guessed():
     # The checker resolves all unverified orders together: one row, two orders -> waiting.
-    portal = Polled(polls=[[_today_row()]] * 3)
-    portal.staged = True
-    others = [("B2", _ordered_record())]
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), others,
-                                  sleep=lambda s: None) is None
+    assert _verify(_polled([[_today_row()]] * 3), others=[("B2", _ordered_record())]) is None
 
 
 @pytest.mark.parametrize("error", [PartsPortalError("SECRET-PAGE-TEXT", "parse"),
@@ -3169,6 +3237,7 @@ def test_list_sent_orders_raising_keeps_the_order_and_message(tg, sleeps, error,
     rec = orders_state.get("B1")
     assert rec["status"] == "ordered" and "verified_at" not in rec
     assert rec["plan"]["confirmation"] == "ORD-9"
+    assert tg["sent"] == [tg["sent"][0]]
     assert tg["sent"][0].splitlines()[:2] == ["Beställd: OLRD-0001 (TST001)",
                                               "Ordernummer: ORD-9"]
     assert parts_order.order_notify_failed("B1") is False
@@ -3178,8 +3247,7 @@ def test_list_sent_orders_raising_keeps_the_order_and_message(tg, sleeps, error,
 def test_portal_without_list_sent_orders_is_swallowed():
     class Bare:
         pass
-    assert parts_order.verify_now(Bare(), "B1", _ordered_record(), [],
-                                  sleep=lambda s: None) is None
+    assert _verify(Bare()) is None
 
 
 def test_verify_budget_exceeded_stops_polling(stage_clock):
@@ -3190,17 +3258,26 @@ def test_verify_budget_exceeded_stops_polling(stage_clock):
     portal = Slow(polls=[[], [], []])
     portal.staged = True
     calls = []
-    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
-                                  sleep=calls.append) is None
+    assert _verify(portal, sleep=calls.append) is None
     # polls at 0 (-> 50) and 60 (-> 110): past the 90 s budget, no third poll
     assert portal.sent_calls == 2 and calls == [10]
     assert parts_order.VERIFY_BUDGET_S == 90
 
 
+def test_exhausted_run_deadline_skips_verification(tg, sleeps, stage_clock):
+    portal = Polled(polls=[[_today_row()]])
+
+    assert _place(tg, portal, deadline=stage_clock["t"] - 1) == "ordered"
+
+    assert portal.sent_calls == 0                   # never read after the order
+    assert orders_state.get("B1")["status"] == "ordered"
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställd: OLRD-0001")
+    assert _verify(_polled([[_today_row()]]), deadline=stage_clock["t"] - 1) is None
+
+
 def test_the_checker_skips_a_record_verified_right_after_checkout(tg, sleeps):
     import approve
-    portal = Polled(polls=[[_today_row()]], ref="ORD-9")
-    assert _place(tg, portal) == "ordered"
+    assert _place(tg, Polled(polls=[[_today_row()]])) == "ordered"
     sent = len(tg["sent"])
 
     class Untouchable:
@@ -3212,8 +3289,8 @@ def test_the_checker_skips_a_record_verified_right_after_checkout(tg, sleeps):
     assert len(tg["sent"]) == sent
 
 
-def test_verified_but_message_not_delivered_is_notify_failed(tg, sleeps):
-    portal = Polled(polls=[[_today_row()]], ref="ORD-9")
+def test_ordered_message_not_delivered_is_notify_failed_and_still_verified(tg, sleeps):
+    portal = Polled(polls=[[_today_row()]])
     plan = _staged_plan(tg, portal)
     portal.staged = True
     tg["send_ok"] = False
@@ -3222,17 +3299,39 @@ def test_verified_but_message_not_delivered_is_notify_failed(tg, sleeps):
 
     rec = orders_state.get("B1")
     assert rec["plan"]["notify_failed"] is True
-    assert rec["verified_numbers"] == "S-91001 · 71001/71002"   # kept by the re-put
+    assert rec["verified_numbers"] == "S-91001 · 71001/71002"
     assert parts_order.order_notify_failed("B1") is True
 
 
-def test_ordered_state_is_persisted_before_verification(tg, sleeps, monkeypatch):
+def test_verified_message_not_delivered_is_kept_and_not_resent(tg, sleeps, monkeypatch):
+    plain = []
+
+    def failing(config, text):
+        plain.append(text)
+        return False
+
+    monkeypatch.setattr(notifier, "send_message", failing)
+    assert _place(tg, Polled(polls=[[_today_row()]])) == "ordered"
+
+    rec = orders_state.get("B1")
+    assert rec["verified_numbers"] == "S-91001 · 71001/71002"
+    assert plain == [_verified_text()]                # tried once
+    assert parts_order.order_notify_failed("B1") is False   # Beställd was delivered
+    assert tg["sent"][0].startswith("Beställd: OLRD-0001")
+
+
+def test_ordered_state_and_message_come_before_verification(tg, sleeps, monkeypatch):
     events = []
     real_put = orders_state.put
+    real_buttons = notifier.send_with_buttons
 
     def put(booking_id, status, *a, **kw):
         events.append(("put", status))
         return real_put(booking_id, status, *a, **kw)
+
+    def buttons(config, text, rows):
+        events.append(("message", text.splitlines()[0]))
+        return real_buttons(config, text, rows)
 
     class Recording(Polled):
         def list_sent_orders(self):
@@ -3240,14 +3339,16 @@ def test_ordered_state_is_persisted_before_verification(tg, sleeps, monkeypatch)
                 events.append(("list_sent_orders", orders_state.get("B1")["status"]))
             return super().list_sent_orders()
 
-    portal = Recording(polls=[[_today_row()]], ref="ORD-9")
+    portal = Recording(polls=[[_today_row()]])
     plan = _staged_plan(tg, portal)
     portal.staged = True
     monkeypatch.setattr(orders_state, "put", put)
+    monkeypatch.setattr(notifier, "send_with_buttons", buttons)
 
     assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
 
     assert events == [("put", "attempted"), ("put", "ordered"),
+                      ("message", "Beställd: OLRD-0001 (TST001)"),
                       ("list_sent_orders", "ordered")]
 
 
@@ -3257,10 +3358,50 @@ def test_auto_mode_verifies_too(tg, sleeps):
             self.staged = True
             return super().checkout(max_total_sek=max_total_sek)
 
-    portal = AutoPolled(polls=[[_today_row()]], ref="ORD-9")
+    portal = AutoPolled(polls=[[_today_row()]])
     assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, AUTO, confident) == "ordered"
     assert orders_state.get("B1")["verified_numbers"] == "S-91001 · 71001/71002"
-    assert "(verifierad)" in tg["sent"][0]
+    assert tg["sent"][-1] == _verified_text()
+
+
+def test_auto_mode_past_the_staging_deadline_does_not_verify(tg, sleeps, stage_clock):
+    class AutoPolled(Polled):
+        def checkout(self, *, max_total_sek):
+            self.staged = True
+            stage_clock["t"] += parts_order.STAGE_BUDGET_S + 1
+            return super().checkout(max_total_sek=max_total_sek)
+
+    portal = AutoPolled(polls=[[_today_row()]])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, AUTO, confident) == "ordered"
+    assert portal.sent_calls == 1                   # the duplicate guard only
+    assert "verified_at" not in orders_state.get("B1")
+
+
+def test_approve_passes_the_run_deadline(tg, monkeypatch, stage_clock):
+    import approve
+    seen = {}
+
+    def fake_execute(config, portal, booking_id, plan, rules, deadline=None):
+        seen["deadline"] = deadline
+        return "ordered"
+
+    class Session:
+        def get(self):
+            return object()
+
+    monkeypatch.setattr(parts_order, "execute_order", fake_execute)
+    monkeypatch.setattr(notifier, "answer_callback", lambda *a, **k: None)
+    orders_state.put("B1", "pending", plan={"reg_nr": "TST001"}, message_id=5)
+    record = orders_state.get("B1")
+    monkeypatch.setattr(approve, "_run_start", stage_clock["t"] - 100)
+
+    approve._approve(CONFIG, Session(), "B1", record, APPROVE, "cb")
+
+    assert seen["deadline"] == stage_clock["t"] - 100 + approve.VERIFY_START_S
+    assert approve.VERIFY_START_S == 270
+    monkeypatch.setattr(approve, "_run_start", None)   # not set: counted from the tap
+    approve._approve(CONFIG, Session(), "B1", record, APPROVE, "cb")
+    assert seen["deadline"] == stage_clock["t"] + approve.VERIFY_START_S
 
 
 def test_out_of_time_error_names_the_budget_in_use(tg, stage_clock):
