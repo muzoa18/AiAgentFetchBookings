@@ -12,7 +12,7 @@ Stored as config/orders.json (committed back to the repo by the workflows):
                                    "handled", "last_reason", "gave_up",
                                    "klar_message_id", "klar_sent_at", "klar_closed",
                                    "vehicle_model", "verified_at", "verified_numbers",
-                                   "verify_warned"}}}
+                                   "verify_warned", "swaps"}}}
 
 Optional fields (absent in older records) are kept by put()/begin() and set with
 update_fields(). Unknown record keys are rejected. Never store customer data here.
@@ -56,7 +56,11 @@ OPTIONAL_FIELDS = {
     "verified_at": str,     # ISO 8601 with time zone
     "verified_numbers": str,  # "<supplier no> · <portal order numbers>", <= NUMBERS_MAX
     "verify_warned": bool,
+    # One-tap swap (approve.py): how often the owner swapped a part to its alternative
+    # (0..MAX_SWAPS); parts_order shows no swap buttons once it reaches MAX_SWAPS.
+    "swaps": int,
 }
+MAX_SWAPS = 2
 MODEL_MAX = 80
 NUMBERS_MAX = 120
 KLAR_MAX_AGE = timedelta(days=14)
@@ -114,6 +118,8 @@ def _field_problem(key: str, value) -> str | None:
         return f"{key!r} is not {want.__name__}"
     if key == "tries" and value < 0:
         return "'tries' is negative"
+    if key == "swaps" and not 0 <= value <= MAX_SWAPS:
+        return f"'swaps' is not 0-{MAX_SWAPS}"
     if key == "klar_message_id" and value < 1:
         return "'klar_message_id' is not positive"
     if key in ("klar_sent_at", "verified_at") and _parse_time(value) is None:

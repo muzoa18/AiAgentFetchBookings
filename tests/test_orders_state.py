@@ -571,3 +571,41 @@ def test_unverified_orders_are_ordered_records_without_verified_at():
 
 def test_unverified_orders_empty_without_file(orders_file):
     assert orders_state.unverified_orders() == []
+
+
+# ── Swap counter (package 2 task 4) ──────────────────────────────────────────
+
+@pytest.mark.parametrize("value", [0, 1, 2])
+def test_swaps_loads(orders_file, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, "swaps": value}})
+    assert orders_state.get("B1")["swaps"] == value
+
+
+@pytest.mark.parametrize("value", [-1, 3, True, False, "1", 1.0, None])
+def test_bad_swaps_raise(orders_file, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, "swaps": value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+@pytest.mark.parametrize("value", [-1, 3, True, "1", 1.0])
+def test_update_fields_rejects_bad_swaps(orders_file, value):
+    orders_state.put("B1", "pending")
+    before = orders_file.read_bytes()
+    with pytest.raises(ValueError):
+        orders_state.update_fields("B1", swaps=value)
+    assert orders_file.read_bytes() == before
+
+
+def test_swaps_is_kept_by_put_update_fields_and_begin():
+    orders_state.put("B1", "pending", plan={"a": 1}, message_id=9)
+    orders_state.update_fields("B1", swaps=1)
+    orders_state.put("B1", "attempted")
+    orders_state.update_fields("B1", cart_touched=True)
+    orders_state.put("B1", "pending", plan={"a": 2}, message_id=10)
+    rec = orders_state.get("B1")
+    assert rec["swaps"] == 1 and rec["plan"] == {"a": 2} and rec["message_id"] == 10
+    orders_state.queue("B2")
+    orders_state.update_fields("B2", swaps=2)
+    assert orders_state.begin("B2") is True
+    assert orders_state.get("B2")["swaps"] == 2
