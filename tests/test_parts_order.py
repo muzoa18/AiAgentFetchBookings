@@ -3261,3 +3261,13 @@ def test_auto_mode_verifies_too(tg, sleeps):
     assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, AUTO, confident) == "ordered"
     assert orders_state.get("B1")["verified_numbers"] == "S-91001 · 71001/71002"
     assert "(verifierad)" in tg["sent"][0]
+
+
+def test_out_of_time_error_names_the_budget_in_use(tg, stage_clock):
+    orders_state.put("B1", "attempted")
+    with pytest.raises(PartsPortalError, match="240 s"):
+        parts_order._stage(CONFIG, BOOKING, FakePortal(), APPROVE, confident, pins={},
+                           keep={}, deadline=stage_clock["t"] - 1)
+    with pytest.raises(PartsPortalError, match="480 s"):
+        parts_order._stage(CONFIG, BOOKING, Clocked(stage_clock, per_search=500), APPROVE,
+                           confident)

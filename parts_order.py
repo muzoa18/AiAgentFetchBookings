@@ -483,8 +483,9 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
         choice = None
         for term in search_terms(name):  # synonyms first, then the normalised term, the original last
             if out_of_time():  # nothing is in the cart yet: retried quietly (transient)
+                budget = SWAP_BUDGET_S if swap else STAGE_BUDGET_S
                 raise PartsPortalError(f"staging {booking_id} took longer than "
-                                       f"{STAGE_BUDGET_S} s", "search_timeout")
+                                       f"{budget} s", "search_timeout")
             if staged is not None:  # a swap keeps the other lines exactly as staged
                 choice = _find_staged(name, staged, portal.search(term), rules)
             else:
@@ -645,7 +646,8 @@ def _swap_buttons(booking_id: str, parts: list[dict], swaps,
 
 def swap_booking(booking_id: str, record: dict) -> dict:
     """The booking dict restage_with_pins needs, rebuilt from the stored record and plan
-    (no MECA scrape). It holds no customer data, so the new approval text says "Kund: –"."""
+    (no MECA scrape). It holds no customer data, so the new approval text says
+    "Kund: se bokning <nr>"."""
     plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
     return {"id": booking_id, "booking_nr": plan.get("booking_nr"),
             "reg_nr": plan.get("reg_nr"),
