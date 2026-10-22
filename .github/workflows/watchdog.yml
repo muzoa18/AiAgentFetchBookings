@@ -7,8 +7,10 @@ on:
     - cron: "17 */6 * * *"
   workflow_dispatch:
 
+# Its own group: sharing meca-bookings would let a queued watchdog run replace a
+# pending bookings/approve run (GitHub keeps one pending run per group).
 concurrency:
-  group: meca-bookings
+  group: meca-watchdog
   cancel-in-progress: false
 
 permissions:

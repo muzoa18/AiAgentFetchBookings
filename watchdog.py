@@ -48,9 +48,16 @@ SPECS = {
 }
 
 
+def _utc(when: datetime) -> datetime:
+    """`when` in UTC; a naive datetime is taken as UTC (never as the machine's local time)."""
+    if when.tzinfo is None:
+        return when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
 def last_slot(now: datetime, spec: Spec) -> datetime:
-    """Latest scheduled slot <= now (UTC)."""
-    now = now.astimezone(timezone.utc)
+    """Latest scheduled slot <= now (UTC; a naive `now` is UTC)."""
+    now = _utc(now)
     for back in range(8):
         day = now - timedelta(days=back)
         if day.weekday() not in spec.days:
@@ -62,6 +69,9 @@ def last_slot(now: datetime, spec: Spec) -> datetime:
 
 
 def is_overdue(now, last_success, spec, grace=timedelta(hours=3)) -> bool:
+    now = _utc(now)
+    if last_success is not None:
+        last_success = _utc(last_success)
     slot = last_slot(now, spec)
     if now <= slot + grace:
         return False

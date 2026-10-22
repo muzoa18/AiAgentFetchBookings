@@ -55,6 +55,17 @@ def test_is_overdue_cases():
     assert not is_overdue(utc(2026, 10, 21, 15, 20), None, B)  # inside grace
 
 
+def test_naive_now_is_treated_as_utc_never_local_time():
+    naive = datetime(2026, 10, 21, 15, 30)               # meant as 15:30 UTC
+    assert last_slot(naive, B) == utc(2026, 10, 21, 15)
+    assert last_slot(datetime(2026, 10, 21, 14, 59), B) == utc(2026, 10, 20, 15)
+    tue = utc(2026, 10, 20, 15, 2)
+    assert is_overdue(datetime(2026, 10, 21, 18, 30), tue, B)
+    assert not is_overdue(datetime(2026, 10, 21, 17, 59), tue, B)   # inside grace
+    # A naive last_success is UTC too (no TypeError comparing naive and aware).
+    assert not is_overdue(utc(2026, 10, 21, 18, 30), datetime(2026, 10, 21, 15, 1), B)
+
+
 class Resp:
     def __init__(self, body):
         self.body = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -196,7 +207,9 @@ def test_watchdog_workflow_structure():
     on = wf.get("on", wf.get(True))
     assert on["schedule"] == [{"cron": "17 */6 * * *"}] and "workflow_dispatch" in on
     assert wf["permissions"] == {"contents": "write", "actions": "read"}
-    assert wf["concurrency"] == {"group": "meca-bookings", "cancel-in-progress": False}
+    # Its own group: in the shared one a queued watchdog run would replace a pending
+    # bookings/approve run (GitHub keeps only one pending run per group).
+    assert wf["concurrency"] == {"group": "meca-watchdog", "cancel-in-progress": False}
     job = wf["jobs"]["watch"]
     assert job["timeout-minutes"] == 5
     steps = job["steps"]
