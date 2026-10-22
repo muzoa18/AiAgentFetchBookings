@@ -2012,3 +2012,75 @@ def test_existing_sent_order_helper():
     with pytest.raises(PartsPortalError):
         parts_order._existing_sent_order(
             FakePortal(sent_error=PartsPortalError("x", "login")), BOOKING, now)
+
+
+# ── Duplicate guard fail-closed: a non-empty list that cannot be matched blocks ──
+
+UNCHECKED_TEXT = ("Bokning OLRD-0001: jag kunde inte kontrollera om en order för fordonet redan "
+                  "finns i pro.meca.se. Jag har inte förberett någon order – kontrollera "
+                  "Skickade Beställningar för hand. Jag försöker igen vid nästa körning.")
+
+
+def _assert_unchecked_block(tg, portal):
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked"
+    assert rec["plan"]["reason"] == parts_order.UNCHECKED_REASON == "kan inte kontrollera tidigare order"
+    assert not rec["plan"]["reason"].startswith(orders_state.NO_RESTAGE_REASONS)
+    assert rec.get("cart_touched") is False
+    assert portal.calls == [] and portal.added == [] and portal.sent_calls == 1
+    assert tg["buttons"] == []
+    assert tg["sent"] == [UNCHECKED_TEXT]
+    assert orders_state.restage("B1") is True             # re-stageable, like a transient block
+
+
+def test_rows_without_registration_column_and_no_vehicle_model_block(tg):
+    booking = {**BOOKING, "vehicle": ""}
+    portal = FakePortal(sent_rows=[_sent_row(reg_nr=None)])
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "blocked"
+
+    _assert_unchecked_block(tg, portal)
+
+
+def test_empty_sent_list_without_vehicle_model_proceeds(tg):
+    booking = {**BOOKING, "vehicle": None}
+    portal = FakePortal(sent_rows=[])
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "pending"
+    assert portal.sent_calls == 1
+
+
+@pytest.mark.parametrize("dates", [["21.10.2026"], ["", None, "2026-13-40"]])
+def test_rows_whose_dates_all_cannot_be_read_block(tg, dates):
+    rows = [{**_sent_row(reg_nr="OTH999"), "date": d} for d in dates]
+    portal = FakePortal(sent_rows=rows)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_unchecked_block(tg, portal)
+
+
+def test_one_readable_date_is_enough_to_check(tg):
+    rows = [{**_sent_row(reg_nr="OTH999"), "date": "21.10.2026"}, _sent_row(reg_nr="OTH999")]
+    portal = FakePortal(sent_rows=rows)
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+
+
+def test_unchecked_retry_blocking_the_same_way_is_quiet(tg):
+    booking = {**BOOKING, "vehicle": ""}
+    rows = [_sent_row(reg_nr=None)]
+    assert parts_order.plan_and_stage(CONFIG, booking, FakePortal(sent_rows=rows), APPROVE,
+                                      confident) == "blocked"
+    assert orders_state.restage("B1") is True
+    assert parts_order.plan_and_stage(CONFIG, booking, FakePortal(sent_rows=rows), APPROVE,
+                                      confident) == "blocked"
+    assert tg["sent"] == [UNCHECKED_TEXT]                 # no second message
+
+
+def test_existing_sent_order_raises_when_it_cannot_check():
+    now = datetime.now(timezone.utc)
+    with pytest.raises(parts_order.SentOrdersUnchecked):
+        parts_order._existing_sent_order(FakePortal(sent_rows=[_sent_row(reg_nr=None)]),
+                                         {**BOOKING, "vehicle": ""}, now)
+    with pytest.raises(parts_order.SentOrdersUnchecked):
+        parts_order._existing_sent_order(FakePortal(sent_rows=[{**_sent_row(), "date": "x"}]),
+                                         BOOKING, now)

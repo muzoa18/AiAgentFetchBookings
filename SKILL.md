@@ -121,6 +121,10 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   `orders_state.NO_RESTAGE_REASONS`, so `restage()` never retries it.
 - Fail closed: a transient error reading the list (timeout, login, …) is the usual transient
   block (quiet retry); a parse error fails the booking. Never read as "no duplicate".
+  A NON-empty list that cannot be matched (no registration column and no vehicle model, or no
+  row date readable) blocks with "kan inte kontrollera tidigare order" (cart untouched, owner
+  asked to check Skickade Beställningar by hand; re-staged like a transient problem). Only an
+  empty list lets staging proceed without a match.
 
 ## Order checker (approve.py, after the taps)
 - A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the

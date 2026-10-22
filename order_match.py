@@ -102,6 +102,11 @@ def _row_date(row: dict) -> date | None:
         return None
 
 
+def row_date(row: dict) -> date | None:
+    """A row's "Datum" as a date; None when it is missing or not YYYY-MM-DD."""
+    return _row_date(row)
+
+
 def numbers_text(row: dict) -> str:
     """What is stored as verified_numbers: "<supplier no> · <portal order numbers>", cut at a
     number boundary to NUMBERS_MAX characters. claim_tokens() reads the same text back, so

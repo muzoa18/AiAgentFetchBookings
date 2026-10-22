@@ -27,7 +27,9 @@ only holds what approval needs (orders.json is committed to git).
 Before the first portal step, pro.meca.se "Skickade Beställningar" is read once per
 staging attempt: a sent order for the same vehicle dated within DUPLICATE_WINDOW_DAYS and
 not claimed by another record blocks staging (never re-staged; the owner orders by hand).
-A portal error while checking is never read as "no duplicate".
+A portal error while checking is never read as "no duplicate", and neither is a
+non-empty list that cannot be matched (nothing to match by, or no readable dates): that
+blocks with UNCHECKED_REASON, re-staged like a transient problem.
 
 A 'blocked' order whose cart was never touched is re-staged by agent.py through
 orders_state.restage(). Such a quiet retry sends no message when it blocks again for
@@ -41,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 import notifier
 import orders_state
 from logsafe import describe
-from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text
+from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text, row_date
 from parts_matcher import choose, is_fluid, search_terms
 from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
@@ -80,6 +82,20 @@ DUPLICATE_REASON = "order finns redan i pro.meca.se ({numbers})"
 DUPLICATE_TEXT = ("Bokning {label}: en skickad order för fordonet finns redan i pro.meca.se "
                   "({numbers}). Jag har inte förberett någon ny order. "
                   "Beställ för hand om delarna ändå behövs.")
+
+# The sent-orders list is not empty but cannot be checked: nothing to match it by (no
+# registration column and no vehicle model) or no row date can be read. Not in
+# orders_state.NO_RESTAGE_REASONS: retried quietly like a transient problem.
+UNCHECKED_REASON = "kan inte kontrollera tidigare order"
+UNCHECKED_TEXT = ("Bokning {label}: jag kunde inte kontrollera om en order för fordonet redan "
+                  "finns i pro.meca.se. Jag har inte förberett någon order – kontrollera "
+                  "Skickade Beställningar för hand. Jag försöker igen vid nästa körning.")
+
+
+class SentOrdersUnchecked(Exception):
+    """The sent-orders list has rows but cannot be matched to the booking (never "no
+    duplicate"). Caught in _stage; never leaves this module."""
+
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -318,17 +334,21 @@ def _existing_sent_order(portal, booking: dict, now: datetime) -> dict | None:
     same vehicle (plate when the table has the registration column, else brand + model
     words; order_match.candidates), dated on or after DUPLICATE_WINDOW_DAYS before `now`
     (a naive `now` is UTC; the UTC date is never later than the Swedish one, so the window
-    is never shorter), and not claimed by another record. None = no such row.
-    PartsPortalError from list_sent_orders() is raised through (never "no duplicate")."""
+    is never shorter), and not claimed by another record. None = no such row (or the list
+    is empty). PartsPortalError from list_sent_orders() is raised through; a non-empty list
+    with nothing to match by, or without one readable date, raises SentOrdersUnchecked."""
     rows = portal.list_sent_orders()
+    if not rows:
+        return None
+    if all(row_date(row) is None for row in rows):
+        raise SentOrdersUnchecked("no readable date in the sent-orders list")
     when = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
     since = when.astimezone(timezone.utc).date() - timedelta(days=DUPLICATE_WINDOW_DAYS)
     found = candidates(rows, clean_vehicle_model(booking.get("vehicle")), since,
                        _claimed_by_others(booking.get("id")),
                        reg_nr=str(booking.get("reg_nr") or "").strip())
     if found is None:  # nothing to match by (no plate column and no model)
-        log.warning("Duplicate check for %s: nothing to match sent orders by.", booking.get("id"))
-        return None
+        raise SentOrdersUnchecked("nothing to match the sent orders by")
     return found[0] if found else None
 
 
@@ -368,7 +388,11 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     # Duplicate-order guard: once per staging attempt (restaged ones too: the order may
     # have been placed by hand meanwhile), before any portal step that touches a cart.
     if portal is not None:
-        row = _existing_sent_order(portal, booking, datetime.now(timezone.utc))
+        try:
+            row = _existing_sent_order(portal, booking, datetime.now(timezone.utc))
+        except SentOrdersUnchecked as e:
+            log.warning("Duplicate check for %s not possible (%s) — not staging.", booking_id, e)
+            return block(UNCHECKED_REASON, text=UNCHECKED_TEXT.format(label=label))
         if row is not None:
             numbers = numbers_text(row)
             log.warning("A recent sent order exists for %s — not staging.", booking_id)
