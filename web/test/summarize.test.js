@@ -32,12 +32,10 @@ test('every status lands in the right tile', () => {
     }),
     historyText: '', seenText: '', commit, now: NOW,
   });
-  assert.deepEqual(vm.tiles, {
-    pending: 2, orderedVerified: 1, orderedUnverified: 4, needsAction: 3, waitingKlar: 1,
-  });
+  assert.equal(vm.tiles, undefined, 'one number per concept: vm.counts only');
   assert.equal(vm.orders.length, 12);
   assert.deepEqual(vm.counts, {
-    attempted: 1, pending: 2, ordered: 5, blocked: 1, failed: 1, cancelled: 1, expired: 1,
+    attempted: 1, pending: 2, ordered: 4, blocked: 1, failed: 1, cancelled: 1, expired: 1,
     waiting: 2, klar: 1, needsAction: 3,
   });
 });
@@ -156,7 +154,7 @@ test('unknown fields are ignored and never leak into the view model', () => {
 test('an unknown status is shown as unknown and counted nowhere', () => {
   const vm = summarize({ ordersText: orders({ a: rec('weird') }), commit, now: NOW });
   assert.equal(vm.orders[0].status, 'unknown');
-  assert.equal(Object.values(vm.tiles).reduce((a, b) => a + b, 0), 0);
+  assert.equal(Object.values(vm.counts).reduce((a, b) => a + b, 0), 0);
 });
 
 test('huge history is truncated to the newest runs', () => {
@@ -383,7 +381,7 @@ test('counts follow the daily Telegram summary rules', () => {
   });
   assert.equal(vm.counts.waiting, 2);
   assert.equal(vm.counts.klar, 2, 'o2 and b1');
-  assert.equal(vm.counts.ordered, 5, 'status ordered, Klar or not');
+  assert.equal(vm.counts.ordered, 4, 'status ordered and not counted under Klar (o1, o3, o4, o5)');
   assert.equal(vm.counts.needsAction, 3, 'b2, f1, x2');
   const by = Object.fromEntries(vm.orders.map((o) => [o.bookingId, o]));
   assert.equal(by.o2.klarOpen, true);

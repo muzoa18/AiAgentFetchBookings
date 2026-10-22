@@ -59,7 +59,6 @@ function render(vm) {
   $('alerts').replaceChildren(...(banner ? [banner] : []));
   $('headline').textContent = R.headline(vm);
   replace('tiles', R.tiles(document, vm));
-  replace('counts', R.countsRow(document, vm));
   lastVm = vm;
   renderOrders();
   replace('lastrun', R.lastRun(document, vm, now));
@@ -163,6 +162,9 @@ async function onLogout() {
   try {
     await api('/api/logout', { body: {} });
   } finally {
+    lastVm = null;
+    $('order-search').value = '';
+    $('order-status-filter').value = '';
     show('login');
     $('password').focus();
   }

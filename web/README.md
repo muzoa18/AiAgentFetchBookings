@@ -6,12 +6,15 @@ failed orders and why, bookings waiting for Klar, and the recent run history.
 It also has two buttons that start the `approve.yml` and `bookings.yml`
 workflows immediately instead of waiting for the schedule.
 
-At the top it shows the same four counts as the daily Telegram summary:
-waiting for approval (status `pending`), waiting for Klar (ordered or blocked
-with an open Klar button: not handled, not closed, sent within 14 days; each
-booking once), ordered (status `ordered`, Klar or not) and needs action
-(blocked, failed or expired, updated within 7 days or of unknown age, and not
-already counted under Klar). Above the orders list, a search box and a status
+At the top, four tiles show the same counts as the daily Telegram summary, one
+number per concept (the headline uses the same numbers). Each booking is in at
+most one tile: "Väntar på godkännande" (status `pending`), "Väntar på Klar"
+(ordered or blocked with an open Klar button: not handled, not closed, sent
+within 14 days), "Beställda" (status `ordered` and not counted under Klar, so
+it does not overlap the Klar tile; it includes unverified orders) and "Behöver
+åtgärd" (blocked, failed or expired, updated within 7 days or of unknown age,
+and not under Klar). The view model's `counts.ordered` is this non-overlapping
+number, not the plain per-status total. Above the orders list, a search box and a status
 filter narrow the loaded orders (up to 200) in the browser: a case-insensitive
 substring over booking id and number, plate, status, the portal's order status
 (`portal_status`) and order numbers (`verified_numbers`). Typing never

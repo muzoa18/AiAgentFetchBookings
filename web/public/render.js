@@ -111,23 +111,23 @@ export function badge(doc, status) {
 }
 
 export function headline(vm) {
-  const t = vm.tiles;
-  if (t.needsAction > 0) return `${plural(t.needsAction, ['bokning behöver', 'bokningar behöver'])} din åtgärd`;
-  if (t.pending > 0) return `${plural(t.pending, ['beställning väntar', 'beställningar väntar'])} på ditt godkännande i Telegram`;
-  if (t.waitingKlar > 0) return `${plural(t.waitingKlar, ['bokning väntar', 'bokningar väntar'])} på Klar i Telegram`;
+  const c = vm.counts ?? {};
+  if (c.needsAction > 0) return `${plural(c.needsAction, ['bokning behöver', 'bokningar behöver'])} din åtgärd`;
+  if (c.waiting > 0) return `${plural(c.waiting, ['beställning väntar', 'beställningar väntar'])} på ditt godkännande i Telegram`;
+  if (c.klar > 0) return `${plural(c.klar, ['bokning väntar', 'bokningar väntar'])} på Klar i Telegram`;
   return 'Inget väntar på dig just nu';
 }
 
+// One number per concept, the same four counts as the daily Telegram summary (vm.counts).
 export function tiles(doc, vm) {
   const items = [
-    ['pending', 'Väntar på godkännande', 'wait', 'Godkänn eller avbryt i Telegram.'],
-    ['orderedVerified', 'Beställda', 'ok', 'Finns i Skickade beställningar.'],
-    ['orderedUnverified', 'Beställda – väntar på verifiering', 'info', 'Agenten kontrollerar orderlistan.'],
-    ['needsAction', 'Behöver åtgärd', 'alert', 'Stoppade, misslyckade eller utgångna.'],
-    ['waitingKlar', 'Väntar på Klar', 'neutral', 'Tryck Klar i Telegram när bilen är klar.'],
+    ['waiting', 'Väntar på godkännande', 'wait', 'Godkänn eller avbryt i Telegram.'],
+    ['klar', 'Väntar på Klar', 'neutral', 'Tryck Klar i Telegram när bilen är klar.'],
+    ['ordered', 'Beställda', 'ok', 'Beställda, utan Klar-knapp ute.'],
+    ['needsAction', 'Behöver åtgärd', 'alert', 'Stoppade, misslyckade eller utgångna senaste 7 dagarna.'],
   ];
   return h(doc, 'ul', { class: 'tiles', role: 'list' }, items.map(([key, label, tone, hint]) => {
-    const n = Number(vm.tiles[key]) || 0;
+    const n = Number(vm.counts?.[key]) || 0;
     return h(doc, 'li', { class: `tile tone-${tone}${n === 0 ? ' is-zero' : ''}` },
       h(doc, 'span', { class: 'tile-n' }, String(n)),
       h(doc, 'span', { class: 'tile-label' }, label),
@@ -135,30 +135,10 @@ export function tiles(doc, vm) {
   }));
 }
 
-/** The daily summary's four numbers, from vm.counts. */
-export function countsRow(doc, vm) {
-  const c = vm.counts ?? {};
-  const items = [
-    ['waiting', 'Väntar på godkännande', 'wait'],
-    ['klar', 'Väntar på Klar', 'neutral'],
-    ['ordered', 'Beställda', 'ok'],
-    ['needsAction', 'Kräver åtgärd', 'alert'],
-  ];
-  return h(doc, 'ul', { class: 'counts', role: 'list', 'aria-label': 'Antal bokningar' }, items.map(([key, label, tone]) => {
-    const n = Number.isFinite(c[key]) ? c[key] : 0;
-    return h(doc, 'li', { class: `count tone-${tone}${n === 0 ? ' is-zero' : ''}` },
-      h(doc, 'span', { class: 'count-n' }, String(n)),
-      h(doc, 'span', { class: 'count-label' }, label));
-  }));
-}
-
 function haystack(o) {
   const label = (STATUS[o.status] ?? STATUS.unknown).label;
-  const parts = [o.bookingId, o.bookingNr, o.regNr, o.status, label, o.portalStatus, o.verifiedNumbers]
-    .filter((v) => typeof v === 'string' && v);
-  // A plate typed with a space ("ABC 123") also matches "ABC123".
-  const joined = parts.join('\n').toLowerCase();
-  return `${joined}\n${joined.replace(/\s+/g, '')}`;
+  return [o.bookingId, o.bookingNr, o.regNr, o.status, label, o.portalStatus, o.verifiedNumbers]
+    .filter((v) => typeof v === 'string' && v).join('\n').toLowerCase();
 }
 
 /**
@@ -173,8 +153,9 @@ export function filterOrders(list, { query = '', status = '' } = {}) {
   return list.filter((o) => {
     if (status && o.status !== status) return false;
     if (!q) return true;
-    const text = haystack(o);
-    return text.includes(q) || (compact !== '' && text.includes(compact));
+    if (haystack(o).includes(q)) return true;
+    // A plate typed with a space ("ABC 123") also matches "ABC123": the plate only.
+    return compact !== '' && typeof o.regNr === 'string' && o.regNr.toLowerCase().replace(/\s+/g, '').includes(compact);
   });
 }
 

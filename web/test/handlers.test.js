@@ -148,7 +148,7 @@ test('status returns only the view model, XSS payload as plain data', async () =
   await h.status(authed({ method: 'GET' }), r);
   assert.equal(r.statusCode, 200);
   const vm = r.json;
-  assert.equal(vm.tiles.pending, 1);
+  assert.equal(vm.counts.waiting, 1);
   assert.equal(vm.freshness.sha, 'abcdef1');
   assert.equal(vm.orders[0].lines[0].title, '<img src=x onerror=alert(1)>');
   assert.equal(vm.bookings, undefined, 'no raw orders.json');

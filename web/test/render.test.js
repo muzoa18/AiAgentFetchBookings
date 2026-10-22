@@ -105,9 +105,9 @@ test('verified orders show their order numbers; stale data shows a warning', () 
 });
 
 test('headline reflects what needs attention', () => {
-  assert.equal(R.headline({ tiles: { needsAction: 1, pending: 2, waitingKlar: 0 } }), '1 bokning behöver din åtgärd');
-  assert.equal(R.headline({ tiles: { needsAction: 0, pending: 2, waitingKlar: 0 } }), '2 beställningar väntar på ditt godkännande i Telegram');
-  assert.equal(R.headline({ tiles: { needsAction: 0, pending: 0, waitingKlar: 0 } }), 'Inget väntar på dig just nu');
+  assert.equal(R.headline({ counts: { needsAction: 1, waiting: 2, klar: 0 } }), '1 bokning behöver din åtgärd');
+  assert.equal(R.headline({ counts: { needsAction: 0, waiting: 2, klar: 0 } }), '2 beställningar väntar på ditt godkännande i Telegram');
+  assert.equal(R.headline({ counts: { needsAction: 0, waiting: 0, klar: 0 } }), 'Inget väntar på dig just nu');
 });
 
 test('relative times are Swedish', () => {
@@ -220,21 +220,36 @@ test('orders list shows "Inga träffar" when the filter matches nothing, and por
   assert.ok(all(some).every((e) => e.tagName !== 'img'));
 });
 
-test('counts row renders the four counts', () => {
+test('tiles show the vm.counts numbers, four tiles, no separate counts row', () => {
   const vm = { counts: { waiting: 2, klar: 1, ordered: 5, needsAction: 0 } };
-  const el = R.countsRow(doc, vm);
-  assert.match(el.textContent, /2/);
-  assert.equal(all(el).filter((e) => e.tagName === 'li').length, 4);
-  assert.equal(R.countsRow(doc, {}).textContent.includes('NaN'), false);
+  const el = R.tiles(doc, vm);
+  const lis = all(el).filter((e) => e.tagName === 'li');
+  assert.deepEqual(lis.map((l) => l.children[0].textContent), ['2', '1', '5', '0']);
+  assert.match(lis[0].textContent, /Väntar på godkännande/);
+  assert.match(lis[1].textContent, /Väntar på Klar/);
+  assert.match(lis[2].textContent, /Beställda/);
+  assert.match(lis[3].textContent, /Behöver åtgärd/);
+  assert.equal(R.tiles(doc, {}).textContent.includes('NaN'), false);
+  assert.equal(R.countsRow, undefined);
+});
+
+test('filterOrders: whitespace-insensitive match applies to the plate only', () => {
+  const list = [{ bookingId: 'B-1', regNr: 'QLM48K', status: 'pending' }];
+  assert.equal(R.filterOrders(list, { query: 'QLM 48K' }).length, 1);
+  assert.equal(R.filterOrders(list, { query: 'b-1qlm' }).length, 0, 'no match across id and plate');
+  assert.equal(R.filterOrders(list, { query: 'b-1 qlm' }).length, 0);
 });
 
 test('search UI: inputs exist, no re-fetch on typing, only DOM APIs', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   assert.match(html, /id="order-search"/);
   assert.match(html, /id="order-status-filter"/);
-  assert.match(html, /id="counts"/);
+  assert.ok(!/id="counts"/.test(html));
   const app = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
   const handler = app.match(/function onFilter[\s\S]*?\n}\n/)?.[0] ?? '';
   assert.ok(handler && !/load\(|api\(|fetch\(/.test(handler), 'filtering does not fetch');
   assert.match(app, /addEventListener\('input'/);
+  const logout = app.match(/async function onLogout[\s\S]*?\n}\n/)?.[0] ?? '';
+  assert.match(logout, /lastVm = null/);
+  assert.match(logout, /order-search/);
 });

@@ -99,12 +99,7 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-siz
   .brand-mark { width: 18px; height: 18px; }
 }
 
-/* ---------- Counts and order filter ---------- */
-.counts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 12px 0 0; padding: 0; list-style: none; }
-.count { display: inline-flex; align-items: baseline; gap: 6px; color: var(--tone-strong, var(--ink)); }
-.count-n { font-size: 1.25rem; font-weight: 750; }
-.count-label { color: var(--muted); font-size: 0.875rem; }
-.count.is-zero .count-n { color: var(--muted); }
+/* ---------- Order filter ---------- */
 .order-filter { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-bottom: 14px; }
 .field { display: grid; gap: 4px; }
 .field label { font-weight: 600; font-size: 0.875rem; }
@@ -193,7 +188,6 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-siz
   border-radius: var(--radius-lg); overflow: hidden;
 }
 .tile { background: var(--surface); padding: 14px 16px 16px; display: grid; gap: 2px; align-content: start; position: relative; }
-.tile:last-child { grid-column: 1 / -1; }
 .tile::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--tone); }
 .tile.is-zero::before { background: transparent; }
 .tile-n { font-size: 2rem; font-weight: 750; line-height: 1.1; color: var(--tone-strong, var(--ink)); }
@@ -341,8 +335,7 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-siz
 /* ---------- Wider screens ---------- */
 @media (min-width: 720px) {
   :root { --gutter: 24px; }
-  .tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-  .tile:last-child { grid-column: auto; }
+  .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .tile { padding: 16px 18px 18px; }
   .tile-n { font-size: 2.25rem; }
   .order-top { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "plate id total"; }

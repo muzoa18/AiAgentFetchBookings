@@ -266,23 +266,18 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
   const problems = [];
 
   const all = parseOrders(ordersText, problems).map(([id, r]) => [order(id, r, now), r]);
-  const tiles = { pending: 0, orderedVerified: 0, orderedUnverified: 0, needsAction: 0, waitingKlar: 0 };
   // Per-status counts plus the daily summary's four numbers: waiting (pending), klar
-  // (ordered/blocked with an open Klar button; each booking once, so a blocked one with an
-  // open Klar is not also needsAction), ordered (status ordered, Klar or not) and needsAction
-  // (blocked/failed/expired, updated within 7 days or of unknown age).
+  // (ordered/blocked with an open Klar button), ordered (status ordered and not under Klar)
+  // and needsAction (blocked/failed/expired, updated within 7 days or of unknown age).
+  // Each booking is in at most one of the four (the summary's elif chain), so they add up.
+  // `ordered` is therefore not the plain per-status count of ordered records.
   const counts = Object.fromEntries([...STATUSES, 'waiting', 'klar', 'needsAction'].map((s) => [s, 0]));
   for (const [o] of all) {
     if (o.status === 'pending') counts.waiting += 1;
     if ((o.status === 'ordered' || o.status === 'blocked') && o.klarOpen) counts.klar += 1;
     else if (NEEDS_ACTION.has(o.status)
       && (o.updatedAt == null || now - Date.parse(o.updatedAt) <= ACTION_WINDOW_MS)) counts.needsAction += 1;
-    if (STATUSES.includes(o.status)) counts[o.status] += 1;
-    if (o.status === 'pending') tiles.pending += 1;
-    if (o.verification.state === 'verified') tiles.orderedVerified += 1;
-    if (o.verification.state === 'unverified') tiles.orderedUnverified += 1;
-    if (NEEDS_ACTION.has(o.status)) tiles.needsAction += 1;
-    if (o.waitingKlar) tiles.waitingKlar += 1;
+    if (STATUSES.includes(o.status) && !(o.status === 'ordered' && o.klarOpen)) counts[o.status] += 1;
   }
   const orders = all.map(([o]) => o)
     .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '') || String(a.bookingId).localeCompare(String(b.bookingId)))
@@ -315,7 +310,6 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
       stale: ageHours == null || ageHours > STALE_HOURS,
       staleHours: STALE_HOURS,
     },
-    tiles,
     counts,
     orders,
     totalOrders: all.length,
