@@ -130,3 +130,25 @@ def test_answer_callback_and_clear_buttons(calls):
     assert calls[1]["url"].endswith("/editMessageReplyMarkup")
     assert calls[1]["body"]["message_id"] == 55
     assert calls[1]["body"]["reply_markup"] == {"inline_keyboard": []}
+
+
+def test_send_with_buttons_accepts_rows(calls):
+    mid = notifier.send_with_buttons(CONFIG, "Order?", [[("Yes", "y:1"), ("No", "n:1")],
+                                                        [("Swap", "s:1:0")]])
+    assert mid == 7
+    keyboard = calls[0]["body"]["reply_markup"]["inline_keyboard"]
+    assert keyboard == [[{"text": "Yes", "callback_data": "y:1"},
+                         {"text": "No", "callback_data": "n:1"}],
+                        [{"text": "Swap", "callback_data": "s:1:0"}]]
+
+
+def test_send_with_buttons_single_row_is_unchanged(calls):
+    notifier.send_with_buttons(CONFIG, "Order?", [("Yes", "y:1")])
+    assert calls[0]["body"]["reply_markup"] == {
+        "inline_keyboard": [[{"text": "Yes", "callback_data": "y:1"}]]}
+
+
+def test_send_with_buttons_rejects_mixed_shapes(calls):
+    with pytest.raises(ValueError):
+        notifier.send_with_buttons(CONFIG, "x", [("Yes", "y:1"), [("No", "n:1")]])
+    assert calls == []

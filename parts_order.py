@@ -44,11 +44,11 @@ import notifier
 import orders_state
 from logsafe import describe
 from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text, row_date
-from parts_matcher import choose, is_fluid, search_terms
+from parts_matcher import choose_with_alternatives, is_fluid, search_terms
 from parts_portal_parse import PartsPortalError
-from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
-                                 is_transient, order_body, owner_reason, parse_qty,
-                                 prepare_section, reference_line, total_problem)
+from parts_order_helpers import (alternative_entry, build_summary, cart_problem, clean_fluids,
+                                 error_code, is_transient, order_body, owner_reason, parse_qty,
+                                 prepare_section, reference_line, replaced_entry, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -74,6 +74,13 @@ STAGE_BUDGET_S = 480
 _clock = time.monotonic
 # After these the session cannot add anything more: the remaining parts are not tried.
 STOP_CODES = ("vehicle_lost", "login")
+
+# Swap buttons ("Byt <part>", callback swap:<booking_id>:<line index>): Telegram allows at
+# most 64 bytes of callback data; a button that would not fit is left out (the alternative
+# text stays). No swap buttons once a booking has been swapped MAX_SWAPS times.
+CALLBACK_DATA_LIMIT = 64
+MAX_SWAPS = 2
+SWAP_LABEL_CHARS = 20
 
 # Duplicate-order guard: a sent order for the vehicle this recent blocks staging. The
 # reason starts with orders_state.NO_RESTAGE_REASONS, so it is never retried quietly.
@@ -406,19 +413,20 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
             "Varukorgen på pro.meca.se är inte tom (annan väntande beställning?). "
             f"Hantera {label} för hand."))
 
-    matched = []
+    matched, choices = [], []
     for line, name, qty in wanted:  # match everything before adding anything
-        candidate = None
+        choice = None
         for term in search_terms(name):  # synonyms first, then the normalised term, the original last
             if out_of_time():  # nothing is in the cart yet: retried quietly (transient)
                 raise PartsPortalError(f"staging {booking_id} took longer than "
                                        f"{STAGE_BUDGET_S} s", "search_timeout")
-            candidate = choose(line, portal.search(term), rules, picker)
-            if candidate is not None:
+            choice = choose_with_alternatives(line, portal.search(term), rules, picker)
+            if choice.chosen is not None:
                 break
-        if candidate is None:
+        if choice is None or choice.chosen is None:
             return block(f"ingen säker träff för '{name}'")
-        matched.append((name, candidate, qty))
+        matched.append((name, choice.chosen, qty))
+        choices.append(choice)
     if matched:
         # Persisted before the first add: a later block or failure must not be retried.
         orders_state.update_fields(booking_id, cart_touched=True)
@@ -459,10 +467,18 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if problem:
         return block(problem, cart_touched=True)
 
-    parts = [{"name": name, "title": c.get("title"), "brand": c.get("brand"),
-              "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id"),
-              "in_stock": c.get("in_stock")}
-             for name, c, qty in matched]
+    parts = []
+    for (name, c, qty), choice in zip(matched, choices):
+        part = {"name": name, "title": c.get("title"), "brand": c.get("brand"),
+                "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id"),
+                "in_stock": c.get("in_stock")}
+        if choice.replaced is not None:  # the owner is told about an in-stock replacement
+            part["replaced_from"] = replaced_entry(choice.replaced)
+        # The matcher returns at most one alternative, whatever max_alternatives (1-3) says.
+        # Never added to the cart here: only a swap (owner's tap) can restage with it.
+        if choice.alternatives:
+            part["alternative"] = alternative_entry(choice.alternatives[0])
+        parts.append(part)
     plan = {
         "booking_id": booking_id,
         "booking_nr": booking.get("booking_nr"),
@@ -480,14 +496,39 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if rules.mode != "approve":
         raise ValueError(f"unknown rules mode {rules.mode!r}")
 
+    buttons = [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")]
+    swap_rows = _swap_buttons(booking_id, parts, record.get("swaps"))
     message_id = notifier.send_with_buttons(
         config, build_summary(booking, cart, fluids, parts) + "\n\nGodkänn för att beställa.",
-        [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")])
+        [buttons] + swap_rows if swap_rows else buttons)
     if message_id is None:
         return _fail(config, booking_id, label,
                      "godkännandemeddelandet kunde inte skickas (varukorgen är fylld)")
     orders_state.put(booking_id, "pending", message_id=message_id)
     return "pending"
+
+
+def _swap_buttons(booking_id: str, parts: list[dict], swaps) -> list[list[tuple]]:
+    """One row ("Byt <name>", "swap:<booking_id>:<index>") per part with an alternative.
+    No rows when the record has MAX_SWAPS or more swaps, or a count that is not an int (an
+    absent/None count is 0); a button whose callback data would exceed
+    CALLBACK_DATA_LIMIT bytes is left out."""
+    if swaps is None:
+        swaps = 0
+    if isinstance(swaps, bool) or not isinstance(swaps, int) or swaps >= MAX_SWAPS:
+        return []
+    rows = []
+    for i, part in enumerate(parts):
+        if not isinstance(part.get("alternative"), dict):
+            continue
+        data = f"swap:{booking_id}:{i}"
+        if len(data.encode("utf-8")) > CALLBACK_DATA_LIMIT:
+            log.warning("Swap button for %s line %d left out: callback data too long.",
+                        booking_id, i)
+            continue
+        name = str(part.get("name") or part.get("title") or "").strip()
+        rows.append([(f"Byt {name[:SWAP_LABEL_CHARS]}", data)])
+    return rows
 
 
 def _partial_text(label: str, added: list, not_added: list, partly: list, untried: list,

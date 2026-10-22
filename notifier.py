@@ -85,12 +85,21 @@ def send_message(config: dict, text: str) -> bool:
 
 
 def send_with_buttons(config: dict, text: str, buttons: list):
-    """Send text with one row of inline buttons [(label, callback_data)]. Returns message_id or None."""
-    row = [{"text": label, "callback_data": data} for label, data in buttons]
+    """Send text with inline buttons. Returns message_id or None.
+
+    `buttons` is one row [(label, callback_data), ...] or rows [[(label, data), ...], ...]
+    (told apart by the element type; a mix raises ValueError)."""
+    if any(isinstance(b, list) for b in buttons):
+        if not all(isinstance(b, list) for b in buttons):
+            raise ValueError("buttons must be one row of (label, data) or a list of rows")
+        rows = buttons
+    else:
+        rows = [buttons]
+    keyboard = [[{"text": label, "callback_data": data} for label, data in row] for row in rows]
     result = _call(config, "sendMessage", {
         "chat_id": _chat_id(config),
         "text": text,
-        "reply_markup": {"inline_keyboard": [row]},
+        "reply_markup": {"inline_keyboard": keyboard},
     })
     if isinstance(result, dict):
         return result.get("message_id")

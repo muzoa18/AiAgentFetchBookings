@@ -146,7 +146,9 @@ def tg(monkeypatch):
         return rec["send_ok"]
 
     def fake_buttons(config, text, buttons):
-        if buttons and all(data.startswith("klar:") for _, data in buttons):
+        flat = ([b for row in buttons for b in row]
+                if buttons and isinstance(buttons[0], list) else buttons)
+        if flat and all(data.startswith("klar:") for _, data in flat):
             if not (rec["send_ok"] and rec["klar_ok"]):
                 return None
             mid = rec["next_klar"]
@@ -2084,3 +2086,295 @@ def test_existing_sent_order_raises_when_it_cannot_check():
     with pytest.raises(parts_order.SentOrdersUnchecked):
         parts_order._existing_sent_order(FakePortal(sent_rows=[{**_sent_row(), "date": "x"}]),
                                          BOOKING, now)
+
+
+# ── Package 2 task 3: alternatives at staging, swap buttons ──────────────────
+
+OOS = {"title": "Bosch Oljefilter P7001", "brand": "Bosch", "price_sek": 120.0,
+       "url_or_id": "p1", "in_stock": False, "search_term": "Oljefilter",
+       "page_text": "SECRET-PAGE-TEXT"}
+MANN = {"title": "Mann Oljefilter W712", "brand": "Mann", "price_sek": 200.0,
+        "url_or_id": "p3", "in_stock": True, "article_nr": "W712", "search_term": "Oljefilter",
+        "page_text": "SECRET-PAGE-TEXT"}
+DEAR = {"title": "Bosch Oljefilter P9000", "brand": "Bosch", "price_sek": 500.0,
+        "url_or_id": "p4", "in_stock": True, "search_term": "Oljefilter"}
+LUFT = CATALOGUE["Luftfilter"]
+NO_SWITCH = Rules(("Bosch",), ("ProMeister",), 10000, "approve", prefer_in_stock=False)
+APPROVE_BUTTONS = [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+MANN_ALT = {"title": "Mann Oljefilter W712", "brand": "Mann", "price_sek": 200.0,
+            "url_or_id": "p3", "in_stock": True, "article_nr": "W712",
+            "search_term": "Oljefilter"}
+
+
+def by_sku(*skus):
+    """A confident picker that takes the first of `skus` present in the list it is shown."""
+    def picker(line, ranked):
+        ids = [c.get("url_or_id") for c in ranked]
+        for sku in skus:
+            if sku in ids:
+                return ids.index(sku), 0.95
+        return 0, 0.1
+    return picker
+
+
+def _added(portal):
+    return [c.get("url_or_id") for c, _ in portal.added]
+
+
+def test_out_of_stock_line_stores_alternative_and_sends_a_swap_row(tg, orders_file):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    plan = orders_state.get("B1")["plan"]
+    assert plan["parts"][0]["url_or_id"] == "p1"
+    assert plan["parts"][0]["alternative"] == {**MANN_ALT, "alt_reason": "slut", "saving_sek": 0}
+    assert "alternative" not in plan["parts"][1]
+    # The alternative is never in the cart at staging: only the chosen parts were added,
+    # and the cart was verified against the chosen parts.
+    assert _added(portal) == ["p1", "p2"]
+    assert [x["url_or_id"] for x in plan["expected_lines"]] == ["p1", "p2"]
+    assert "checkout" not in portal.names()
+    text, buttons = tg["buttons"][0]
+    assert buttons == [APPROVE_BUTTONS, [("Byt Oljefilter", "swap:B1:0")]]
+    assert ("Alternativ för Oljefilter: Mann Oljefilter W712 (Mann) à 200.00 SEK – i lager "
+            "(slut)") in text
+    assert text.endswith("Godkänn för att beställa.")
+    assert orders_state.get("B1")["message_id"] == 77
+    assert "SECRET-PAGE-TEXT" not in orders_file.read_text(encoding="utf-8")
+    assert "SECRET-PAGE-TEXT" not in text
+    _assert_no_pii(orders_file)
+
+
+def test_expensive_line_stores_a_cheaper_alternative_with_its_saving(tg):
+    portal = FakePortal(catalogue={"Oljefilter": [DEAR, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE,
+                                      by_sku("p4", "p3", "p2")) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert part["url_or_id"] == "p4"
+    assert part["alternative"] == {**MANN_ALT, "alt_reason": "dyr", "saving_sek": 300.0}
+    assert _added(portal) == ["p4", "p2"]
+    text, buttons = tg["buttons"][0]
+    assert ("Alternativ för Oljefilter: Mann Oljefilter W712 (Mann) à 200.00 SEK – i lager "
+            "(dyr: sparar 300.00 SEK)") in text
+    assert buttons[1] == [("Byt Oljefilter", "swap:B1:0")]
+
+
+def test_no_flagged_line_sends_exactly_todays_message_and_one_row(tg):
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, FakePortal(), APPROVE,
+                                      confident) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    assert buttons == APPROVE_BUTTONS
+    plan = orders_state.get("B1")["plan"]
+    expected = build_summary(BOOKING, _cart(490.0), BOOKING["fluids"], plan["parts"])
+    assert text == expected + "\n\nGodkänn för att beställa."
+    assert "Alternativ" not in text and "Bytt" not in text
+    assert all("alternative" not in p and "replaced_from" not in p for p in plan["parts"])
+
+
+def test_in_stock_replacement_is_shown_and_stored(tg, orders_file):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert part["url_or_id"] == "p3"
+    assert part["replaced_from"] == {"title": "Bosch Oljefilter P7001", "brand": "Bosch",
+                                     "price_sek": 120.0}
+    assert "alternative" not in part
+    assert _added(portal) == ["p3", "p2"]          # the replacement, never the original
+    text, buttons = tg["buttons"][0]
+    oil = next(line for line in text.splitlines() if line.startswith("- Oljefilter"))
+    assert oil.startswith("- Oljefilter -> Mann Oljefilter W712 (Mann) x2")
+    assert oil.endswith("Bytt från Bosch Oljefilter P7001 (slut)")
+    assert buttons == APPROVE_BUTTONS              # nothing to swap: one row as today
+    assert "checkout" not in portal.names()        # still waits for the owner
+    assert "SECRET-PAGE-TEXT" not in orders_file.read_text(encoding="utf-8")
+
+
+def test_replacement_and_alternative_are_both_shown(tg):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, DEAR, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE,
+                                      by_sku("p1", "p4", "p3", "p2")) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert part["url_or_id"] == "p4"
+    assert part["replaced_from"]["title"] == "Bosch Oljefilter P7001"
+    assert part["alternative"]["url_or_id"] == "p3"
+    assert part["alternative"]["alt_reason"] == "dyr"
+    assert _added(portal) == ["p4", "p2"]
+    text, buttons = tg["buttons"][0]
+    assert "Bytt från Bosch Oljefilter P7001 (slut)" in text
+    assert "Alternativ för Oljefilter: Mann Oljefilter W712 (Mann)" in text
+    assert buttons == [APPROVE_BUTTONS, [("Byt Oljefilter", "swap:B1:0")]]
+
+
+def test_replacement_over_the_ceiling_blocks(tg):
+    rules = Rules(("Bosch",), ("ProMeister",), 1000, "approve")
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, DEAR], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, rules,
+                                      by_sku("p1", "p4", "p2")) == "blocked"
+
+    assert "taket" in orders_state.get("B1")["plan"]["reason"]
+    assert tg["buttons"] == [] and "checkout" not in portal.names()
+
+
+def test_replacement_is_verified_against_the_cart(tg):
+    wrong = _cart(490.0, [{"title": "Bosch Oljefilter P7001", "qty": 2, "url_or_id": "p1"},
+                          {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2"}])
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT}, cart=wrong)
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE,
+                                      by_sku("p1", "p3", "p2")) == "blocked"
+
+    assert "stämmer inte" in orders_state.get("B1")["plan"]["reason"]
+    assert tg["buttons"] == [] and "checkout" not in portal.names()
+
+
+def test_forbidden_brand_is_never_a_replacement_or_alternative(tg):
+    forbidden = {"title": "ProMeister Oljefilter", "brand": "ProMeister", "price_sek": 50.0,
+                 "url_or_id": "p9", "in_stock": True}
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, forbidden], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE,
+                                      by_sku("p9", "p1", "p2")) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert part["url_or_id"] == "p1"
+    assert "alternative" not in part and "replaced_from" not in part
+    assert _added(portal) == ["p1", "p2"]
+    text, buttons = tg["buttons"][0]
+    assert "ProMeister" not in text and buttons == APPROVE_BUTTONS
+
+
+def test_swap_button_over_64_bytes_is_skipped_but_the_text_stays(tg):
+    long_id = "X" * 58                        # swap:<58>:0 is 65 bytes
+    booking = {**BOOKING, "id": long_id}
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    assert buttons == [("Godkänn", f"approve:{long_id}"), ("Avbryt", f"cancel:{long_id}")]
+    assert "Alternativ för Oljefilter: Mann Oljefilter W712" in text
+    assert orders_state.get(long_id)["plan"]["parts"][0]["alternative"]["url_or_id"] == "p3"
+
+
+def test_swap_button_data_fits_telegrams_limit():
+    buttons = parts_order._swap_buttons("B1", [{"name": "Oljefilter med ett mycket långt namn",
+                                                "alternative": {"title": "x"}},
+                                               {"name": "Luftfilter"}], swaps=0)
+    assert buttons == [[("Byt Oljefilter med ett m", "swap:B1:0")]]
+    assert all(len(d.encode()) <= 64 for row in buttons for _, d in row)
+    assert parts_order._swap_buttons("Å" * 29, [{"name": "a", "alternative": {}}], 0) == []
+    assert parts_order._swap_buttons("Å" * 28, [{"name": "a", "alternative": {}}], 0) != []
+
+
+def test_no_swap_buttons_after_two_swaps(tg, monkeypatch):
+    real_get = orders_state.get
+    monkeypatch.setattr(orders_state, "get",
+                        lambda bid: (lambda r: r if r is None else {**r, "swaps": 2})(real_get(bid)))
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    assert buttons == APPROVE_BUTTONS
+    assert "Alternativ för Oljefilter" in text
+
+
+@pytest.mark.parametrize("swaps", [0, 1])
+def test_swap_buttons_under_two_swaps(swaps):
+    parts = [{"name": "Oljefilter", "alternative": {"title": "x"}}]
+    assert parts_order._swap_buttons("B1", parts, swaps) == [[("Byt Oljefilter", "swap:B1:0")]]
+
+
+@pytest.mark.parametrize("swaps", [2, 3, True, "1", None, 1.0])
+def test_swap_buttons_need_a_valid_count_under_two(swaps):
+    parts = [{"name": "Oljefilter", "alternative": {"title": "x"}}]
+    expected = [[("Byt Oljefilter", "swap:B1:0")]] if swaps is None else []
+    assert parts_order._swap_buttons("B1", parts, swaps) == expected
+
+
+def test_auto_mode_orders_the_chosen_part_and_sends_no_buttons(tg):
+    rules = Rules(("Bosch",), ("ProMeister",), 10000, "auto", prefer_in_stock=False)
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, rules,
+                                      by_sku("p1", "p3", "p2")) == "ordered"
+
+    assert tg["buttons"] == []
+    assert _added(portal) == ["p1", "p2"]
+    assert portal.names().count("checkout") == 1
+    assert all("Alternativ" not in text for text in tg["sent"])
+
+
+def test_max_alternatives_three_still_stores_one_alternative(tg):
+    rules = Rules(("Bosch",), ("ProMeister",), 10000, "approve", prefer_in_stock=False,
+                  max_alternatives=3)
+    other = {**MANN, "title": "Mahle Oljefilter OC1", "brand": "Mahle", "url_or_id": "p5"}
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN, other], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, rules,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert isinstance(part["alternative"], dict) and part["alternative"]["url_or_id"] == "p3"
+    text, buttons = tg["buttons"][0]
+    assert text.count("Alternativ för") == 1
+    assert buttons == [APPROVE_BUTTONS, [("Byt Oljefilter", "swap:B1:0")]]
+
+
+def test_ordered_message_does_not_repeat_alternatives(tg):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+    plan = orders_state.get("B1")["plan"]
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, NO_SWITCH) == "ordered"
+
+    (done,) = tg["sent"]
+    assert "Alternativ" not in done and "Mann" not in done
+
+
+def test_build_summary_renders_alternatives_and_replacements():
+    parts = [{"name": "Oljefilter", "title": "Mann Oljefilter W712", "brand": "Mann", "qty": 2,
+              "price_sek": 200.0, "in_stock": True,
+              "replaced_from": {"title": "Bosch Oljefilter P7001", "brand": "Bosch",
+                                "price_sek": 120.0},
+              "alternative": {"title": "Knecht OC1", "brand": None, "price_sek": 90.0,
+                              "in_stock": True, "alt_reason": "dyr", "saving_sek": 110.0}},
+             {"name": "", "title": "Bosch Luftfilter S0123", "brand": "Bosch", "qty": 1,
+              "price_sek": 250.0,
+              "alternative": {"title": "Mann C1", "brand": "Mann", "price_sek": None,
+                              "in_stock": None, "alt_reason": "slut", "saving_sek": 0}}]
+    lines = build_summary(BOOKING, _cart(650.0), [], parts).splitlines()
+    assert lines[4] == ("- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 200.00 SEK – "
+                        "Bytt från Bosch Oljefilter P7001 (slut)")
+    assert lines[5] == "- Bosch Luftfilter S0123 (Bosch) x1 à 250.00 SEK"
+    assert lines[6] == "Totalt: 650.00 SEK"
+    assert lines[7:] == [
+        "Alternativ för Oljefilter: Knecht OC1 (–) à 90.00 SEK – i lager (dyr: sparar 110.00 SEK)",
+        "Alternativ för Bosch Luftfilter S0123: Mann C1 (Mann) à pris saknas (slut)"]
+
+
+def test_auto_mode_replacement_is_told_in_the_ordered_message(tg):
+    rules = Rules(("Bosch",), ("ProMeister",), 10000, "auto")
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, rules,
+                                      by_sku("p1", "p3", "p2")) == "ordered"
+
+    assert tg["buttons"] == []
+    assert _added(portal) == ["p3", "p2"]
+    (done,) = tg["sent"]
+    assert "Bytt från Bosch Oljefilter P7001 (slut)" in done

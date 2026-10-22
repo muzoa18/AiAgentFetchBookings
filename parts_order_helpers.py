@@ -166,16 +166,59 @@ def prepare_section(fluids: list[dict]) -> list[str]:
 
 def order_body(parts: list[dict], total, fluids: list[dict]) -> list[str]:
     """Per chosen part: the booking's line name -> title (brand) qty unit price, plus a stock
-    note when the catalogue says 0 in stock; then the cart total and fluids to prepare."""
+    note when the catalogue says 0 in stock; then the cart total and fluids to prepare.
+    A part that replaced an out-of-stock pick says so: "Bytt från <original title> (slut)"
+    (approval and Beställd messages alike, so auto mode tells the owner too)."""
     lines = ["Delar:"]
     for p in parts:
         name = str(p.get("name") or "").strip()
         head = f"{name} -> {p.get('title')}" if name else str(p.get("title"))
         stock = " – OBS: 0 i lager" if p.get("in_stock") is False else ""
+        replaced = p.get("replaced_from")
+        swapped = (f" – Bytt från {replaced.get('title')} (slut)"
+                   if isinstance(replaced, dict) else "")
         lines.append(f"- {head} ({p.get('brand') or '–'}) x{p.get('qty')} "
-                     f"à {sek(p.get('price_sek'))}{stock}")
+                     f"à {sek(p.get('price_sek'))}{stock}{swapped}")
     lines.append(f"Totalt: {sek(total)}")
     return lines + prepare_section(fluids)
+
+
+# Exactly the candidate fields stored for an alternative: what PartsPortal.add_to_cart reads
+# (url_or_id, and search_term to bring its result page back), what the message shows, and
+# article_nr. Never page text or anything else the search result carried.
+ALTERNATIVE_FIELDS = ("title", "brand", "price_sek", "url_or_id", "in_stock", "search_term",
+                      "article_nr")
+
+
+def alternative_entry(alt: dict) -> dict:
+    """The stored plan["parts"][i]["alternative"]: ALTERNATIVE_FIELDS (search_term and
+    article_nr only when present) plus the matcher's alt_reason and saving_sek."""
+    entry = {k: alt.get(k) for k in ALTERNATIVE_FIELDS
+             if k not in ("search_term", "article_nr") or alt.get(k) is not None}
+    entry["alt_reason"] = alt.get("alt_reason")
+    entry["saving_sek"] = alt.get("saving_sek")
+    return entry
+
+
+def replaced_entry(original: dict) -> dict:
+    """The stored plan["parts"][i]["replaced_from"]: the out-of-stock pick, for the message."""
+    return {k: original.get(k) for k in ("title", "brand", "price_sek")}
+
+
+def alternative_lines(parts: list[dict]) -> list[str]:
+    """One "Alternativ för <name>: ..." line per part that has an alternative."""
+    lines = []
+    for p in parts:
+        alt = p.get("alternative")
+        if not isinstance(alt, dict):
+            continue
+        name = str(p.get("name") or "").strip() or str(p.get("title"))
+        stock = " – i lager" if alt.get("in_stock") is True else ""
+        why = (f"dyr: sparar {sek(alt.get('saving_sek'))}" if alt.get("alt_reason") == "dyr"
+               else "slut")
+        lines.append(f"Alternativ för {name}: {alt.get('title')} ({alt.get('brand') or '–'}) "
+                     f"à {sek(alt.get('price_sek'))}{stock} ({why})")
+    return lines
 
 
 UNVERIFIED_PREFIX = "UNVERIFIED-"
@@ -192,11 +235,13 @@ def reference_line(ref) -> str:
 
 
 def build_summary(booking: dict, cart: dict, fluids: list[dict], parts: list[dict]) -> str:
-    """Approval text: booking header, chosen parts, cart total, fluids. Plain text."""
+    """Approval text: booking header, chosen parts (with any in-stock replacement), cart
+    total, fluids, then one line per alternative. Plain text."""
     reg = str(booking.get("reg_nr") or "–").strip()
     label = booking.get("booking_nr") or booking.get("id") or "okänd bokning"
     return "\n".join([
         f"Delbeställning {label}",
         f"Kund: {booking.get('driver_name') or '–'}",
         f"Fordon: {reg} {booking.get('vehicle') or ''}".rstrip(),
-    ] + order_body(parts, cart.get("total_sek"), fluids))
+    ] + order_body(parts, cart.get("total_sek"), fluids)
+        + alternative_lines(parts))

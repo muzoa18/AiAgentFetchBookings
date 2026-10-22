@@ -1270,3 +1270,52 @@ def test_list_sent_orders_already_on_an_empty_sent_tab_waits_the_budget_too():
     assert portal.list_sent_orders() == []
     assert page.clicks == [] and portal.clock.now >= parts_portal.RESULTS_WAIT_S
 
+
+
+# ── Package 2 task 3: a stored alternative can be added by the real add_to_cart ──
+
+def test_stored_alternative_has_what_add_to_cart_needs(add_page, monkeypatch, tmp_path):
+    import notifier
+    import orders_state
+    import parts_order
+    from rules import Rules
+
+    monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
+    sent = []
+    monkeypatch.setattr(notifier, "send_message", lambda config, text: sent.append(text) or True)
+    monkeypatch.setattr(notifier, "send_with_buttons",
+                        lambda config, text, buttons: sent.append((text, buttons)) or 901)
+    page, portal = add_page({"Oljefilter": ["o1", "o2"], "Luftfilter": ["l1"]})
+    cards = {"o1": {"title": "Bosch Oljefilter P1", "brand": "Bosch", "price_sek": 120.0,
+                    "in_stock": False},
+             "o2": {"title": "Mann Oljefilter W7", "brand": "Mann", "price_sek": 90.0,
+                    "in_stock": True, "article_nr": "W7"},
+             "l1": {"title": "Bosch Luftfilter L1", "brand": "Bosch", "price_sek": 250.0}}
+    monkeypatch.setattr(parts_portal, "parse_search_results", lambda html: [
+        {**cards[sku], "url_or_id": sku} for sku in page.catalogue.get(page.term, ())])
+
+    class Stage(_StagePortal):
+        def read_cart(self):  # what the fake page holds
+            lines = [{"title": cards[s]["title"], "qty": q, "url_or_id": s,
+                      "price_sek": cards[s]["price_sek"] * q} for s, q in page.qty.items() if q]
+            return {"lines": lines, "total_sek": sum(x["price_sek"] for x in lines)}
+
+    booking = {"id": "B1", "booking_nr": "OLRD-1", "reg_nr": "ABC123",
+               "parts": [{"name": "Oljefilter", "qty": "1"}, {"name": "Luftfilter", "qty": "1"}],
+               "fluids": []}
+    rules = Rules(("Bosch",), ("ProMeister",), 10000, "approve", prefer_in_stock=False)
+
+    def picker(line, ranked):
+        return 0, 0.95
+
+    assert parts_order.plan_and_stage({"telegram": {}}, booking, Stage(portal), rules,
+                                      picker) == "pending"
+
+    assert page.qty == {"o1": 1, "l1": 1}            # the alternative is not in the cart
+    alt = orders_state.get("B1")["plan"]["parts"][0]["alternative"]
+    assert alt["url_or_id"] == "o2" and alt["search_term"] == "Oljefilter"
+    # The last search was Luftfilter: the stored dict alone brings its own page back.
+    assert page.term == "Luftfilter"
+    portal.add_to_cart(alt, 1)
+    assert page.searches[-1] == "Oljefilter"
+    assert page.qty["o2"] == 1
