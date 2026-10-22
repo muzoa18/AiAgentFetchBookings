@@ -3,3 +3,11 @@ brand_prefer: [Bosch]        # tried first when matching parts
 brand_forbid: [ProMeister]   # never ordered
 ceiling_sek: 10000           # orders above this total are never placed
 mode: approve                # approve = ask owner first | auto = order directly
+
+# Optional (defaults shown; uncomment to change):
+# brand_prefer_by_part:        # per part word, tried before brand_prefer
+#   Oljefilter: [Mann, Bosch]
+# prefer_in_stock: true        # swap an out-of-stock choice for an in-stock one
+# expensive_ratio: 1.5         # flag a part when an alternative costs <= 1/ratio of it
+# expensive_min_diff_sek: 100  # ...and saves at least this much
+# max_alternatives: 1          # 0-3
