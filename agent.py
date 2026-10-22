@@ -52,6 +52,7 @@ import orders_state
 from logsafe import describe
 from config_loader import load_config
 from notifier import send_message
+from preflight import check_state_or_alert, guarded
 from parts_matcher import make_claude_picker
 from parts_order import (give_up_if_capped, needs_portal, order_notify_failed, plan_and_stage,
                          record_failure, split_lines)
@@ -119,6 +120,11 @@ def run() -> int:
     log.info("=" * 55)
 
     config   = load_config()
+
+    # Fail closed: without readable order state nothing may be ordered or fetched.
+    if not check_state_or_alert(config):
+        _log_summary(0, Counter(), 0, 0)
+        return 1
 
     # Before this run queues anything: report orders a previous run left unfinished.
     swept_failed = _sweep_stale_orders(config)
@@ -526,4 +532,4 @@ def build_message(booking: dict) -> str:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(guarded("booking_agent", run))

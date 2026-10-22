@@ -15,6 +15,7 @@ import orders_state
 import parts_order
 import rules
 from parts_portal_parse import PartsPortalError
+from conftest import write_orders_skeleton
 from rules import Rules
 
 REPO = Path(__file__).resolve().parent.parent
@@ -122,6 +123,8 @@ class PortalFactory:
 def orders_file(tmp_path, monkeypatch):
     path = tmp_path / "config" / "orders.json"
     monkeypatch.setattr(orders_state, "ORDERS_FILE", path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_orders_skeleton(path)
     return path
 
 
@@ -1591,3 +1594,19 @@ def test_long_numbers_are_stored_cut_and_claimed_the_same_way_next_run(tg, run_m
     assert run_main(PortalFactory(SentPortal(rows))) == 0
     assert "verified_at" not in orders_state.get("B2") and len(tg["sent"]) == 1
 
+
+
+def test_main_stops_before_telegram_when_orders_json_missing(monkeypatch, run_main, orders_file):
+    import alerts
+    orders_file.unlink()
+
+    def forbidden(*a, **k):
+        raise AssertionError("no Telegram polling when the order state is unreadable")
+
+    monkeypatch.setattr(notifier, "get_updates", forbidden)
+    monkeypatch.setattr(notifier, "send_message", lambda config, text: True)
+    monkeypatch.setattr(approve, "make_portal", forbidden)
+    monkeypatch.setattr(config_loader, "load_config", lambda: CONFIG)
+
+    assert approve.main([]) == 1
+    assert [a["text"] for a in alerts.active()] == ["config/orders.json saknas"]

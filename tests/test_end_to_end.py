@@ -14,6 +14,7 @@ import config_loader
 import notifier
 import orders_state
 import rules
+from conftest import write_orders_skeleton
 from rules import Rules
 
 CONFIG = {
@@ -104,6 +105,8 @@ class Session:
 def world(monkeypatch, tmp_path):
     orders_file = tmp_path / "config" / "orders.json"
     monkeypatch.setattr(orders_state, "ORDERS_FILE", orders_file)
+    orders_file.parent.mkdir(parents=True, exist_ok=True)
+    write_orders_skeleton(orders_file)
     portal = FakeMecaPortal()
     rec = {"portal": portal, "sent": [], "buttons": [], "klar": [], "answers": [], "cleared": [],
            "updates": [], "offsets": [], "picked": [], "orders_file": orders_file,

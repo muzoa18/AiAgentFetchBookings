@@ -196,6 +196,8 @@ def run_agent(monkeypatch, tmp_path):
     import state
 
     monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
+    from conftest import write_orders_skeleton
+    write_orders_skeleton(tmp_path / "orders.json")
     monkeypatch.setattr(state, "NO_BUTTON_FILE", tmp_path / "nb.txt")
     monkeypatch.setattr(state, "NO_BUTTON_SEEN_FILE", tmp_path / "nbs.txt")
     booking = {"id": "B1", "booking_type": "Bokning", "booking_nr": "UNKW-0001",

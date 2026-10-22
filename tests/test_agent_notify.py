@@ -7,6 +7,7 @@ import agent
 import notifier
 import orders_state
 import state
+from conftest import write_orders_skeleton
 from rules import Rules
 
 CONFIG = {
@@ -59,6 +60,7 @@ def env(monkeypatch, tmp_path):
            "staged": [], "order_status": "pending", "portal_opened": 0, "portal_closed": 0}
 
     monkeypatch.setattr(orders_state, "ORDERS_FILE", tmp_path / "orders.json")
+    write_orders_skeleton(tmp_path / "orders.json")
     monkeypatch.setattr(state, "NO_BUTTON_FILE", tmp_path / "no_button_ids.txt")
     monkeypatch.setattr(state, "NO_BUTTON_SEEN_FILE", tmp_path / "no_button_seen_once.txt")
     rec["buttons"], rec["klar"], rec["cleared"] = [], [], []
@@ -1039,3 +1041,20 @@ def test_login_alert_forwards_the_fixed_auth_reasons(env, monkeypatch, reason):
 
     assert agent.run() == 1
     assert env["sent"][0].endswith(f"Orsak: {reason}")
+
+
+def test_agent_run_stops_before_portal_when_orders_json_missing(env, monkeypatch):
+    import alerts
+
+    def forbidden(config):
+        raise AssertionError("the portal must not be contacted without order state")
+
+    orders_state.ORDERS_FILE.unlink()
+    monkeypatch.setattr(agent, "fetch_bookings", forbidden)
+    env["bookings"] = [_booking("B1")]
+
+    assert agent.run() == 1
+
+    assert env["staged"] == []
+    assert env["logged"] is not None
+    assert [a["text"] for a in alerts.active()] == ["config/orders.json saknas"]
