@@ -402,7 +402,7 @@ not raise `stale_summary` before its first run; only a known-old last success is
 - `summarize.js` whitelists, per order, `portalStatus` (<= 80), `verifiedNumbers` (<= 120) and
   `klarOpen` (same predicate as the Klar section above). `vm.counts` holds the per-status counts plus
   `waiting`, `klar`, `needsAction`; the four tiles (`render.tiles`, headline too) read only these:
-  `waiting` = pending; `klar` = ordered/blocked with `klarOpen`; `ordered` = status ordered and NOT
+  `waiting` = pending; `klar` = any record except pending/attempted with `klarOpen`; `ordered` = status ordered and NOT
   under Klar (so `counts.ordered` is not the plain per-status total); `needsAction` = blocked/failed/
   expired updated within 7 days or of unknown age, not under Klar. They add up without overlap and
   have the meaning of the Telegram summary's sections, except that the summary has no section for
