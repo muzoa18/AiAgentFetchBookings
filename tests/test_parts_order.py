@@ -2159,7 +2159,7 @@ def test_expensive_line_stores_a_cheaper_alternative_with_its_saving(tg):
     assert _added(portal) == ["p4", "p2"]
     text, buttons = tg["buttons"][0]
     assert ("Alternativ för Oljefilter: Mann Oljefilter W712 (Mann) à 200.00 SEK – i lager "
-            "(dyr: sparar 300.00 SEK)") in text
+            "(dyr: sparar 300.00 SEK/st)") in text
     assert buttons[1] == [("Byt Oljefilter", "swap:B1:0")]
 
 
@@ -2362,12 +2362,19 @@ def test_build_summary_renders_alternatives_and_replacements():
                         "Bytt från Bosch Oljefilter P7001 (slut)")
     assert lines[5] == "- Bosch Luftfilter S0123 (Bosch) x1 à 250.00 SEK"
     assert lines[6] == "Totalt: 650.00 SEK"
+    # Task 4: a blank line sets the alternatives apart (also from a Förbered list), and the
+    # saving is per unit ("/st").
     assert lines[7:] == [
-        "Alternativ för Oljefilter: Knecht OC1 (–) à 90.00 SEK – i lager (dyr: sparar 110.00 SEK)",
+        "",
+        "Alternativ för Oljefilter: Knecht OC1 (–) à 90.00 SEK – i lager "
+        "(dyr: sparar 110.00 SEK/st)",
         "Alternativ för Bosch Luftfilter S0123: Mann C1 (Mann) à pris saknas (slut)"]
 
 
-def test_auto_mode_replacement_is_told_in_the_ordered_message(tg):
+def test_auto_mode_never_replaces_an_out_of_stock_pick(tg, orders_file):
+    # Task 4 (was: auto mode told the owner about a replacement). The in-stock replacement
+    # is approve mode only: auto orders exactly what it ordered before package 2, and it
+    # stores no alternative either (nobody can swap an order that is already placed).
     rules = Rules(("Bosch",), ("ProMeister",), 10000, "auto")
     portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
 
@@ -2375,6 +2382,101 @@ def test_auto_mode_replacement_is_told_in_the_ordered_message(tg):
                                       by_sku("p1", "p3", "p2")) == "ordered"
 
     assert tg["buttons"] == []
-    assert _added(portal) == ["p3", "p2"]
+    assert _added(portal) == ["p1", "p2"]
     (done,) = tg["sent"]
-    assert "Bytt från Bosch Oljefilter P7001 (slut)" in done
+    assert "Bytt från" not in done and "Mann" not in done
+    assert "OBS: 0 i lager" in done
+    parts = orders_state.get("B1")["plan"]["parts"]
+    assert all("alternative" not in p and "replaced_from" not in p for p in parts)
+
+
+# ── Package 2 task 4: approval text guards ───────────────────────────────────
+
+def test_alternatives_are_set_apart_by_a_blank_line_in_the_approval_text(tg):
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    text, _ = tg["buttons"][0]
+    assert "- Olja 5W30 x5\n\nAlternativ för Oljefilter:" in text
+
+
+def _long_booking(n=12, title_len=180):
+    parts = [{"name": f"Del nummer {i} med ett ganska långt namn", "qty": "1"} for i in range(n)]
+    catalogue, picks = {}, []
+    for i in range(n):
+        base = f"Bosch Reservdel {i} " + "X" * title_len
+        catalogue[parts[i]["name"]] = [
+            {"title": base, "brand": "Bosch", "price_sek": 100.0, "url_or_id": f"o{i}",
+             "in_stock": False},
+            {"title": f"Mann Reservdel {i} " + "Y" * title_len, "brand": "Mann",
+             "price_sek": 110.0, "url_or_id": f"a{i}", "in_stock": True}]
+        picks += [f"o{i}", f"a{i}"]
+    return {**BOOKING, "parts": parts, "fluids": []}, catalogue, picks
+
+
+def test_too_long_approval_text_drops_the_alternatives_and_swap_rows(tg):
+    booking, catalogue, picks = _long_booking()
+    portal = FakePortal(catalogue=catalogue)
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, NO_SWITCH,
+                                      by_sku(*picks)) == "pending"
+
+    plan = orders_state.get("B1")["plan"]
+    assert all(isinstance(p.get("alternative"), dict) for p in plan["parts"])  # still stored
+    full = build_summary(booking, {"total_sek": plan["total_sek"]}, [], plan["parts"])
+    assert len(full) > 4000                       # the test really is over the limit
+    text, buttons = tg["buttons"][0]
+    assert len(text) <= 4000
+    assert "Alternativ för" not in text
+    assert text.count("OBS: 0 i lager") == 12     # the stock notes still fit
+    assert text.endswith("Godkänn för att beställa.")
+    assert buttons == APPROVE_BUTTONS             # Godkänn/Avbryt only, no swap rows
+    assert orders_state.get("B1")["message_id"] == 77
+
+
+def test_too_long_even_without_alternatives_falls_back_to_the_plain_summary(tg):
+    booking, catalogue, picks = _long_booking(title_len=200)
+    portal = FakePortal(catalogue=catalogue)
+
+    # prefer_in_stock: every line is replaced, so every line also carries "Bytt från <title>".
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE,
+                                      by_sku(*[p for p in picks if p.startswith("o")]
+                                             + [p for p in picks if p.startswith("a")])
+                                      ) == "pending"
+
+    plan = orders_state.get("B1")["plan"]
+    assert all(isinstance(p.get("replaced_from"), dict) for p in plan["parts"])
+    text, buttons = tg["buttons"][0]
+    assert len(text) <= 4000
+    assert "Bytt från" not in text and "Alternativ för" not in text
+    expected = build_summary(booking, {"total_sek": plan["total_sek"]}, [], plan["parts"],
+                             alternatives=False, notes=False)
+    assert text == expected + "\n\nGodkänn för att beställa."
+    assert buttons == APPROVE_BUTTONS
+
+
+def test_short_text_keeps_alternatives_and_swap_rows(tg):
+    booking, catalogue, picks = _long_booking(n=2, title_len=20)
+    portal = FakePortal(catalogue=catalogue)
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, NO_SWITCH,
+                                      by_sku(*picks)) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    assert text.count("Alternativ för") == 2
+    assert buttons[0] == APPROVE_BUTTONS and len(buttons) == 3
+
+
+def test_swaps_count_is_read_from_the_real_state_file(tg, orders_file):
+    orders_state.queue("B1")
+    orders_state.update_fields("B1", swaps=2)
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      by_sku("p1", "p3", "p2")) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    assert buttons == APPROVE_BUTTONS
+    assert "Alternativ för Oljefilter" in text
+    assert orders_state.get("B1")["swaps"] == 2

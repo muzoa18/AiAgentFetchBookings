@@ -36,6 +36,7 @@ orders_state.restage(). Such a quiet retry sends no message when it blocks again
 the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
 """
 
+import dataclasses
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,12 @@ STOP_CODES = ("vehicle_lost", "login")
 CALLBACK_DATA_LIMIT = 64
 MAX_SWAPS = 2
 SWAP_LABEL_CHARS = 20
+
+# Approval text length guard: Telegram refuses a message over 4096 characters, and the
+# cart is already filled when the approval is sent. Over APPROVAL_TEXT_MAX the alternative
+# block and the swap rows go first, then the "Bytt från" notes (_approval_message).
+APPROVAL_SUFFIX = "\n\nGodkänn för att beställa."
+APPROVAL_TEXT_MAX = 4000
 
 # Duplicate-order guard: a sent order for the vehicle this recent blocks staging. The
 # reason starts with orders_state.NO_RESTAGE_REASONS, so it is never retried quietly.
@@ -413,6 +420,10 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
             "Varukorgen på pro.meca.se är inte tom (annan väntande beställning?). "
             f"Hantera {label} för hand."))
 
+    # Auto mode orders exactly what it ordered before package 2: no in-stock replacement and
+    # no alternative (nobody can swap an order that is already placed).
+    match_rules = (dataclasses.replace(rules, prefer_in_stock=False, max_alternatives=0)
+                   if rules.mode == "auto" else rules)
     matched, choices = [], []
     for line, name, qty in wanted:  # match everything before adding anything
         choice = None
@@ -420,7 +431,7 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
             if out_of_time():  # nothing is in the cart yet: retried quietly (transient)
                 raise PartsPortalError(f"staging {booking_id} took longer than "
                                        f"{STAGE_BUDGET_S} s", "search_timeout")
-            choice = choose_with_alternatives(line, portal.search(term), rules, picker)
+            choice = choose_with_alternatives(line, portal.search(term), match_rules, picker)
             if choice.chosen is not None:
                 break
         if choice is None or choice.chosen is None:
@@ -496,16 +507,35 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     if rules.mode != "approve":
         raise ValueError(f"unknown rules mode {rules.mode!r}")
 
-    buttons = [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")]
-    swap_rows = _swap_buttons(booking_id, parts, record.get("swaps"))
-    message_id = notifier.send_with_buttons(
-        config, build_summary(booking, cart, fluids, parts) + "\n\nGodkänn för att beställa.",
-        [buttons] + swap_rows if swap_rows else buttons)
+    text, buttons = _approval_message(booking_id, booking, cart, fluids, parts,
+                                      record.get("swaps"))
+    message_id = notifier.send_with_buttons(config, text, buttons)
     if message_id is None:
         return _fail(config, booking_id, label,
                      "godkännandemeddelandet kunde inte skickas (varukorgen är fylld)")
     orders_state.put(booking_id, "pending", message_id=message_id)
     return "pending"
+
+
+def _approval_message(booking_id: str, booking: dict, cart: dict, fluids: list[dict],
+                      parts: list[dict], swaps) -> tuple[str, list]:
+    """(text, buttons) of the approval message, at most APPROVAL_TEXT_MAX characters when
+    possible: the full text with swap rows; else without the alternative block and swap rows;
+    else also without the "Bytt från" notes (the pre-package-2 summary). Godkänn/Avbryt
+    always stay. A plain summary that is still too long is sent as before."""
+    buttons = [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")]
+    swap_rows = _swap_buttons(booking_id, parts, swaps)
+    text = build_summary(booking, cart, fluids, parts) + APPROVAL_SUFFIX
+    if len(text) <= APPROVAL_TEXT_MAX:
+        return text, ([buttons] + swap_rows if swap_rows else buttons)
+    log.warning("Approval text for %s is %d characters: alternatives and swap buttons left "
+                "out.", booking_id, len(text))
+    text = build_summary(booking, cart, fluids, parts, alternatives=False) + APPROVAL_SUFFIX
+    if len(text) <= APPROVAL_TEXT_MAX:
+        return text, buttons
+    log.warning("Approval text for %s still too long: replacement notes left out.", booking_id)
+    return (build_summary(booking, cart, fluids, parts, alternatives=False, notes=False)
+            + APPROVAL_SUFFIX), buttons
 
 
 def _swap_buttons(booking_id: str, parts: list[dict], swaps) -> list[list[tuple]]:
