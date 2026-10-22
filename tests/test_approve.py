@@ -1667,8 +1667,10 @@ def stage_swap(booking_id="B1", message_id=77, swaps=None, updated_at=None, **pl
 class SwapPortal:
     """pro.meca.se for a swap: a cart (filled as staged), search, add, clear. Records calls."""
 
-    def __init__(self, catalogue=SWAP_CATALOGUE, clear_fails=False, add_fails=()):
+    def __init__(self, catalogue=SWAP_CATALOGUE, clear_fails=False, add_fails=(), clock=None,
+                 clear_takes=0):
         self.catalogue = catalogue
+        self.clock, self.clear_takes = clock, clear_takes
         self.clear_fails = clear_fails
         self.add_fails = set(add_fails)
         self.cart = [(P1, 2), (P2, 1)]       # what the original staging left in the cart
@@ -1686,6 +1688,8 @@ class SwapPortal:
 
     def clear_cart(self, reg_nr=None):
         self.calls.append("clear_cart")
+        if self.clock is not None:
+            self.clock["t"] += self.clear_takes
         if self.clear_fails:
             raise RuntimeError("clear broke")
         self.cart = []
@@ -1704,8 +1708,8 @@ class SwapPortal:
     def read_cart(self):
         self.calls.append("read_cart")
         lines = [{"title": c["title"], "qty": q, "url_or_id": c["url_or_id"],
-                  "price_sek": c["price_sek"] * q} for c, q in self.cart]
-        return {"lines": lines, "total_sek": sum(x["price_sek"] for x in lines)}
+                  "price_sek": c["price_sek"]} for c, q in self.cart]  # unit price, as the shop
+        return {"lines": lines, "total_sek": sum(x["price_sek"] * x["qty"] for x in lines)}
 
     def checkout(self, *, max_total_sek):
         raise AssertionError("a swap must never check out")
@@ -1801,7 +1805,9 @@ def test_swap_rechecks_the_ceiling_on_the_real_cart(tgs):
     assert rec["status"] in ("blocked", "failed") and rec["cart_touched"] is True
     assert "taket" in rec["plan"]["reason"]
     assert tgs["approvals"] == []
-    assert any(parts_order.SWAP_FAILED in t for t in tgs["sent"])
+    # Every add worked: the cart is full, not emptied (fix round 1, M-1).
+    assert any(parts_order.SWAP_FAILED_FULL in t for t in tgs["sent"])
+    assert not any(parts_order.SWAP_FAILED in t for t in tgs["sent"])
 
 
 def test_swap_with_a_booking_id_containing_colons(tgs):
@@ -1970,7 +1976,10 @@ def test_staging_failure_after_the_clear_is_truthful_and_not_pending(tgs):
     assert orders_state.restage("B1") is False
     assert tgs["cleared"][0] == 77                       # old buttons removed
     assert tgs["approvals"] == []
-    assert any(parts_order.SWAP_FAILED in t and "OLRD-0001" in t for t in tgs["sent"])
+    # p3 failed, p2 is in the cart: the message says so (fix round 1, M-1).
+    assert any("Bytet misslyckades" in t and "OLRD-0001" in t
+               and "i varukorgen: Bosch Luftfilter S0123 x1" in t
+               and "Kunde inte läggas till: Oljefilter" in t for t in tgs["sent"])
     assert tgs["answers"][1] == ("cb2", "Redan hanterad.")
 
 
@@ -2004,3 +2013,52 @@ def test_parse_swap_data():
     assert approve._parse("approve:a:b") == ("approve", "a:b")
     for bad in ("swap:B1:x", "swap:B1", "swap::1", "swap:B1:-1", "swap:B1:1e3"):
         assert approve._parse(bad) is None
+
+
+# ── Task 4 fix round 1: the swap's own time budget ───────────────────────────
+
+@pytest.fixture
+def swap_clock(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(parts_order, "_clock", lambda: clock["t"])
+    return clock
+
+
+def test_swap_budget_counts_the_cart_clear(tgs, swap_clock):
+    stage_swap()
+    portal = SwapPortal(clock=swap_clock, clear_takes=parts_order.SWAP_BUDGET_S + 1)
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+
+    assert problem is True
+    rec = orders_state.get("B1")
+    assert rec["status"] in ("blocked", "failed") and rec["cart_touched"] is True
+    assert portal.added == [] and tgs["approvals"] == []
+    assert tgs["cleared"] == [77]
+    assert any(parts_order.SWAP_FAILED in t for t in tgs["sent"])
+
+
+def test_swap_within_its_budget_works(tgs, swap_clock):
+    stage_swap()
+    portal = SwapPortal(clock=swap_clock, clear_takes=parts_order.SWAP_BUDGET_S - 10)
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+
+    assert (actions, problem) == (1, False)
+    assert orders_state.get("B1")["status"] == "pending"
+
+
+def test_swap_budget_fits_the_approve_step():
+    assert parts_order.SWAP_BUDGET_S == 240 < parts_order.STAGE_BUDGET_S
+
+
+def test_swap_message_live_price_and_booking_pointer(tgs):
+    stage_swap()
+    live = {**P3, "price_sek": 215.0}
+    portal = SwapPortal(catalogue={"Oljefilter": [P1, live], "Luftfilter": [P2]})
+
+    run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+
+    (text, _, _), = tgs["approvals"]
+    assert "Kund: se bokning OLRD-0001" in text
+    assert "- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 200.00 SEK" in text

@@ -94,8 +94,16 @@ APPROVAL_TEXT_MAX = 4000
 
 # One-tap swap (approve.py -> restage_with_pins). The owner's cart was emptied before the
 # restage, so any problem after that leaves the cart empty or partly filled.
+# The cart's state is told as far as it is known: emptied or unknown (SWAP_FAILED), full
+# because every add worked (SWAP_FAILED_FULL), or partly filled (the _partial_text lines).
 SWAP_FAILED = ("Bytet misslyckades – varukorgen är tömd eller delvis fylld, "
                "kontrollera pro.meca.se")
+SWAP_FAILED_FULL = ("Bytet misslyckades – varukorgen innehåller delarna, "
+                    "kontrollera pro.meca.se")
+SWAP_FAILED_PARTIAL = "Bytet misslyckades – kontrollera pro.meca.se"
+# A swap's own time budget, from the start of approve._swap (cart clear included): it must
+# fit in the approve step's timeout together with expiry, Klar, browser start and login.
+SWAP_BUDGET_S = 240
 
 # Duplicate-order guard: a sent order for the vehicle this recent blocks staging. The
 # reason starts with orders_state.NO_RESTAGE_REASONS, so it is never retried quietly.
@@ -375,11 +383,13 @@ def _existing_sent_order(portal, booking: dict, now: datetime) -> dict | None:
 
 
 def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
-           pins: dict | None = None, keep: dict | None = None) -> str:
+           pins: dict | None = None, keep: dict | None = None,
+           deadline: float | None = None) -> str:
     """Stage one booking. With `pins` (a swap, restage_with_pins) those line indexes use the
     pinned candidate (no search, re-validated), lines in `keep` must be found again as
     staged, every block uses SWAP_FAILED, and the result is always an approval message:
-    a swap never orders, whatever rules.mode says."""
+    a swap never orders, whatever rules.mode says. `deadline` (a _clock() value) replaces
+    the STAGE_BUDGET_S budget (a swap's SWAP_BUDGET_S, counted by the caller)."""
     swap = pins is not None
     booking_id, label = booking["id"], _label(booking)
     record = orders_state.get(booking_id) or {}
@@ -395,14 +405,18 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
     if fields:  # cart_touched=False marks the record as not legacy (orders_state.restage)
         orders_state.update_fields(booking_id, **fields)
     order_lines, fluids = split_lines(booking)
-    deadline = _clock() + STAGE_BUDGET_S
+    if deadline is None:
+        deadline = _clock() + STAGE_BUDGET_S
 
     def out_of_time() -> bool:
         return _clock() > deadline
 
     def block(reason: str, **kw) -> str:
         if swap:  # the cart was emptied for the swap: never quiet, never re-staged
-            return swap_failed(config, booking, reason)
+            if reason == PARTIAL_REASON and kw.get("text"):
+                return swap_failed(config, booking, reason, partial=kw["text"])
+            # cart_touched=True here means every add worked: the cart holds the parts.
+            return swap_failed(config, booking, reason, full=kw.get("cart_touched") is True)
         return _block(config, booking, reason, fluids, quiet_reason=quiet_reason, **kw)
 
     if not order_lines:
@@ -505,11 +519,21 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
     if problem:
         return block(problem, cart_touched=True)
 
+    live = {str(x["url_or_id"]): x for x in cart.get("lines") or []
+            if isinstance(x, dict) and x.get("url_or_id")}
     parts = []
-    for (name, c, qty), choice in zip(matched, choices):
+    for i, ((name, c, qty), choice) in enumerate(zip(matched, choices)):
+        price, in_stock = c.get("price_sek"), c.get("in_stock")
+        if swap and i in pins:  # the stored alternative may be days old: the cart is live
+            line = live.get(str(c.get("url_or_id")))
+            if line is not None:
+                if _price(line.get("price_sek")) is not None:
+                    price = line["price_sek"]
+                if isinstance(line.get("in_stock"), bool):
+                    in_stock = line["in_stock"]
         part = {"name": name, "title": c.get("title"), "brand": c.get("brand"),
-                "price_sek": c.get("price_sek"), "qty": qty, "url_or_id": c.get("url_or_id"),
-                "in_stock": c.get("in_stock")}
+                "price_sek": price, "qty": qty, "url_or_id": c.get("url_or_id"),
+                "in_stock": in_stock}
         if choice.replaced is not None:  # the owner is told about an in-stock replacement
             part["replaced_from"] = replaced_entry(choice.replaced)
         # The matcher returns at most one alternative, whatever max_alternatives (1-3) says.
@@ -539,11 +563,11 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
             raise ValueError(f"unknown rules mode {rules.mode!r}")
 
     text, buttons = _approval_message(booking_id, booking, cart, fluids, parts,
-                                      record.get("swaps"))
+                                      record.get("swaps"), rules)
     message_id = notifier.send_with_buttons(config, text, buttons)
     if message_id is None:
         if swap:
-            return block("godkännandemeddelandet kunde inte skickas")
+            return block("godkännandemeddelandet kunde inte skickas", cart_touched=True)
         return _fail(config, booking_id, label,
                      "godkännandemeddelandet kunde inte skickas (varukorgen är fylld)")
     orders_state.put(booking_id, "pending", plan=plan, message_id=message_id)
@@ -551,13 +575,13 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
 
 
 def _approval_message(booking_id: str, booking: dict, cart: dict, fluids: list[dict],
-                      parts: list[dict], swaps) -> tuple[str, list]:
+                      parts: list[dict], swaps, rules: Rules | None = None) -> tuple[str, list]:
     """(text, buttons) of the approval message, at most APPROVAL_TEXT_MAX characters when
     possible: the full text with swap rows; else without the alternative block and swap rows;
     else also without the "Bytt från" notes (the pre-package-2 summary). Godkänn/Avbryt
     always stay. A plain summary that is still too long is sent as before."""
     buttons = [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")]
-    swap_rows = _swap_buttons(booking_id, parts, swaps)
+    swap_rows = _swap_buttons(booking_id, parts, swaps, rules)
     text = build_summary(booking, cart, fluids, parts) + APPROVAL_SUFFIX
     if len(text) <= APPROVAL_TEXT_MAX:
         return text, ([buttons] + swap_rows if swap_rows else buttons)
@@ -571,11 +595,13 @@ def _approval_message(booking_id: str, booking: dict, cart: dict, fluids: list[d
             + APPROVAL_SUFFIX), buttons
 
 
-def _swap_buttons(booking_id: str, parts: list[dict], swaps) -> list[list[tuple]]:
+def _swap_buttons(booking_id: str, parts: list[dict], swaps,
+                  rules: Rules | None = None) -> list[list[tuple]]:
     """One row ("Byt <name>", "swap:<booking_id>:<index>") per part with an alternative.
     No rows when the record has MAX_SWAPS or more swaps, or a count that is not an int (an
     absent/None count is 0); a button whose callback data would exceed
-    CALLBACK_DATA_LIMIT bytes is left out."""
+    CALLBACK_DATA_LIMIT bytes is left out, and so (with `rules`) is one whose alternative
+    the swap would refuse (pin_problem): never a dead button. The text stays."""
     if swaps is None:
         swaps = 0
     if isinstance(swaps, bool) or not isinstance(swaps, int) or swaps >= MAX_SWAPS:
@@ -584,12 +610,17 @@ def _swap_buttons(booking_id: str, parts: list[dict], swaps) -> list[list[tuple]
     for i, part in enumerate(parts):
         if not isinstance(part.get("alternative"), dict):
             continue
+        name = str(part.get("name") or "").strip()
+        if rules is not None and pin_problem(name, pin_candidate(part["alternative"]), rules):
+            log.info("Swap button for %s line %d left out: the alternative cannot be pinned.",
+                     booking_id, i)
+            continue
         data = f"swap:{booking_id}:{i}"
         if len(data.encode("utf-8")) > CALLBACK_DATA_LIMIT:
             log.warning("Swap button for %s line %d left out: callback data too long.",
                         booking_id, i)
             continue
-        name = str(part.get("name") or part.get("title") or "").strip()
+        name = name or str(part.get("title") or "").strip()
         rows.append([(f"Byt {name[:SWAP_LABEL_CHARS]}", data)])
     return rows
 
@@ -605,7 +636,8 @@ def swap_booking(booking_id: str, record: dict) -> dict:
             "parts": [{"name": p.get("name"), "qty": p.get("qty")}
                       for p in plan.get("parts") or [] if isinstance(p, dict)],
             "fluids": list(plan.get("fluids") or []),
-            "detail_url": record.get("detail_url"), "vehicle": record.get("vehicle_model")}
+            "detail_url": record.get("detail_url"), "vehicle": record.get("vehicle_model"),
+            "customer_line": f"se bokning {plan.get('booking_nr') or booking_id}"}
 
 
 def pin_candidate(alternative: dict) -> dict:
@@ -696,22 +728,30 @@ def _find_staged(line_name: str, staged: dict, results: list[dict], rules: Rules
     return Choice(None)
 
 
-def swap_failed(config: dict, booking: dict, reason: str) -> str:
-    """End a swap after the cart was emptied: 'blocked' with cart_touched (never re-staged),
-    the SWAP_FAILED text with a Klar button. 'failed' if that message is not delivered."""
+def swap_failed(config: dict, booking: dict, reason: str, full: bool = False,
+                partial: str | None = None) -> str:
+    """End a swap after the cart was emptied: 'blocked' with cart_touched (never re-staged)
+    and a Klar message that tells the cart's state as far as it is known: `partial` (the
+    _partial_text lines: what is in the cart), `full` (every add worked: SWAP_FAILED_FULL),
+    else SWAP_FAILED (emptied, or unknown). 'failed' if the message is not delivered."""
     try:
         orders_state.update_fields(booking["id"], cart_touched=True)
     except Exception:
         log.exception("Could not flag cart_touched for %s.", booking.get("id"))
     fluids = split_lines(booking)[1]
-    text = "\n".join([f"Byte för {_label(booking)}: {SWAP_FAILED}.",
-                      f"Orsak: {reason}. Inget beställdes – beställ för hand."]
-                     + prepare_section(fluids))
+    why = f"Orsak: {reason}. Inget beställdes – beställ för hand."
+    if partial:
+        text = "\n".join([f"Byte för {_label(booking)}: {SWAP_FAILED_PARTIAL}.", why, partial])
+    else:
+        text = "\n".join([f"Byte för {_label(booking)}: "
+                          f"{SWAP_FAILED_FULL if full else SWAP_FAILED}.", why]
+                         + prepare_section(fluids))
     return _block(config, booking, reason, fluids, cart_touched=True, text=text)
 
 
 def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict],
-                      rules: Rules, picker, keep: dict[int, dict] | None = None) -> str:
+                      rules: Rules, picker, keep: dict[int, dict] | None = None,
+                      deadline: float | None = None) -> str:
     """Stage `booking` again after a swap emptied its cart: the _stage flow with `pins`
     ({line index: the stored alternative}) used instead of searching for those lines.
 
@@ -721,6 +761,8 @@ def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict]
     never re-chosen); other lines are matched normally with `picker`. Then, as _stage:
     empty-cart check, add, cart verification against the new expected lines, the ceiling,
     and a new approval message (fresh message id) before the record is 'pending' again.
+    `deadline` (a _clock() value; approve._swap passes start + SWAP_BUDGET_S) bounds the
+    whole restage: past it nothing more is searched or added and swap_failed applies.
     Never checks out. Any problem: swap_failed. Returns pending | blocked | failed; no
     exception leaves this function."""
     booking_id, label = booking.get("id"), _label(booking)
@@ -730,7 +772,11 @@ def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict]
         if problem:
             log.error("Swap restage for %s refused: %s.", booking_id, problem)
             return swap_failed(config, booking, problem)
-        return _stage(config, booking, portal, rules, picker, pins=dict(pins), keep=keep)
+        if deadline is not None and _clock() > deadline:
+            log.error("Swap restage for %s: out of time before staging.", booking_id)
+            return swap_failed(config, booking, "tiden för bytet tog slut")
+        return _stage(config, booking, portal, rules, picker, pins=dict(pins), keep=keep,
+                      deadline=deadline)
     except Exception as e:
         log.error("Swap restage failed for %s: %s", booking_id, describe(e))
         log.debug("Traceback", exc_info=True)

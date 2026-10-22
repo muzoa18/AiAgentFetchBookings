@@ -2499,6 +2499,26 @@ def _staged_for_swap(tg, catalogue=None, rules=NO_SWITCH, picks=("p1", "p3", "p2
     return record
 
 
+class UnitPortal(FakePortal):
+    """read_cart as pro.meca.se shows it: price_sek is the unit price ("Pris per enhet"),
+    with url_or_id; `live` overrides a sku's unit price."""
+
+    def __init__(self, live=None, **kw):
+        super().__init__(**kw)
+        self.live = dict(live or {})
+
+    def read_cart(self):
+        self._record("read_cart")
+        if self.carts:
+            return self.carts.pop(0)
+        if not self.added and self.initial is not None:
+            return self.initial
+        lines = [{"title": c["title"], "qty": q, "url_or_id": c["url_or_id"],
+                  "price_sek": self.live.get(c["url_or_id"], c["price_sek"])}
+                 for c, q in self.added]
+        return {"lines": lines, "total_sek": sum(x["price_sek"] * x["qty"] for x in lines)}
+
+
 class Recorder:
     def __init__(self):
         self.calls = []
@@ -2524,7 +2544,8 @@ def test_swap_booking_is_rebuilt_from_the_stored_plan_only(tg):
                        "parts": [{"name": "Oljefilter", "qty": 2},
                                  {"name": "Luftfilter", "qty": 1}],
                        "fluids": [{"name": "Olja 5W30", "qty": "5"}],
-                       "detail_url": "https://m/b/B1", "vehicle": "VOLKSWAGEN PASSAT"}
+                       "detail_url": "https://m/b/B1", "vehicle": "VOLKSWAGEN PASSAT",
+                       "customer_line": "se bokning OLRD-0001"}  # fix round 1, M-5
 
 
 def test_restage_with_pins_stages_the_alternative_and_keeps_the_other_lines(tg, orders_file):
@@ -2590,13 +2611,15 @@ def test_restage_after_the_second_swap_has_no_swap_buttons(tg):
     assert "Alternativ för Luftfilter" in text
 
 
-def _assert_swap_failed(tg, portal, reason_part=None):
+def _assert_swap_failed(tg, portal, reason_part=None, cart_text=None):
+    """cart_text: what the message must say about the cart (fix round 1, M-1): by default
+    the emptied-or-unknown text; SWAP_FAILED_FULL after every add succeeded."""
     rec = orders_state.get("B1")
     assert rec["status"] in ("blocked", "failed") and rec["cart_touched"] is True
     assert tg["buttons"] == []
     assert "checkout" not in portal.names()
     (text,) = tg["sent"]
-    assert parts_order.SWAP_FAILED in text and "OLRD-0001" in text
+    assert (cart_text or parts_order.SWAP_FAILED) in text and "OLRD-0001" in text
     if reason_part:
         assert reason_part in rec["plan"]["reason"]
     assert orders_state.restage("B1") is False            # never retried automatically
@@ -2664,7 +2687,8 @@ def test_restage_over_the_ceiling_blocks_with_the_swap_text(tg):
 
     assert _restage(record, portal, rules=rules) in ("blocked", "failed")  # 650 SEK > 600
 
-    _assert_swap_failed(tg, portal, "taket")
+    _assert_swap_failed(tg, portal, "taket", cart_text=parts_order.SWAP_FAILED_FULL)
+    assert parts_order.SWAP_FAILED not in tg["sent"][0]   # the cart is full, not emptied
 
 
 def test_restage_verifies_the_cart_against_the_new_expected_lines(tg):
@@ -2676,7 +2700,7 @@ def test_restage_verifies_the_cart_against_the_new_expected_lines(tg):
 
     assert _restage(record, portal) in ("blocked", "failed")
 
-    _assert_swap_failed(tg, portal, "stämmer inte")
+    _assert_swap_failed(tg, portal, "stämmer inte", cart_text=parts_order.SWAP_FAILED_FULL)
 
 
 def test_restage_fails_when_a_kept_part_is_gone(tg):
@@ -2709,7 +2733,8 @@ def test_restage_add_failure_blocks_with_the_swap_text(tg):
 
     assert _restage(record, portal) in ("blocked", "failed")
 
-    _assert_swap_failed(tg, portal)
+    _assert_swap_failed(tg, portal, cart_text="Inget lades i varukorgen.")
+    assert parts_order.SWAP_FAILED not in tg["sent"][0]
 
 
 def test_restage_portal_error_blocks_with_the_swap_text(tg):
@@ -2779,3 +2804,207 @@ def test_swap_problem_runs_the_matcher_filters(tg, alt):
     record["plan"]["parts"][0]["alternative"] = {**alt, "price_sek": 50.0, "in_stock": True,
                                                  "alt_reason": "dyr", "saving_sek": 70.0}
     assert "inte tillåtet" in parts_order.swap_problem(record, 0, NO_SWITCH)
+
+
+# ── Task 4 fix round 1 ───────────────────────────────────────────────────────
+
+KLOSS_FRAM = {"title": "Bosch Bromsklossar", "brand": "Bosch", "price_sek": 900.0,
+              "url_or_id": "k1", "in_stock": False, "placement": "Framaxel",
+              "search_term": "Bromsklossar fram"}
+KLOSS_ALT = {"title": "Mann Bromsklossar", "brand": "Mann", "price_sek": 400.0,
+             "url_or_id": "k2", "in_stock": True, "placement": "Framaxel",
+             "search_term": "Bromsklossar fram"}
+KLOSS_BOOKING = {**BOOKING, "parts": [{"name": "Bromsklossar fram", "qty": "1"}], "fluids": []}
+
+
+def _kloss_catalogue():
+    return {term: [KLOSS_FRAM, KLOSS_ALT] for term in
+            ("Bromsklossar fram", "bromsklossar fram", "bromsklossar", "Bromsklossar")}
+
+
+def test_alternative_keeps_its_placement_and_the_swap_works_end_to_end(tg):
+    # I-1: the axle is only in the shop's placement field, not in the title.
+    portal = FakePortal(catalogue=_kloss_catalogue())
+    assert parts_order.plan_and_stage(CONFIG, KLOSS_BOOKING, portal, NO_SWITCH,
+                                      by_sku("k1", "k2")) == "pending"
+    record = orders_state.get("B1")
+    alt = record["plan"]["parts"][0]["alternative"]
+    assert alt["placement"] == "Framaxel"
+    assert parts_order.pin_candidate(alt)["placement"] == "Framaxel"
+    _, buttons = tg["buttons"][0]
+    assert buttons == [APPROVE_BUTTONS, [("Byt Bromsklossar fram", "swap:B1:0")]]
+    assert parts_order.swap_problem(record, 0, NO_SWITCH) is None
+    orders_state.put("B1", "attempted")
+    orders_state.update_fields("B1", swaps=1, cart_touched=True)
+    tg["buttons"].clear()
+
+    portal = UnitPortal(catalogue=_kloss_catalogue())
+    booking = parts_order.swap_booking("B1", record)
+    assert parts_order.restage_with_pins(CONFIG, portal, booking, {0: alt}, NO_SWITCH,
+                                         Recorder()) == "pending"
+    assert _added(portal) == ["k2"]
+    assert orders_state.get("B1")["plan"]["parts"][0]["url_or_id"] == "k2"
+
+
+def test_alternative_that_cannot_be_pinned_shows_text_but_no_swap_button(tg):
+    # A candidate the matcher may choose but a swap could never add (no url_or_id).
+    no_id = {**MANN, "url_or_id": ""}
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, no_id], "Luftfilter": LUFT})
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, NO_SWITCH,
+                                      lambda line, ranked: (len(ranked) - 1, 0.95)
+                                      if line["name"] == "Oljefilter" and len(ranked) == 1
+                                      else (0, 0.95)) == "pending"
+
+    part = orders_state.get("B1")["plan"]["parts"][0]
+    assert isinstance(part.get("alternative"), dict)
+    text, buttons = tg["buttons"][0]
+    assert "Alternativ för Oljefilter: Mann Oljefilter W712" in text
+    assert buttons == APPROVE_BUTTONS
+
+
+def test_swap_buttons_skip_an_alternative_the_pin_check_rejects():
+    parts = [{"name": "Oljefilter", "alternative": {"title": "ProMeister X", "brand": "ProMeister",
+                                                    "url_or_id": "p9"}},
+             {"name": "Luftfilter", "alternative": {"title": "Mann C1", "brand": "Mann",
+                                                    "url_or_id": "p7"}}]
+    assert parts_order._swap_buttons("B1", parts, 0, NO_SWITCH) == [
+        [("Byt Luftfilter", "swap:B1:1")]]
+
+
+def test_restage_with_a_past_deadline_fails_with_the_swap_text(tg, stage_clock):
+    # I-2: the swap's own budget, counted by the caller from the start of the swap.
+    record = _staged_for_swap(tg)
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    booking = parts_order.swap_booking("B1", record)
+    parts = record["plan"]["parts"]
+    status = parts_order.restage_with_pins(CONFIG, portal, booking,
+                                           {0: parts[0]["alternative"]}, NO_SWITCH,
+                                           Recorder(), keep={1: parts[1]},
+                                           deadline=stage_clock["t"] - 1)
+
+    assert status in ("blocked", "failed")
+    assert portal.added == [] and portal.calls == []
+    _assert_swap_failed(tg, portal)
+
+
+def test_restage_deadline_while_adding_lists_what_is_in_the_cart(tg, stage_clock):
+    record = _staged_for_swap(tg)
+
+    class Slow(FakePortal):
+        def add_to_cart(self, candidate, qty):
+            super().add_to_cart(candidate, qty)
+            stage_clock["t"] += 100
+
+    portal = Slow(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+    booking = parts_order.swap_booking("B1", record)
+    parts = record["plan"]["parts"]
+    status = parts_order.restage_with_pins(CONFIG, portal, booking,
+                                           {0: parts[0]["alternative"]}, NO_SWITCH,
+                                           Recorder(), keep={1: parts[1]},
+                                           deadline=stage_clock["t"] + 50)
+
+    assert status in ("blocked", "failed")
+    assert _added(portal) == ["p3"]
+    _assert_swap_failed(tg, portal, cart_text="i varukorgen: Mann Oljefilter W712 x2")
+    assert "Inte försökt: Luftfilter" in tg["sent"][0]
+
+
+def test_restage_partial_add_says_which_parts_are_in_the_cart(tg):
+    record = _staged_for_swap(tg)
+
+    class OneFails(FakePortal):
+        def add_to_cart(self, candidate, qty):
+            if candidate["url_or_id"] == "p2":
+                self._record("add_to_cart", "p2", qty)
+                raise RuntimeError("add broke")
+            super().add_to_cart(candidate, qty)
+
+    portal = OneFails(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert _restage(record, portal) in ("blocked", "failed")
+
+    _assert_swap_failed(tg, portal, cart_text="i varukorgen: Mann Oljefilter W712 x2")
+    text = tg["sent"][0]
+    assert "Bytet misslyckades" in text and "Kunde inte läggas till: Luftfilter" in text
+    assert parts_order.SWAP_FAILED not in text
+
+
+def test_swapped_line_shows_the_live_cart_unit_price(tg):
+    # M-4: the stored alternative said 200.00; the cart says 210.00 per unit.
+    record = _staged_for_swap(tg)
+    portal = UnitPortal(live={"p3": 210.0},
+                        catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert _restage(record, portal) == "pending"
+
+    rec = orders_state.get("B1")
+    assert rec["plan"]["parts"][0]["price_sek"] == 210.0
+    assert rec["plan"]["total_sek"] == 670.0
+    text, _ = tg["buttons"][0]
+    assert "- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 210.00 SEK\n" in text
+
+
+def test_swapped_line_falls_back_to_the_stored_price_without_a_live_line(tg):
+    record = _staged_for_swap(tg)
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT},
+                        cart=_cart(650.0, [{"title": "Mann Oljefilter W712", "qty": 2},
+                                           {"title": "Bosch Luftfilter S0123", "qty": 1}]))
+
+    assert _restage(record, portal) == "pending"
+
+    assert orders_state.get("B1")["plan"]["parts"][0]["price_sek"] == 200.0
+
+
+def test_swapped_line_stock_note_follows_live_stock_info(tg):
+    record = _staged_for_swap(tg)
+    plan = record["plan"]
+    plan["parts"][0]["alternative"]["in_stock"] = False
+    orders_state.put("B1", "attempted", plan=plan)
+    lines = [{"title": "Mann Oljefilter W712", "qty": 2, "url_or_id": "p3", "price_sek": 200.0,
+              "in_stock": True},
+             {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2",
+              "price_sek": 250.0}]
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT},
+                        cart=_cart(650.0, lines))
+
+    assert _restage(record, portal) == "pending"
+
+    text, _ = tg["buttons"][0]
+    assert "OBS: 0 i lager" not in text
+    assert orders_state.get("B1")["plan"]["parts"][0]["in_stock"] is True
+
+
+def test_swapped_line_keeps_the_stored_out_of_stock_note_without_live_info(tg):
+    record = _staged_for_swap(tg)
+    plan = record["plan"]
+    plan["parts"][0]["alternative"]["in_stock"] = False
+    orders_state.put("B1", "attempted", plan=plan)
+    portal = UnitPortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT})
+
+    assert _restage(record, portal) == "pending"
+
+    text, _ = tg["buttons"][0]
+    assert "- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 200.00 SEK – OBS: 0 i lager" in text
+
+
+def test_swap_message_points_to_the_booking_for_the_customer(tg):
+    # M-5: the customer name is not stored, so the line points to the booking.
+    record = _staged_for_swap(tg)
+
+    assert _restage(record, UnitPortal(catalogue={"Oljefilter": [OOS, MANN],
+                                                  "Luftfilter": LUFT})) == "pending"
+
+    text, _ = tg["buttons"][0]
+    assert "\nKund: se bokning OLRD-0001\n" in text
+    assert "Kund: –" not in text
+
+
+def test_alternative_placement_is_stored_clean_and_only_when_present():
+    from parts_order_helpers import alternative_entry
+    base = {"title": "Mann X", "brand": "Mann", "price_sek": 1.0, "url_or_id": "x"}
+    assert "placement" not in alternative_entry(base)
+    assert "placement" not in alternative_entry({**base, "placement": "  "})
+    assert alternative_entry({**base, "placement": " Fram\naxel​ "})["placement"] == "Fram axel"
+    assert len(alternative_entry({**base, "placement": "F" * 500})["placement"]) == 80

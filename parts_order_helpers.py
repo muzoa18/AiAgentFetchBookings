@@ -6,6 +6,7 @@ No I/O. Every check returns a short Swedish problem string, or None when OK.
 """
 
 import math
+import unicodedata
 from collections import Counter
 
 from parts_matcher import has_non_latin, is_fluid, is_forbidden
@@ -185,17 +186,36 @@ def order_body(parts: list[dict], total, fluids: list[dict], notes: bool = True)
 
 
 # Exactly the candidate fields stored for an alternative: what PartsPortal.add_to_cart reads
-# (url_or_id, and search_term to bring its result page back), what the message shows, and
-# article_nr. Never page text or anything else the search result carried.
+# (url_or_id, and search_term to bring its result page back), what the message shows,
+# article_nr, and the shop's placement (axle/side): a swap re-runs the placement filter on
+# the stored alternative, and the axle is often only in that field, not in the title.
+# Never page text or anything else the search result carried.
 ALTERNATIVE_FIELDS = ("title", "brand", "price_sek", "url_or_id", "in_stock", "search_term",
-                      "article_nr")
+                      "article_nr", "placement")
+_OPTIONAL_ALT_FIELDS = ("search_term", "article_nr", "placement")
+PLACEMENT_MAX = 80
+
+
+def clean_placement(value) -> str | None:
+    """The shop's placement text made safe to store: a string, control/format characters
+    removed, single spaces, at most PLACEMENT_MAX characters; None when empty."""
+    if not isinstance(value, str):
+        return None
+    kept = "".join(" " if unicodedata.category(c) == "Cc" else c for c in value
+                   if unicodedata.category(c) != "Cf")
+    return " ".join(kept.split())[:PLACEMENT_MAX] or None
 
 
 def alternative_entry(alt: dict) -> dict:
-    """The stored plan["parts"][i]["alternative"]: ALTERNATIVE_FIELDS (search_term and
-    article_nr only when present) plus the matcher's alt_reason and saving_sek."""
+    """The stored plan["parts"][i]["alternative"]: ALTERNATIVE_FIELDS (search_term,
+    article_nr and placement only when present) plus the matcher's alt_reason and
+    saving_sek."""
     entry = {k: alt.get(k) for k in ALTERNATIVE_FIELDS
-             if k not in ("search_term", "article_nr") or alt.get(k) is not None}
+             if k not in _OPTIONAL_ALT_FIELDS or alt.get(k) is not None}
+    placement = clean_placement(alt.get("placement"))
+    entry.pop("placement", None)
+    if placement is not None:
+        entry["placement"] = placement
     entry["alt_reason"] = alt.get("alt_reason")
     entry["saving_sek"] = alt.get("saving_sek")
     return entry
@@ -247,7 +267,7 @@ def build_summary(booking: dict, cart: dict, fluids: list[dict], parts: list[dic
     alt = alternative_lines(parts) if alternatives else []
     return "\n".join([
         f"Delbeställning {label}",
-        f"Kund: {booking.get('driver_name') or '–'}",
+        f"Kund: {booking.get('driver_name') or booking.get('customer_line') or '–'}",
         f"Fordon: {reg} {booking.get('vehicle') or ''}".rstrip(),
     ] + order_body(parts, cart.get("total_sek"), fluids, notes=notes)
         + ([""] + alt if alt else []))

@@ -267,6 +267,8 @@ def _swap(config, session, booking_id, record, line_index, rules, cb) -> tuple[i
     """
     import notifier
     import parts_order
+    # The swap's own budget, cart clear included (it must fit in the approve step).
+    deadline = parts_order._clock() + parts_order.SWAP_BUDGET_S
     problem = parts_order.swap_problem(record, line_index, rules)
     if problem:
         log.info("Swap of %s line %r refused: %s.", booking_id, line_index, problem)
@@ -300,7 +302,7 @@ def _swap(config, session, booking_id, record, line_index, rules, cb) -> tuple[i
             != "pending"
     status = parts_order.restage_with_pins(
         config, portal, booking, {line_index: parts[line_index]["alternative"]}, rules,
-        _no_picker, keep=keep)
+        _no_picker, keep=keep, deadline=deadline)
     log.info("Swap of %s line %d: %s.", booking_id, line_index, status)
     return 1, status != "pending"
 
