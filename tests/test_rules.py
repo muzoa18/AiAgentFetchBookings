@@ -114,3 +114,24 @@ def test_max_alternatives_zero_allowed(tmp_path):
 def test_invalid_new_values_rejected_by_name(tmp_path, key, value):
     with pytest.raises(ValueError, match=key):
         load_rules(write_rules(tmp_path, **{key: value}))
+
+
+@pytest.mark.parametrize("value", [".inf", "-.inf", ".nan", ".NaN", ".Inf"])
+def test_non_finite_expensive_ratio_rejected_by_name(tmp_path, value):
+    with pytest.raises(ValueError, match="expensive_ratio"):
+        load_rules(write_rules(tmp_path, expensive_ratio=value))
+
+
+@pytest.mark.parametrize("mapping", [
+    "{Oljefilter: [Mann], oljefilter: [Bosch]}",
+    "{Oljefilter: [Mann], ' OLJEFILTER ': [Bosch]}",
+    "{'Oljefilter ': [Mann], Oljefilter: [Bosch]}",
+])
+def test_duplicate_part_keys_rejected_by_name(tmp_path, mapping):
+    with pytest.raises(ValueError, match="brand_prefer_by_part.*oljefilter"):
+        load_rules(write_rules(tmp_path, brand_prefer_by_part=mapping))
+
+
+def test_part_keys_and_brands_stored_stripped(tmp_path):
+    path = write_rules(tmp_path, brand_prefer_by_part="{' Oljefilter ': [' Mann ', 'Bosch  ']}")
+    assert load_rules(path).brand_prefer_by_part == (("Oljefilter", ("Mann", "Bosch")),)

@@ -1,4 +1,5 @@
 """Loads the owner-editable parts-ordering rules (parts_rules.yaml). Fails closed."""
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,14 +36,18 @@ def _by_part(value) -> tuple[tuple[str, tuple[str, ...]], ...]:
     key = "brand_prefer_by_part"
     if not isinstance(value, dict):
         raise ValueError(f"{key} must be a mapping of part word -> list of brand names")
-    out = []
+    out, seen = [], set()
     for part, brands in value.items():
         if not isinstance(part, str) or not part.strip():
             raise ValueError(f"{key}: part names must be non-empty strings, got {part!r}")
         if (not isinstance(brands, list)
                 or not all(isinstance(b, str) and b.strip() for b in brands)):
             raise ValueError(f"{key}: '{part}' must be a list of non-empty brand names")
-        out.append((part, tuple(brands)))
+        folded = part.strip().casefold()
+        if folded in seen:
+            raise ValueError(f"{key}: part '{folded}' is listed more than once")
+        seen.add(folded)
+        out.append((part.strip(), tuple(b.strip() for b in brands)))
     return tuple(out)
 
 
@@ -64,7 +69,8 @@ def load_rules(path: Path = Path("parts_rules.yaml")) -> Rules:
     if not isinstance(prefer_in_stock, bool):
         raise ValueError(f"prefer_in_stock must be true or false, got {prefer_in_stock!r}")
     ratio = data.get("expensive_ratio", 1.5)
-    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not ratio > 1:
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) \
+            or not ratio > 1:
         raise ValueError(f"expensive_ratio must be a number greater than 1, got {ratio!r}")
     min_diff = data.get("expensive_min_diff_sek", 100)
     if not _is_int(min_diff) or min_diff < 0:
