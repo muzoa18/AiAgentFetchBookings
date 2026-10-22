@@ -252,6 +252,16 @@ def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
     return sorted(allowed, key=lambda c: _brand_rank(c, rules))  # stable, new list
 
 
+def allowed_for_line(line_name, candidates: list[dict], rules: Rules) -> list[dict]:
+    """The candidates the matcher may choose from for this booking line: rank_candidates()
+    (no forbidden brand, fluid or non-Latin text) then the placement filter. [] for a fluid
+    or non-Latin line name. Used to re-validate a stored part (a swap) exactly like a
+    fresh match; on a one-element list it says whether that one candidate is allowed."""
+    if is_fluid(line_name or "") or has_non_latin(line_name):
+        return []
+    return _placement_filter(line_name, rank_candidates(candidates, rules))
+
+
 def _pick(line: dict, ranked: list[dict], picker) -> dict | None:
     """One picker call on `ranked`; the chosen candidate, or None unless valid and confident."""
     try:

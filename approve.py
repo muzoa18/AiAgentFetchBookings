@@ -18,6 +18,13 @@ parts_order.execute_order then re-checks the live cart against the plan and
 the ceiling before checkout, and records "attempted" first, so a crash is
 never re-ordered (agent.py's start-of-run sweep reports it).
 
+A "Byt <part>" tap (swap:<id>:<line>) gets the same owner, message id, "pending" and
+age checks, at most two swaps per booking and a line with a stored alternative
+(parts_order.swap_problem). It empties the vehicle's cart, withdraws the old approval
+message and restages the same booking with that alternative pinned and the other lines
+as staged (parts_order.restage_with_pins): a new approval message, or a truthful
+"Bytet misslyckades" with the record no longer pending. A swap never orders.
+
 After the taps, the order checker (_verify_orders) looks for every placed order that is
 not verified yet in pro.meca.se Orderöversikt -> "Skickade Beställningar" (read-only;
 the row appears there some time after the order) and matches it by car model, date and
@@ -64,6 +71,8 @@ NOT_VERIFIED_TEXT = ("Kunde inte verifiera beställningen för {label} i Skickad
 CART_CLEARED = "Varukorgen är tömd."
 CART_MANUAL = "Varukorgen kunde inte tömmas – töm varukorgen på pro.meca.se för hand."
 CART_LEFT = "Varukorgen på pro.meca.se innehåller fortfarande delarna – töm varukorgen för hand."
+SWAP_REFUSED = "Bytet är inte längre möjligt."
+SWAP_INDEX_DIGITS = 3  # "swap:<id>:<n>": n is 0-999, plain ASCII digits, no sign or leading 0
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -78,15 +87,23 @@ def _is_int(value) -> bool:
 
 
 def _parse(data):
-    """'approve:<id>' / 'cancel:<id>' / 'klar:<id>' -> (action, id); anything else -> None."""
+    """'approve:<id>' / 'cancel:<id>' / 'klar:<id>' -> (action, id); 'swap:<id>:<n>' ->
+    ("swap", id, n) (rpartition: a booking id may contain ':'); anything else -> None."""
     if not isinstance(data, str):
         return None
     action, sep, booking_id = data.partition(":")
-    if not sep or action not in ("approve", "cancel", "klar"):
+    if not sep or action not in ("approve", "cancel", "klar", "swap"):
         return None
+    index = None
+    if action == "swap":
+        booking_id, sep, digits = booking_id.rpartition(":")
+        if (not sep or not digits.isascii() or not digits.isdigit()
+                or len(digits) > SWAP_INDEX_DIGITS or (digits != "0" and digits[0] == "0")):
+            return None
+        index = int(digits)
     if not booking_id or booking_id != booking_id.strip() or any(c.isspace() for c in booking_id):
         return None
-    return action, booking_id
+    return (action, booking_id) if index is None else (action, booking_id, index)
 
 
 def _from_owner(update: dict, owner: str) -> bool:
@@ -238,6 +255,61 @@ def _cancel(config, session, booking_id, record, cb) -> bool:
     return False
 
 
+def _swap(config, session, booking_id, record, line_index, rules, cb) -> tuple[int, bool]:
+    """The owner tapped "Byt <part>" on the current approval message (owner, message id,
+    'pending' and age already checked): swap that line to its stored alternative.
+
+    (actions taken, run must exit 1). Refused (nothing changes) when parts_order.swap_problem
+    says so. Otherwise: empty the vehicle's cart (a failure stops here and leaves the old
+    approval valid: execute_order re-checks the cart anyway), withdraw the old message,
+    count the swap, and restage with the alternative pinned and the other lines as staged.
+    restage_with_pins sends the new approval message or the SWAP_FAILED text. Never orders.
+    """
+    import notifier
+    import parts_order
+    problem = parts_order.swap_problem(record, line_index, rules)
+    if problem:
+        log.info("Swap of %s line %r refused: %s.", booking_id, line_index, problem)
+        notifier.answer_callback(config, cb, SWAP_REFUSED)
+        return 0, False
+    label = _label(booking_id, record)
+    plan = record["plan"]
+    notifier.answer_callback(config, cb, "Byter…")
+    if not _clear_cart(session, plan["reg_nr"]):
+        log.error("Swap of %s stopped: the cart could not be emptied.", booking_id)
+        if not notifier.send_message(config, f"Bytet för {label} gick inte: {CART_MANUAL}"):
+            log.error("Swap failure message for %s was not delivered.", booking_id)
+        return 1, True
+    notifier.clear_buttons(config, record["message_id"])
+    booking = parts_order.swap_booking(booking_id, record)
+    try:
+        # Not "pending" from here on: the old message is withdrawn and its cart is gone.
+        orders_state.put(booking_id, "attempted")
+        orders_state.update_fields(booking_id, swaps=record.get("swaps", 0) + 1,
+                                   cart_touched=True)
+    except Exception:
+        log.exception("Could not record the swap of %s.", booking_id)
+        notifier.send_message(config, f"Byte för {label}: {parts_order.SWAP_FAILED}.")
+        raise
+    parts = plan["parts"]
+    keep = {i: part for i, part in enumerate(parts) if i != line_index}
+    try:
+        portal = session.get()
+    except Exception:  # already logged by _Portal (it was open a moment ago)
+        return 1, parts_order.swap_failed(config, booking, "kunde inte öppna pro.meca.se") \
+            != "pending"
+    status = parts_order.restage_with_pins(
+        config, portal, booking, {line_index: parts[line_index]["alternative"]}, rules,
+        _no_picker, keep=keep)
+    log.info("Swap of %s line %d: %s.", booking_id, line_index, status)
+    return 1, status != "pending"
+
+
+def _no_picker(line, ranked):
+    """A swap keeps every other line as staged; nothing is ever chosen anew."""
+    return 0, 0.0
+
+
 def mark_handled(config: dict, detail_url: str):
     """Press Hanterad -> Bekräfta for one booking (True / False / None = no button)."""
     from portal_scraper import mark_booking_handled  # lazy: Playwright
@@ -318,12 +390,12 @@ def _handle_one(config, session, rules, update, owner: str, mark=None) -> tuple[
     if parsed is None:
         notifier.answer_callback(config, cb, "Okänd åtgärd.")
         return 0, False
-    action, booking_id = parsed
+    action, booking_id = parsed[0], parsed[1]
     record = orders_state.get(booking_id)
     if record is None:
         notifier.answer_callback(config, cb, "Okänd bokning.")
         return 0, False
-    # Approve/Cancel live on the approval message, Klar on the latest resolution message.
+    # Approve/Cancel/Swap live on the approval message, Klar on the latest resolution message.
     stored = record.get("klar_message_id" if action == "klar" else "message_id")
     if not _is_int(stored) or not _is_int(update.get("message_id")) \
             or update.get("message_id") != stored:
@@ -338,6 +410,11 @@ def _handle_one(config, session, rules, update, owner: str, mark=None) -> tuple[
         return 1, _cancel(config, session, booking_id, record, cb)
     if _too_old(record, datetime.now(timezone.utc)):
         notifier.answer_callback(config, cb, "Godkännandet har gått ut.")
+        return 0, False
+    if action == "swap":
+        return _swap(config, session, booking_id, record, parsed[2], rules, cb)
+    if action != "approve":
+        notifier.answer_callback(config, cb, "Okänd åtgärd.")
         return 0, False
     return 1, _approve(config, session, booking_id, record, rules, cb)
 

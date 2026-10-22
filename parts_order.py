@@ -38,6 +38,7 @@ the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
 
 import dataclasses
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -45,11 +46,13 @@ import notifier
 import orders_state
 from logsafe import describe
 from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text, row_date
-from parts_matcher import choose_with_alternatives, is_fluid, search_terms
+from parts_matcher import (Choice, allowed_for_line, choose_with_alternatives, is_fluid,
+                           search_terms)
 from parts_portal_parse import PartsPortalError
-from parts_order_helpers import (alternative_entry, build_summary, cart_problem, clean_fluids,
-                                 error_code, is_transient, order_body, owner_reason, parse_qty,
-                                 prepare_section, reference_line, replaced_entry, total_problem)
+from parts_order_helpers import (ALTERNATIVE_FIELDS, alternative_entry, build_summary,
+                                 cart_problem, clean_fluids, error_code, is_transient,
+                                 order_body, owner_reason, parse_qty, prepare_section,
+                                 reference_line, replaced_entry, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -80,7 +83,7 @@ STOP_CODES = ("vehicle_lost", "login")
 # most 64 bytes of callback data; a button that would not fit is left out (the alternative
 # text stays). No swap buttons once a booking has been swapped MAX_SWAPS times.
 CALLBACK_DATA_LIMIT = 64
-MAX_SWAPS = 2
+MAX_SWAPS = orders_state.MAX_SWAPS
 SWAP_LABEL_CHARS = 20
 
 # Approval text length guard: Telegram refuses a message over 4096 characters, and the
@@ -88,6 +91,11 @@ SWAP_LABEL_CHARS = 20
 # block and the swap rows go first, then the "Bytt från" notes (_approval_message).
 APPROVAL_SUFFIX = "\n\nGodkänn för att beställa."
 APPROVAL_TEXT_MAX = 4000
+
+# One-tap swap (approve.py -> restage_with_pins). The owner's cart was emptied before the
+# restage, so any problem after that leaves the cart empty or partly filled.
+SWAP_FAILED = ("Bytet misslyckades – varukorgen är tömd eller delvis fylld, "
+               "kontrollera pro.meca.se")
 
 # Duplicate-order guard: a sent order for the vehicle this recent blocks staging. The
 # reason starts with orders_state.NO_RESTAGE_REASONS, so it is never retried quietly.
@@ -366,11 +374,17 @@ def _existing_sent_order(portal, booking: dict, now: datetime) -> dict | None:
     return found[0] if found else None
 
 
-def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
+def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
+           pins: dict | None = None, keep: dict | None = None) -> str:
+    """Stage one booking. With `pins` (a swap, restage_with_pins) those line indexes use the
+    pinned candidate (no search, re-validated), lines in `keep` must be found again as
+    staged, every block uses SWAP_FAILED, and the result is always an approval message:
+    a swap never orders, whatever rules.mode says."""
+    swap = pins is not None
     booking_id, label = booking["id"], _label(booking)
     record = orders_state.get(booking_id) or {}
     # A quiet retry (orders_state.restage) remembers the reason the last attempt blocked.
-    quiet_reason = record.get("last_reason") if record.get("tries") else None
+    quiet_reason = record.get("last_reason") if record.get("tries") and not swap else None
     fields = {} if record.get("cart_touched") is True else {"cart_touched": False}
     detail_url = booking.get("detail_url")
     if isinstance(detail_url, str) and detail_url.strip():
@@ -387,6 +401,8 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
         return _clock() > deadline
 
     def block(reason: str, **kw) -> str:
+        if swap:  # the cart was emptied for the swap: never quiet, never re-staged
+            return swap_failed(config, booking, reason)
         return _block(config, booking, reason, fluids, quiet_reason=quiet_reason, **kw)
 
     if not order_lines:
@@ -425,13 +441,24 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     match_rules = (dataclasses.replace(rules, prefer_in_stock=False, max_alternatives=0)
                    if rules.mode == "auto" else rules)
     matched, choices = [], []
-    for line, name, qty in wanted:  # match everything before adding anything
+    for i, (line, name, qty) in enumerate(wanted):  # match everything before adding anything
+        if swap and i in pins:  # the owner's swap: the stored alternative, no search
+            candidate = pin_candidate(pins[i])
+            if pin_problem(name, candidate, rules):
+                return block(f"alternativet för '{name}' är inte tillåtet")
+            matched.append((name, candidate, qty))
+            choices.append(Choice(candidate))
+            continue
+        staged = (keep or {}).get(i) if swap else None
         choice = None
         for term in search_terms(name):  # synonyms first, then the normalised term, the original last
             if out_of_time():  # nothing is in the cart yet: retried quietly (transient)
                 raise PartsPortalError(f"staging {booking_id} took longer than "
                                        f"{STAGE_BUDGET_S} s", "search_timeout")
-            choice = choose_with_alternatives(line, portal.search(term), match_rules, picker)
+            if staged is not None:  # a swap keeps the other lines exactly as staged
+                choice = _find_staged(name, staged, portal.search(term), rules)
+            else:
+                choice = choose_with_alternatives(line, portal.search(term), match_rules, picker)
             if choice.chosen is not None:
                 break
         if choice is None or choice.chosen is None:
@@ -500,20 +527,26 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
         "fluids": fluids,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    orders_state.put(booking_id, "pending", plan=plan)
-
-    if rules.mode == "auto":
-        return execute_order(config, portal, booking_id, plan, rules)
-    if rules.mode != "approve":
-        raise ValueError(f"unknown rules mode {rules.mode!r}")
+    if swap:
+        # Not "pending" until the new message is out: the old approval message must never
+        # approve the new cart (a crash here is reported by agent.py's stale sweep).
+        orders_state.put(booking_id, "attempted", plan=plan)
+    else:
+        orders_state.put(booking_id, "pending", plan=plan)
+        if rules.mode == "auto":
+            return execute_order(config, portal, booking_id, plan, rules)
+        if rules.mode != "approve":
+            raise ValueError(f"unknown rules mode {rules.mode!r}")
 
     text, buttons = _approval_message(booking_id, booking, cart, fluids, parts,
                                       record.get("swaps"))
     message_id = notifier.send_with_buttons(config, text, buttons)
     if message_id is None:
+        if swap:
+            return block("godkännandemeddelandet kunde inte skickas")
         return _fail(config, booking_id, label,
                      "godkännandemeddelandet kunde inte skickas (varukorgen är fylld)")
-    orders_state.put(booking_id, "pending", message_id=message_id)
+    orders_state.put(booking_id, "pending", plan=plan, message_id=message_id)
     return "pending"
 
 
@@ -559,6 +592,153 @@ def _swap_buttons(booking_id: str, parts: list[dict], swaps) -> list[list[tuple]
         name = str(part.get("name") or part.get("title") or "").strip()
         rows.append([(f"Byt {name[:SWAP_LABEL_CHARS]}", data)])
     return rows
+
+
+# ── Swap (the owner's one-tap swap, approve.py) ──────────────────────────────
+
+def swap_booking(booking_id: str, record: dict) -> dict:
+    """The booking dict restage_with_pins needs, rebuilt from the stored record and plan
+    (no MECA scrape). It holds no customer data, so the new approval text says "Kund: –"."""
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    return {"id": booking_id, "booking_nr": plan.get("booking_nr"),
+            "reg_nr": plan.get("reg_nr"),
+            "parts": [{"name": p.get("name"), "qty": p.get("qty")}
+                      for p in plan.get("parts") or [] if isinstance(p, dict)],
+            "fluids": list(plan.get("fluids") or []),
+            "detail_url": record.get("detail_url"), "vehicle": record.get("vehicle_model")}
+
+
+def pin_candidate(alternative: dict) -> dict:
+    """The stored alternative as a candidate to add (ALTERNATIVE_FIELDS only: url_or_id and
+    search_term are what PartsPortal.add_to_cart reads)."""
+    return {k: alternative[k] for k in ALTERNATIVE_FIELDS if k in alternative}
+
+
+def pin_problem(line_name: str, candidate: dict, rules: Rules) -> bool:
+    """True if the matcher would not allow `candidate` for this line today: the same
+    rank_candidates() + placement filter (parts_matcher.allowed_for_line) on a one-element
+    list, plus a usable url_or_id."""
+    if not str(candidate.get("url_or_id") or "").strip():
+        return True
+    return allowed_for_line(line_name, [candidate], rules) != [candidate]
+
+
+def _price(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
+
+
+def swap_problem(record: dict, index, rules: Rules) -> str | None:
+    """Why the stored plan's line `index` cannot be swapped to its alternative now (a short
+    Swedish reason for the log), or None. Checked BEFORE the cart is touched: the swap
+    count, the line and its alternative, the matcher's filters on the alternative, and an
+    estimate of the new total against the ceiling (the real cart total is checked again
+    after the restage)."""
+    swaps = record.get("swaps", 0)
+    if type(swaps) is not int or not 0 <= swaps < MAX_SWAPS:
+        return f"högst {MAX_SWAPS} byten"
+    plan = record.get("plan")
+    parts = plan.get("parts") if isinstance(plan, dict) else None
+    if not isinstance(parts, list) or not all(isinstance(p, dict) for p in parts):
+        return "planen saknar delar"
+    if not isinstance(plan.get("reg_nr"), str) or not plan["reg_nr"].strip():
+        return "registreringsnummer saknas"  # never clear "the loaded vehicle's" cart
+    if type(index) is not int or not 0 <= index < len(parts):
+        return "ingen sådan rad"
+    part = parts[index]
+    alt = part.get("alternative")
+    if not isinstance(alt, dict):
+        return "inget alternativ för raden"
+    name = str(part.get("name") or "").strip()
+    if not name or any(is_fluid(str(p.get("name") or "")) for p in parts):
+        return "raden kan inte bytas"  # the line indexes would not match a restage
+    if pin_problem(name, pin_candidate(alt), rules):
+        return f"alternativet för '{name}' är inte tillåtet"
+    total, old, new = _price(plan.get("total_sek")), _price(part.get("price_sek")), \
+        _price(alt.get("price_sek"))
+    qty = parse_qty(part.get("qty"))
+    if None not in (total, old, new, qty) and total - old * qty + new * qty > rules.ceiling_sek:
+        return f"bytet skulle överstiga taket {rules.ceiling_sek} SEK"
+    return None
+
+
+def _pins_problem(booking: dict, pins) -> str | None:
+    """The pins must be the stored plan's own alternatives, for lines of that same plan."""
+    record = orders_state.get(booking.get("id")) or {}
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    parts = plan.get("parts") if isinstance(plan.get("parts"), list) else []
+    names = [str(line.get("name") or "").strip() for line in booking.get("parts") or []]
+    if not parts or names != [str((p or {}).get("name") or "").strip() for p in parts] \
+            or len(split_lines(booking)[0]) != len(parts):
+        return "bokningen stämmer inte med den förberedda planen"
+    if not isinstance(pins, dict) or not pins:
+        return "inget alternativ valt"
+    for i, pin in pins.items():
+        if type(i) is not int or not 0 <= i < len(parts) or not isinstance(pin, dict) \
+                or parts[i].get("alternative") != pin:
+            return "bytet stämmer inte med det föreslagna alternativet"
+    return None
+
+
+def _find_staged(line_name: str, staged: dict, results: list[dict], rules: Rules) -> Choice:
+    """A swap's other line: the staged part (same url_or_id) among fresh search results
+    that pass the matcher's filters, with its stored alternative and replacement note.
+    Choice(None) if it is not there: never re-chosen silently."""
+    sku = staged.get("url_or_id")
+    if sku:
+        for cand in allowed_for_line(line_name, results, rules):
+            if cand.get("url_or_id") == sku:
+                alt, replaced = staged.get("alternative"), staged.get("replaced_from")
+                return Choice(cand, (alt,) if isinstance(alt, dict) else (),
+                              replaced if isinstance(replaced, dict) else None)
+    return Choice(None)
+
+
+def swap_failed(config: dict, booking: dict, reason: str) -> str:
+    """End a swap after the cart was emptied: 'blocked' with cart_touched (never re-staged),
+    the SWAP_FAILED text with a Klar button. 'failed' if that message is not delivered."""
+    try:
+        orders_state.update_fields(booking["id"], cart_touched=True)
+    except Exception:
+        log.exception("Could not flag cart_touched for %s.", booking.get("id"))
+    fluids = split_lines(booking)[1]
+    text = "\n".join([f"Byte för {_label(booking)}: {SWAP_FAILED}.",
+                      f"Orsak: {reason}. Inget beställdes – beställ för hand."]
+                     + prepare_section(fluids))
+    return _block(config, booking, reason, fluids, cart_touched=True, text=text)
+
+
+def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict],
+                      rules: Rules, picker, keep: dict[int, dict] | None = None) -> str:
+    """Stage `booking` again after a swap emptied its cart: the _stage flow with `pins`
+    ({line index: the stored alternative}) used instead of searching for those lines.
+
+    Every pin must be the alternative stored in the record's current plan, and is
+    re-validated with the matcher's filters (pin_problem). `keep` ({line index: stored plan
+    part}) keeps those lines exactly as staged (found again in a fresh search, re-validated;
+    never re-chosen); other lines are matched normally with `picker`. Then, as _stage:
+    empty-cart check, add, cart verification against the new expected lines, the ceiling,
+    and a new approval message (fresh message id) before the record is 'pending' again.
+    Never checks out. Any problem: swap_failed. Returns pending | blocked | failed; no
+    exception leaves this function."""
+    booking_id, label = booking.get("id"), _label(booking)
+    try:
+        orders_state.update_fields(booking_id, cart_touched=True)
+        problem = _pins_problem(booking, pins)
+        if problem:
+            log.error("Swap restage for %s refused: %s.", booking_id, problem)
+            return swap_failed(config, booking, problem)
+        return _stage(config, booking, portal, rules, picker, pins=dict(pins), keep=keep)
+    except Exception as e:
+        log.error("Swap restage failed for %s: %s", booking_id, describe(e))
+        log.debug("Traceback", exc_info=True)
+        try:
+            return swap_failed(config, booking, owner_reason(e))
+        except Exception:
+            log.exception("Could not record the failed swap for %s", booking_id)
+            return _fail(config, booking_id, label, owner_reason(e))
 
 
 def _partial_text(label: str, added: list, not_added: list, partly: list, untried: list,

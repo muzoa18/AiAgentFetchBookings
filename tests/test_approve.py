@@ -1623,3 +1623,384 @@ def test_main_resolves_the_state_alert_when_the_state_is_readable(monkeypatch, r
 
     assert approve.main([]) == 0   # nothing pending: stops early, after the guard
     assert alerts.active() == []
+
+
+# ── Package 2 task 4: one-tap swap ───────────────────────────────────────────
+
+P1 = {"title": "Bosch Oljefilter P7001", "brand": "Bosch", "price_sek": 120.0,
+      "url_or_id": "p1", "in_stock": False, "search_term": "Oljefilter"}
+P2 = {"title": "Bosch Luftfilter S0123", "brand": "Bosch", "price_sek": 250.0,
+      "url_or_id": "p2", "in_stock": True, "search_term": "Luftfilter"}
+P3 = {"title": "Mann Oljefilter W712", "brand": "Mann", "price_sek": 200.0,
+      "url_or_id": "p3", "in_stock": True, "search_term": "Oljefilter"}
+SWAP_CATALOGUE = {"Oljefilter": [P1, P3], "Luftfilter": [P2]}
+P3_ALT = {**P3, "alt_reason": "slut", "saving_sek": 0}
+
+
+def swap_plan(booking_id="B1", alternative=P3_ALT, total=490.0):
+    oil = {"name": "Oljefilter", "title": P1["title"], "brand": "Bosch", "price_sek": 120.0,
+           "qty": 2, "url_or_id": "p1", "in_stock": False}
+    if alternative is not None:
+        oil["alternative"] = dict(alternative)
+    return {"booking_id": booking_id, "booking_nr": "OLRD-0001", "reg_nr": "TST001",
+            "parts": [oil, {"name": "Luftfilter", "title": P2["title"], "brand": "Bosch",
+                            "price_sek": 250.0, "qty": 1, "url_or_id": "p2", "in_stock": True}],
+            "expected_lines": [{"title": P1["title"], "qty": 2, "url_or_id": "p1"},
+                               {"title": P2["title"], "qty": 1, "url_or_id": "p2"}],
+            "total_sek": total, "fluids": [], "created_at": T0.isoformat()}
+
+
+def stage_swap(booking_id="B1", message_id=77, swaps=None, updated_at=None, **plan_kw):
+    orders_state.put(booking_id, "pending", plan=swap_plan(booking_id, **plan_kw),
+                     message_id=message_id)
+    fields = {"cart_touched": True, "detail_url": "https://meca.example/b/1",
+              "vehicle_model": "VOLKSWAGEN PASSAT"}
+    if swaps is not None:
+        fields["swaps"] = swaps
+    orders_state.update_fields(booking_id, **fields)
+    if updated_at is not None:
+        data = json.loads(orders_state.ORDERS_FILE.read_text(encoding="utf-8"))
+        data["bookings"][booking_id]["updated_at"] = updated_at.isoformat()
+        orders_state.ORDERS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+class SwapPortal:
+    """pro.meca.se for a swap: a cart (filled as staged), search, add, clear. Records calls."""
+
+    def __init__(self, catalogue=SWAP_CATALOGUE, clear_fails=False, add_fails=()):
+        self.catalogue = catalogue
+        self.clear_fails = clear_fails
+        self.add_fails = set(add_fails)
+        self.cart = [(P1, 2), (P2, 1)]       # what the original staging left in the cart
+        self.calls, self.added = [], []
+
+    def login(self):
+        self.calls.append("login")
+
+    def list_sent_orders(self):
+        self.calls.append("list_sent_orders")
+        return []
+
+    def load_vehicle(self, reg_nr):
+        self.calls.append("load_vehicle")
+
+    def clear_cart(self, reg_nr=None):
+        self.calls.append("clear_cart")
+        if self.clear_fails:
+            raise RuntimeError("clear broke")
+        self.cart = []
+
+    def search(self, term):
+        self.calls.append(("search", term))
+        return [dict(c) for c in self.catalogue.get(term, [])]
+
+    def add_to_cart(self, candidate, qty):
+        self.calls.append(("add_to_cart", candidate["url_or_id"], qty))
+        if candidate["url_or_id"] in self.add_fails:
+            raise RuntimeError("add broke")
+        self.cart.append((candidate, qty))
+        self.added.append((candidate["url_or_id"], qty))
+
+    def read_cart(self):
+        self.calls.append("read_cart")
+        lines = [{"title": c["title"], "qty": q, "url_or_id": c["url_or_id"],
+                  "price_sek": c["price_sek"] * q} for c, q in self.cart]
+        return {"lines": lines, "total_sek": sum(x["price_sek"] for x in lines)}
+
+    def checkout(self, *, max_total_sek):
+        raise AssertionError("a swap must never check out")
+
+
+@pytest.fixture
+def tgs(tg, monkeypatch):
+    """tg, plus approval messages (any non-Klar buttons) recorded in `approvals` with ids
+    from 500 up; `approval_ok` False makes them fail."""
+    klar = notifier.send_with_buttons
+    tg.update(approvals=[], next_approval=500, approval_ok=True)
+
+    def buttons(config, text, rows):
+        flat = [b for row in rows for b in row] if isinstance(rows[0], list) else rows
+        if all(data.startswith("klar:") for _, data in flat):
+            return klar(config, text, rows)
+        if not tg["approval_ok"]:
+            return None
+        mid = tg["next_approval"]
+        tg["next_approval"] += 1
+        tg["approvals"].append((text, rows, mid))
+        return mid
+
+    monkeypatch.setattr(notifier, "send_with_buttons", buttons)
+    monkeypatch.setattr(parts_order, "execute_order",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no approve path")))
+    return tg
+
+
+def run_swap(tgs, updates, portal=None, rules_obj=APPROVE, allowed=True):
+    tgs["updates"] = updates
+    factory = PortalFactory(portal or SwapPortal(), allowed=allowed)
+    actions, problem = approve._handle(CONFIG, factory, rules_obj)
+    return actions, problem, factory
+
+
+def test_swap_restages_the_alternative_with_a_new_approval_message(tgs, orders_file):
+    stage_swap()
+    portal = SwapPortal()
+
+    actions, problem, factory = run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+
+    assert (actions, problem) == (1, False)
+    rec = orders_state.get("B1")
+    assert rec["status"] == "pending"
+    assert rec["message_id"] == 500                     # the new approval message
+    assert rec["swaps"] == 1 and rec["cart_touched"] is True
+    parts = rec["plan"]["parts"]
+    assert [p["url_or_id"] for p in parts] == ["p3", "p2"]
+    assert "alternative" not in parts[0]
+    assert parts[1] == swap_plan()["parts"][1]          # the other line is as staged
+    assert rec["plan"]["expected_lines"] == [
+        {"title": P3["title"], "qty": 2, "url_or_id": "p3"},
+        {"title": P2["title"], "qty": 1, "url_or_id": "p2"}]
+    assert rec["plan"]["total_sek"] == 650.0            # read again from the cart
+    assert portal.calls.index("clear_cart") < portal.calls.index(("add_to_cart", "p3", 2))
+    assert portal.added == [("p3", 2), ("p2", 1)]
+    assert not any(c[0] == "search" and "olje" in c[1].casefold()
+                   for c in portal.calls if isinstance(c, tuple))
+    assert tgs["cleared"] == [77]                       # old buttons gone
+    assert tgs["answers"] == [("cb1", "Byter…")]
+    (text, rows, mid), = tgs["approvals"]
+    assert mid == 500
+    assert "- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 200.00 SEK" in text
+    assert "Totalt: 650.00 SEK" in text
+    assert "Alternativ" not in text
+    assert rows == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+    assert tgs["sent"] == []
+    assert factory.opened == 1
+    assert "SECRET" not in orders_file.read_text(encoding="utf-8")
+
+
+def test_swap_rechecks_the_ceiling(tgs):
+    stage_swap()
+    rules_low = Rules(("Bosch",), ("ProMeister",), 600, "approve")
+    portal = SwapPortal()
+    # The estimate (490 - 240 + 400 = 650) is over 600: refused before the cart is touched.
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal, rules_low)
+    assert (actions, problem) == (0, False)
+    assert portal.calls == [] and orders_state.get("B1")["status"] == "pending"
+    assert tgs["answers"] == [("cb1", approve.SWAP_REFUSED)]
+
+
+def test_swap_rechecks_the_ceiling_on_the_real_cart(tgs):
+    stage_swap(total=100.0)                            # a wrong estimate: 100 - 240 + 400
+    rules_low = Rules(("Bosch",), ("ProMeister",), 600, "approve")
+    portal = SwapPortal()
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal, rules_low)
+
+    assert (actions, problem) == (1, True)
+    rec = orders_state.get("B1")
+    assert rec["status"] in ("blocked", "failed") and rec["cart_touched"] is True
+    assert "taket" in rec["plan"]["reason"]
+    assert tgs["approvals"] == []
+    assert any(parts_order.SWAP_FAILED in t for t in tgs["sent"])
+
+
+def test_swap_with_a_booking_id_containing_colons(tgs):
+    stage_swap("A:B:1")
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:A:B:1:0")])
+
+    assert (actions, problem) == (1, False)
+    rec = orders_state.get("A:B:1")
+    assert rec["swaps"] == 1 and rec["plan"]["parts"][0]["url_or_id"] == "p3"
+    (_, rows, _), = tgs["approvals"]
+    assert rows == [("Godkänn", "approve:A:B:1"), ("Avbryt", "cancel:A:B:1")]
+
+
+def _setup_status(status):
+    def setup():
+        stage_swap()
+        orders_state.put("B1", status)
+    return setup
+
+
+REFUSALS = [
+    ("wrong chat", stage_swap, {"chat_id": "99"}, None),
+    ("wrong user", stage_swap, {"user_id": "7"}, None),
+    ("stale message", stage_swap, {"message_id": 76}, "Knappen är inte längre giltig."),
+    ("blocked", _setup_status("blocked"), {}, "Redan hanterad."),
+    ("ordered", _setup_status("ordered"), {}, "Redan hanterad."),
+    ("cancelled", _setup_status("cancelled"), {}, "Redan hanterad."),
+    ("two swaps", lambda: stage_swap(swaps=2), {}, "REFUSED"),
+    ("no alternative", stage_swap, {"data": "swap:B1:1"}, "REFUSED"),
+    ("index out of range", stage_swap, {"data": "swap:B1:2"}, "REFUSED"),
+    ("expired", lambda: stage_swap(updated_at=datetime.now(timezone.utc) - timedelta(hours=49)),
+     {}, "Godkännandet har gått ut."),
+    ("unknown booking", stage_swap, {"data": "swap:B2:0"}, "Okänd bokning."),
+] + [(f"malformed {d!r}", stage_swap, {"data": d}, "Okänd åtgärd.") for d in (
+    "swap:B1", "swap:B1:", "swap:B1:x", "swap:B1:-1", "swap:B1:+1", "swap:B1: 0", "swap:B1:0 ",
+    "swap:B1:01", "swap:B1:1.0", "swap:B1:0:", "swap::0", "swap:B1:9999", "swap:B 1:0",
+    "swap:B1:٠", "swap", "swapx:B1:0")]
+
+
+@pytest.mark.parametrize("why,setup,kw,answer", REFUSALS, ids=[r[0] for r in REFUSALS])
+def test_swap_refusals_change_nothing(tgs, why, setup, kw, answer):
+    setup()
+    before = orders_state.get("B1")
+    kw = {"data": "swap:B1:0", **kw}
+    answer = approve.SWAP_REFUSED if answer == "REFUSED" else answer
+
+    actions, problem, _ = run_swap(tgs, [tap(1, **kw)], allowed=False)
+
+    assert (actions, problem) == (0, False)
+    assert orders_state.get("B1") == before
+    assert tgs["answers"] == ([] if answer is None else [("cb1", answer)])
+    assert tgs["cleared"] == [] and tgs["sent"] == [] and tgs["approvals"] == []
+
+
+@pytest.mark.parametrize("alt", [
+    {"title": "ProMeister Oljefilter", "brand": "ProMeister"},
+    {"title": "Castrol Motorolja 5W30", "brand": "Castrol"},
+    {"title": "Oljefilter Ж", "brand": "Mann"},
+])
+def test_swap_to_a_forbidden_or_fluid_alternative_is_refused(tgs, alt):
+    stage_swap(alternative={**P3_ALT, **alt})
+    before = orders_state.get("B1")
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], allowed=False)
+
+    assert (actions, problem) == (0, False)
+    assert orders_state.get("B1") == before
+    assert tgs["answers"] == [("cb1", approve.SWAP_REFUSED)]
+    assert tgs["cleared"] == [] and tgs["approvals"] == []
+
+
+def test_swap_to_an_alternative_for_the_wrong_axle_is_refused(tgs):
+    plan = swap_plan()
+    plan["parts"][0]["name"] = "Bromsskiva fram"
+    plan["parts"][0]["alternative"] = {**P3_ALT, "title": "Mann Bromsskiva bak",
+                                       "placement": "Bakaxel"}
+    orders_state.put("B1", "pending", plan=plan, message_id=77)
+    before = orders_state.get("B1")
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], allowed=False)
+
+    assert (actions, problem) == (0, False)
+    assert orders_state.get("B1") == before
+    assert tgs["answers"] == [("cb1", approve.SWAP_REFUSED)]
+
+
+def test_double_tap_on_the_old_message_does_nothing(tgs):
+    stage_swap()
+    portal = SwapPortal()
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0"), tap(2, "swap:B1:0"),
+                                         tap(3, "approve:B1")], portal)
+
+    assert (actions, problem) == (1, False)
+    rec = orders_state.get("B1")
+    assert rec["swaps"] == 1 and rec["message_id"] == 500 and rec["status"] == "pending"
+    assert portal.calls.count("clear_cart") == 1
+    assert len(tgs["approvals"]) == 1
+    assert tgs["answers"] == [("cb1", "Byter…"), ("cb2", "Knappen är inte längre giltig."),
+                              ("cb3", "Knappen är inte längre giltig.")]
+
+
+def test_second_swap_on_the_new_message_is_the_last(tgs):
+    plan = swap_plan()
+    plan["parts"][1]["alternative"] = {"title": "Mann Luftfilter C1", "brand": "Mann",
+                                       "price_sek": 150.0, "url_or_id": "p7", "in_stock": True,
+                                       "search_term": "Luftfilter", "alt_reason": "dyr",
+                                       "saving_sek": 100.0}
+    orders_state.put("B1", "pending", plan=plan, message_id=77)
+    orders_state.update_fields("B1", cart_touched=True)
+    catalogue = {**SWAP_CATALOGUE, "Luftfilter": [P2]}
+    portal = SwapPortal(catalogue=catalogue)
+
+    run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+    (_, rows, mid), = tgs["approvals"]
+    assert rows == [[("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")],
+                    [("Byt Luftfilter", "swap:B1:1")]]
+    assert orders_state.get("B1")["plan"]["parts"][1]["alternative"]["url_or_id"] == "p7"
+
+    run_swap(tgs, [tap(2, "swap:B1:1", message_id=mid)], portal)
+
+    rec = orders_state.get("B1")
+    assert rec["swaps"] == 2 and rec["status"] == "pending"
+    assert [p["url_or_id"] for p in rec["plan"]["parts"]] == ["p3", "p7"]
+    assert tgs["approvals"][1][1] == [("Godkänn", "approve:B1"), ("Avbryt", "cancel:B1")]
+    assert tgs["cleared"] == [77, 500]
+
+
+def test_cart_clear_failure_keeps_the_old_record(tgs):
+    stage_swap()
+    before = orders_state.get("B1")
+    portal = SwapPortal(clear_fails=True)
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+
+    assert problem is True
+    assert orders_state.get("B1") == before              # still pending, old message valid
+    assert portal.added == []
+    assert tgs["cleared"] == [] and tgs["approvals"] == []
+    (text,) = tgs["sent"]
+    assert approve.CART_MANUAL in text and "OLRD-0001" in text
+
+
+def test_portal_unavailable_is_a_cart_clear_failure(tgs):
+    stage_swap()
+    before = orders_state.get("B1")
+    tgs["updates"] = [tap(1, "swap:B1:0")]
+
+    actions, problem = approve._handle(CONFIG, PortalFactory(open_fails=True), APPROVE)
+
+    assert problem is True and orders_state.get("B1") == before
+    assert approve.CART_MANUAL in tgs["sent"][0]
+
+
+def test_staging_failure_after_the_clear_is_truthful_and_not_pending(tgs):
+    stage_swap()
+    portal = SwapPortal(add_fails={"p3"})
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0"), tap(2, "approve:B1")], portal)
+
+    assert problem is True
+    rec = orders_state.get("B1")
+    assert rec["status"] in ("blocked", "failed")
+    assert rec["cart_touched"] is True and rec["swaps"] == 1
+    assert orders_state.restage("B1") is False
+    assert tgs["cleared"][0] == 77                       # old buttons removed
+    assert tgs["approvals"] == []
+    assert any(parts_order.SWAP_FAILED in t and "OLRD-0001" in t for t in tgs["sent"])
+    assert tgs["answers"][1] == ("cb2", "Redan hanterad.")
+
+
+def test_new_approval_message_not_sent_is_not_pending(tgs):
+    stage_swap()
+    tgs["approval_ok"] = False
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")])
+
+    assert problem is True
+    rec = orders_state.get("B1")
+    assert rec["status"] in ("blocked", "failed") and rec["cart_touched"] is True
+    assert tgs["cleared"] == [77]
+
+
+def test_swap_never_orders_even_in_auto_mode(tgs):
+    stage_swap()
+    portal = SwapPortal()
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal,
+                                   Rules(("Bosch",), ("ProMeister",), 10000, "auto"))
+
+    assert (actions, problem) == (1, False)
+    assert orders_state.get("B1")["status"] == "pending"
+    assert len(tgs["approvals"]) == 1
+
+
+def test_parse_swap_data():
+    assert approve._parse("swap:B1:0") == ("swap", "B1", 0)
+    assert approve._parse("swap:a:b:12") == ("swap", "a:b", 12)
+    assert approve._parse("approve:a:b") == ("approve", "a:b")
+    for bad in ("swap:B1:x", "swap:B1", "swap::1", "swap:B1:-1", "swap:B1:1e3"):
+        assert approve._parse(bad) is None
