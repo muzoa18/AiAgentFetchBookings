@@ -35,7 +35,10 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      # Step timeout below the job's 15 min: a step timeout fails the step, so the
+      # alert step's failure() fires (a job timeout is a cancel instead).
       - name: Run booking agent
+        timeout-minutes: 13
         env:
           PORTAL_USERNAME:       ${{ secrets.PORTAL_USERNAME }}
           PORTAL_PASSWORD:       ${{ secrets.PORTAL_PASSWORD }}
@@ -54,12 +57,14 @@ jobs:
           WORKFLOW_NAME:      ${{ github.workflow }}
         run: python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"
 
-      # Covers failures outside our Python code (pip/playwright install, the
-      # 15 min timeout, a crash before agent.py starts). Stdlib only: nothing
-      # needs installing. Runs before the persist step so config/alerts.json is
-      # committed.
+      # Covers failures our Python code cannot report itself: a failed pip/playwright
+      # install, the 13 min step timeout above (the step fails), the 15 min job timeout
+      # (a cancel, hence cancelled(); a manual cancel alerts too) and a crash before
+      # agent.py starts. Not sent when this run already raised a more specific alert
+      # (alerts_cli suppression rule). Stdlib only: nothing needs installing. Runs
+      # before the persist step so config/alerts.json is committed.
       - name: Alert on failure
-        if: ${{ failure() }}
+        if: ${{ failure() || cancelled() }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}

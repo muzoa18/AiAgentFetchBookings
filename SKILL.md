@@ -131,9 +131,17 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   ("MECA Booking Agent" / "MECA Approval Poller"). Alert texts are fixed Swedish strings with the
   exception class name only, never the message.
 - **Workflow alert** (`alerts_cli.py workflow-failed <name>`, step "Alert on failure",
-  `if: failure()`, in bookings.yml and approve.yml): key `workflow_failed_<workflow name>`; stdlib
-  only, so it also covers a failed install, a timeout or a crash before our code starts. It runs
-  before the persist step; always exits 0.
+  `if: failure() || cancelled()`, in bookings.yml and approve.yml): key
+  `workflow_failed_<workflow name>`; stdlib only. It covers a failed install, the main step's own
+  `timeout-minutes` ("Run booking agent" 13, "Handle approvals" 8: the step fails, so `failure()`
+  fires), the job timeout (15 / 10 min: that is a cancel, hence `cancelled()`; a manual cancel
+  alerts too) and a crash before our code starts. Suppressed when this workflow's
+  `state_unreadable`, `crash_<short>` or `run_failed_<short>` is active and was last seen within
+  60 min (this run already told the owner). It runs before the persist step; always exits 0.
+- **Mark OK** (`alerts_cli.py workflow-ok <name>`, `if: success()`, after the agent/approve step and
+  before the persist step, env WORKFLOW_NAME only): resolves `workflow_failed_<name>`,
+  `run_failed_<short>`, `crash_<short>`. Needed because most approve runs stop after `--check`,
+  which runs outside `guarded`.
 - **Watchdog** (`watchdog.py`, watchdog.yml, cron `17 */6 * * *`, own concurrency group
   `meca-watchdog`): asks the GitHub API when bookings.yml and approve.yml last succeeded. Alerts
   `stale_bookings` (expected Mon-Sat 15:00 UTC) and `stale_approve` (daily 06:00 UTC) when the

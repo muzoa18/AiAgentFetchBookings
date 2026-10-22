@@ -53,8 +53,11 @@ jobs:
         if: ${{ steps.check.outputs.has_pending == 'true' }}
         run: python -m playwright install --with-deps chromium
 
+      # Step timeout below the job's 10 min: a step timeout fails the step, so the
+      # alert step's failure() fires (a job timeout is a cancel instead).
       - name: Handle approvals
         if: ${{ steps.check.outputs.has_pending == 'true' }}
+        timeout-minutes: 8
         env:
           # PORTAL_*: the MECA portal login for a Klar tap (press Hanterad, then confirm);
           # config_loader requires them anyway.
@@ -75,12 +78,14 @@ jobs:
           WORKFLOW_NAME:      ${{ github.workflow }}
         run: python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"
 
-      # Covers failures outside our Python code (pip/playwright install, the
-      # 10 min timeout, a crash before approve.py starts). Stdlib only: nothing
-      # needs installing. Runs before the persist step so config/alerts.json is
-      # committed.
+      # Covers failures our Python code cannot report itself: a failed pip/playwright
+      # install, the 8 min step timeout above (the step fails), the 10 min job timeout
+      # (a cancel, hence cancelled(); a manual cancel alerts too) and a crash before
+      # approve.py starts. Not sent when this run already raised a more specific alert
+      # (alerts_cli suppression rule). Stdlib only: nothing needs installing. Runs
+      # before the persist step so config/alerts.json is committed.
       - name: Alert on failure
-        if: ${{ failure() }}
+        if: ${{ failure() || cancelled() }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}

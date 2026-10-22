@@ -93,7 +93,7 @@ when the problem is gone.
 |---|---|---|
 | `state_unreadable` ("config/orders.json saknas" / "kan inte läsas") | The order state is missing or broken. All ordering is stopped before the portal is touched, so nothing can be ordered twice. | Restore `config/orders.json` from git history (it must be committed) and run the workflow again. |
 | `crash_<name>` / `run_failed_<name>` | `agent.py` (`booking_agent`) or `approve.py` (`approve`) crashed or ended with an error. | Open the GitHub Actions log. Fix the cause (often a portal selector) or re-run. |
-| `workflow_failed_<workflow>` | The whole GitHub workflow failed, e.g. a failed install or a timeout, possibly before our code started. | Open the run link in the message. |
+| `workflow_failed_<workflow>` | The whole GitHub workflow failed or was cancelled: a failed install, the main step's own timeout (13 min bookings / 8 min approve), the job timeout (15 / 10 min, a cancel), a manual cancel, or a crash before our code started. Not sent when the same run already sent a more specific alert (`state_unreadable`, `crash_<name>`, `run_failed_<name>`), so one fault gives one message. A later successful run clears it (step "Mark OK"). | Open the run link in the message. |
 | `stale_bookings` / `stale_approve` | The watchdog (every 6 h) found no successful booking run (Mon–Sat 15:00 UTC) or approval poll (daily 06:00 UTC) within 3 h of its slot. | Check the Actions tab; run the workflow by hand. A GitHub API error never raises this alert. |
 
 **Limit:** the watchdog is itself a scheduled workflow, so it cannot notice GitHub disabling

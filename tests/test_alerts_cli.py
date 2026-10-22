@@ -92,7 +92,8 @@ def test_workflows_list_alerts_json_in_persist(name):
     assert "watchdog_alerts" not in persist["run"]     # the watchdog's own file
     alert = steps[names.index("Alert on failure")]
     assert names.index("Alert on failure") < names.index("Persist state back to repo")
-    assert alert["if"] == "${{ failure() }}"
+    # cancelled(): a job-level timeout is a cancel, and failure() alone skips the step.
+    assert alert["if"] == "${{ failure() || cancelled() }}"
     assert alert["run"].strip() == 'python3 alerts_cli.py workflow-failed "$WORKFLOW_NAME"'
     assert "${{" not in alert["run"]
     assert set(alert["env"]) == {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "WORKFLOW_NAME"}
@@ -216,3 +217,15 @@ def test_workflows_mark_ok_after_the_run_and_before_persist(name, run_step):
     assert ok["run"].strip() == 'python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"'
     assert set(ok["env"]) == {"WORKFLOW_NAME"}
     assert ok["env"]["WORKFLOW_NAME"] == "${{ github.workflow }}"
+
+
+@pytest.mark.parametrize("name,run_step,step_timeout,job_timeout",
+                         [("bookings.yml", "Run booking agent", 13, 15),
+                          ("approve.yml", "Handle approvals", 8, 10)])
+def test_main_step_times_out_before_the_job(name, run_step, step_timeout, job_timeout):
+    # A step timeout fails the step (failure() fires); a job timeout only cancels.
+    wf = yaml.safe_load((ROOT / ".github/workflows" / name).read_text(encoding="utf-8"))
+    job = next(iter(wf["jobs"].values()))
+    assert job["timeout-minutes"] == job_timeout
+    step = next(s for s in job["steps"] if s["name"] == run_step)
+    assert step["timeout-minutes"] == step_timeout
