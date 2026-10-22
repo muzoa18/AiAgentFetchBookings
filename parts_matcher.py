@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import unicodedata
+from dataclasses import dataclass
 
 from rules import Rules
 
@@ -191,15 +192,54 @@ def is_forbidden(cand: dict, rules: Rules) -> bool:
     return any(f in h for f in forbidden for h in haystacks)
 
 
-def _brand_rank(cand: dict, rules: Rules) -> int:
-    """Index of the first rules.brand_prefer entry in the brand or title; len(prefer) if none."""
+def _word_runs(text) -> list[tuple[str, ...]]:
+    """Word sequences of every search term for `text` (synonyms, normalised, original)."""
+    return [tuple(_words(term)) for term in search_terms(text)]
+
+
+def _contains_run(words: tuple[str, ...], run: tuple[str, ...]) -> bool:
+    n = len(run)
+    return n > 0 and any(words[i:i + n] == run for i in range(len(words) - n + 1))
+
+
+def _part_brands(rules: Rules, line_name) -> tuple[str, ...]:
+    """Brands of the first rules.brand_prefer_by_part key the booking line names, else ().
+
+    A key matches when its words appear as whole, consecutive words in the line. Both sides go
+    through search_terms(), so case, quantities, placement words, known plurals and the owner's
+    synonyms (Pollenfilter = Kupéfilter) are honoured in either direction. "filter" therefore
+    never matches "Oljefilter": Swedish compounds are one word.
+    """
+    if not rules.brand_prefer_by_part or not str(line_name or "").strip():
+        return ()
+    line_runs = _word_runs(line_name)
+    for part, brands in rules.brand_prefer_by_part:
+        if any(_contains_run(words, run) for run in _word_runs(part) for words in line_runs):
+            return brands
+    return ()
+
+
+def _prefer_list(rules: Rules, line_name="") -> list[str]:
+    """Normalised preference order: the line's per-part brands, then the global brand_prefer."""
+    return [_norm(b) for b in (*_part_brands(rules, line_name), *rules.brand_prefer)]
+
+
+def _rank_in(cand: dict, prefer: list[str]) -> int:
     # pro.meca.se titles carry the brand ("Bosch Oljefilter, ..."); brand is usually "".
-    prefer = [_norm(b) for b in rules.brand_prefer]
     haystacks = (_norm(cand.get("brand")), _norm(cand.get("title")))
     for i, p in enumerate(prefer):
         if p and any(p in h for h in haystacks):
             return i
     return len(prefer)
+
+
+def _brand_rank(cand: dict, rules: Rules, line_name: str = "") -> int:
+    """Index of the first preferred brand in the brand or title; len(preferences) if none.
+
+    With a `line_name` naming a brand_prefer_by_part key, that key's brands come first (in
+    listed order), then rules.brand_prefer. Without one this is the global list alone.
+    """
+    return _rank_in(cand, _prefer_list(rules, line_name))
 
 
 def rank_candidates(candidates: list[dict], rules: Rules) -> list[dict]:
@@ -243,6 +283,91 @@ def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | N
         if chosen is not None:
             return chosen
     return _pick(line, ranked, picker)
+
+
+@dataclass(frozen=True)
+class Choice:
+    """Result of choose_with_alternatives(). Every alternative is a copy of an allowed,
+    picker-confirmed candidate plus "alt_reason" ("slut" or "dyr") and "saving_sek"."""
+    chosen: dict | None
+    alternatives: tuple[dict, ...] = ()
+
+
+def _price(cand: dict) -> float | None:
+    value = cand.get("price_sek")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value
+
+
+# Float slack for the "cheaper enough" boundary (exactly ratio x and exactly min diff qualify).
+_EPS = 1e-6
+
+
+def choose_with_alternatives(line: dict, candidates: list[dict], rules: Rules, picker) -> Choice:
+    """choose() with per-part brands, an in-stock replacement and at most one alternative.
+
+    Everything below works ONLY on `ranked`: the rank_candidates() output (no forbidden brand,
+    no ProMeister, no fluid, no non-Latin text) after the placement filter. Nothing is ever
+    rebuilt from the raw candidates, so a brand list can never bring a forbidden part back.
+
+    1. Main pick as choose(), with the line's per-part brands ranked before the global list.
+    2. If rules.prefer_in_stock and the pick is out of stock (in_stock is False), one picker
+       call on the in-stock ranked candidates; a confident pick replaces it.
+    3. If rules.max_alternatives > 0, at most one more picker call:
+       - "slut": the chosen part is out of stock -> an in-stock ranked candidate (skipped when
+         step 2 already asked the picker about that same list);
+       - "dyr": otherwise, when the chosen price is known -> an in-stock ranked candidate with
+         price * expensive_ratio <= chosen price and a saving >= expensive_min_diff_sek.
+    in_stock None means unknown: never "slut", never a replacement or alternative.
+    """
+    name = line.get("name", "")
+    if is_fluid(name) or has_non_latin(name):
+        return Choice(None)
+    prefer = _prefer_list(rules, name)
+    allowed = sorted(rank_candidates(candidates, rules), key=lambda c: _rank_in(c, prefer))
+    ranked = _placement_filter(name, allowed)
+    if not ranked:
+        return Choice(None)
+    preferred = [c for c in ranked if _rank_in(c, prefer) < len(prefer)]
+    chosen = None
+    if preferred and len(preferred) < len(ranked):
+        chosen = _pick(line, preferred, picker)
+    if chosen is None:
+        chosen = _pick(line, ranked, picker)
+    if chosen is None:
+        return Choice(None)
+
+    in_stock = [c for c in ranked if c is not chosen and c.get("in_stock") is True]
+    asked_in_stock = False
+    if rules.prefer_in_stock and chosen.get("in_stock") is False and in_stock:
+        asked_in_stock = True
+        replacement = _pick(line, in_stock, picker)
+        if replacement is not None:
+            chosen = replacement
+            in_stock = [c for c in ranked if c is not chosen and c.get("in_stock") is True]
+
+    if rules.max_alternatives <= 0:
+        return Choice(chosen)
+    if chosen.get("in_stock") is False:
+        if not in_stock or asked_in_stock:
+            return Choice(chosen)
+        alt = _pick(line, in_stock, picker)
+        return Choice(chosen, () if alt is None else ({**alt, "alt_reason": "slut", "saving_sek": 0},))
+    chosen_price = _price(chosen)
+    if chosen_price is None:
+        return Choice(chosen)
+    cheaper = [c for c in in_stock
+               if (p := _price(c)) is not None
+               and p * rules.expensive_ratio <= chosen_price + _EPS
+               and chosen_price - p >= rules.expensive_min_diff_sek - _EPS]
+    if not cheaper:
+        return Choice(chosen)
+    alt = _pick(line, cheaper, picker)
+    if alt is None:
+        return Choice(chosen)
+    saving = round(chosen_price - _price(alt), 2)
+    return Choice(chosen, ({**alt, "alt_reason": "dyr", "saving_sek": saving},))
 
 
 def make_claude_picker(api_key: str, client=None):
