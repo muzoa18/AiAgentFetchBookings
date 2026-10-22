@@ -31,8 +31,18 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   (`has_pending=false`, no alert from approve) and exits 1 on a corrupt one (generic
   `workflow_failed_` alert only); the guard in approve runs only in the full run. Before any cart action `parts_order._stage`
   runs the duplicate-order guard (below).
-- `watchdog.py` (every 6 h, `watchdog.yml`): alerts `stale_bookings` / `stale_approve` when a
-  scheduled run has not succeeded; writes only `config/watchdog_alerts.json`.
+- `watchdog.py` (every 6 h, `watchdog.yml`): alerts `stale_bookings` / `stale_approve` /
+  `stale_summary` when a scheduled run has not succeeded; writes only `config/watchdog_alerts.json`.
+- `summary.py` (daily 05:45 UTC, `daily-summary.yml`, stdlib only): one Telegram overview from the
+  state files (pending, Klar-waiting, ordered but unverified, needs action, alerts, last successful
+  run). No state written, no browser, always exits 0, no failure-alert step (the watchdog covers it).
+  Run by hand from the Actions tab.
+- `approve.py` also runs `track_statuses` after the order checker: the portal's "Beställningsstatus"
+  of verified, not-Klar orders younger than 21 days is stored, and a change is sent as
+  `Orderstatus <label>: <old> → <new>` (first sighting silent, `-` counts as empty, stored only after
+  a successful send, an undelivered message or a crash exits 1). One `list_sent_orders` read per run
+  (`_SentOrders`) is shared with the checker. `--check` says `has_pending=true` while anything is
+  tracked, so there is about one browser run a day per order for up to 21 days.
 - `improve.py --apply-all` (Mondays 06:00 UTC): proposals → PR; only `state.py`, `run_logger.py`
   and new `tests/test_*.py` files are ever written; everything else becomes a suggestion.
 
@@ -90,14 +100,20 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   `preflight.guarded`. The watchdog cannot see GitHub disabling scheduled workflows after 60 days
   of repo inactivity. To get past a duplicate-order block, order by hand in pro.meca.se.
 - Cron times in the workflows are UTC; Sweden is UTC+1/+2.
+- Margin warning: `parts_order_helpers.margin_line` adds one `OBS:` line to the approval message
+  (never blocks). Booking prices are ex VAT row totals; the cart total (incl. 25 % VAT) is divided
+  by `VAT_FACTOR` (1.25); only ordered rows count (not fluids). `min_margin_pct` (0-90, default 0 =
+  warn only on a loss). No line when anything is unknown. Details in `SKILL.md`.
+- Dashboard: four tiles read `vm.counts` (same meaning as the Telegram summary, no overlap), plus a
+  search box and status filter over the loaded orders (`render.filterOrders`).
 - After changing behaviour, update the root `SKILL.md`. It is the improve agent's only picture of the
   system, and stale text there produces bad weekly PRs.
 - Verify a Python change with `python -m py_compile <file>`; the improve job applies the same check.
 - `agent.py` and `portal_scraper.py` are committed with CRLF line endings; keep them that way.
 - Optional rules keys (defaults): `brand_prefer_by_part` (none), `prefer_in_stock` (true),
   `expensive_ratio` (1.5), `expensive_min_diff_sek` (100), `max_alternatives` (1, allowed 0-3 but
-  at most one alternative is ever offered). Invalid values make the whole rules file invalid
-  (fail closed). Details in `SKILL.md` ("Alternatives and the swap").
+  at most one alternative is ever offered), `min_margin_pct` (0). Invalid values make the whole
+  rules file invalid (fail closed). Details in `SKILL.md` ("Alternatives and the swap").
 
 ## Duplicate-order guard (parts_order._stage, before any cart action)
 - Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"

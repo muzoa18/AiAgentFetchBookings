@@ -22,6 +22,9 @@ ProMeister portal (meca.promeisterportal.com). The system, end to end:
    cart; Byt → swap one line to its alternative and send a new approval message. Every resolution message carries a **Klar** button; a Klar
    tap marks the booking Hanterad in the MECA portal.
 5. **Weekly self-improve** (`improve.py`): Claude reviews code + logs and opens a Pull Request.
+6. **Daily summary** (`summary.py`): one Telegram overview a day of what waits for the owner.
+   After an order is placed, `approve.py` also follows the portal's order status and tells the
+   owner when it changes (see "Daily summary" and "Order status tracking").
 
 Everything runs on **GitHub Actions** (no local machine, no Task Scheduler). Every booking with
 parts ends in a message saying ordered, blocked or failed: nothing fails silently.
@@ -30,7 +33,10 @@ parts ends in a message saying ordered, blocked or failed: nothing fails silentl
 ```
 agent.py                 Daily booking run: scrape → notify once → Hanterad (no parts) or stage order
 approve.py               Daily poller: Approve / Cancel / Byt / Klar taps, 48 h expiry, Klar
-                         withdrawal, order checker (verifies placed orders in "Skickade Beställningar")
+                         withdrawal, order checker (verifies placed orders in "Skickade Beställningar"),
+                         order status tracking (track_statuses), one shared list read (_SentOrders)
+summary.py               Daily Telegram overview (stdlib + notifier only; reads the state files, writes
+                         nothing, no browser, always exits 0)
 order_match.py           Order checker matching (pure): car model / date / registration → one row
 notifier.py              Telegram Bot API client (stdlib): messages, inline buttons (one row or rows),
                          getUpdates
@@ -38,7 +44,8 @@ portal_scraper.py        MECA portal (Playwright): login, Nya tab, detail page, 
 parts_order.py           Plan, stage (cart), approval message, swap restage, execute_order (checkout),
                          _verify_placed -> _verified_row (immediate order lookup; verify_now is
                          the test-facing wrapper of the same search)
-parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text, alternatives
+parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text, alternatives,
+                         margin warning (parts_price, margin_line, VAT_FACTOR)
 parts_matcher.py         Pure matching: brand rank, ProMeister/fluid/placement filters, Claude picker,
                          stock-aware choice and alternatives (choose_with_alternatives)
 parts_portal.py          pro.meca.se (Playwright): login, load vehicle, search, cart, checkout
@@ -46,13 +53,15 @@ parts_portal_parse.py    Pure HTML parsers for pro.meca.se pages (fixture-tested
 orders_state.py          config/orders.json: one status per booking, never order twice
 rules.py                 Loads + validates parts_rules.yaml (fails closed)
 parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling_sek, mode, plus optional
-                         brand_prefer_by_part, prefer_in_stock, expensive_*, max_alternatives
+                         brand_prefer_by_part, prefer_in_stock, expensive_*, max_alternatives,
+                         min_margin_pct
 config_loader.py         Env-first config (GitHub Secrets) with config/config.yaml fallback
 alerts.py                Alert store config/alerts.json: Telegram + dashboard, 24 h de-dup, never raises
 preflight.py             Fail-closed guards: state_problems / check_state_or_alert, guarded(name, fn)
 alerts_cli.py            Workflow-level failure alert (stdlib only), called by the workflows
-watchdog.py              Dead-man switch (stdlib only): stale bookings / approve run -> alert
-web/                     Read-only owner dashboard (Node): active alerts, last successful run age
+watchdog.py              Dead-man switch (stdlib only): stale bookings / approve / summary run -> alert
+web/                     Read-only owner dashboard (Node): active alerts, last successful run age,
+                         four count tiles, orders list with search box + status filter
 state.py                 config/seen_ids.txt (notified once) + no-Hanterad-button bookkeeping
 run_logger.py            Appends one structured line per run to logs/run_history.jsonl
 improve.py               Weekly self-improve → PR (file allowlist enforced in code; rest = suggestions)
@@ -165,8 +174,10 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   `run_failed_<short>`, `crash_<short>`. Needed because most approve runs stop after `--check`,
   which runs outside `guarded`.
 - **Watchdog** (`watchdog.py`, watchdog.yml, cron `17 */6 * * *`, own concurrency group
-  `meca-watchdog`): asks the GitHub API when bookings.yml and approve.yml last succeeded. Alerts
-  `stale_bookings` (expected Mon-Sat 15:00 UTC) and `stale_approve` (daily 06:00 UTC) when the
+  `meca-watchdog`): asks the GitHub API when bookings.yml, approve.yml and daily-summary.yml last
+  succeeded. Alerts
+  `stale_bookings` (expected Mon-Sat 15:00 UTC), `stale_approve` (daily 06:00 UTC) and
+  `stale_summary` (daily-summary.yml, daily 05:45 UTC; `Spec.minute` = 45) when the
   last slot is more than 3 h past with no success; it resolves them when fine. A GitHub API error
   never raises an alert. It writes ONLY `config/watchdog_alerts.json` (so its state commit cannot
   conflict with bookings/approve, which write `config/alerts.json`). Limit: it cannot detect
@@ -177,6 +188,7 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   logs `state_unreadable: true` when the state guard stops it) is older than
   `LAST_SUCCESS_STALE_HOURS` = 52 h (Saturday 15:00 to Monday 15:00 is 48 h with no Sunday run).
   The commit-age warning keeps `STALE_HOURS` = 36. Both reach the page in the view model.
+  Orders list, tiles and search: see "Dashboard: tiles and search" below.
 
 ## Alternatives and the swap (parts_matcher.py, parts_order.py, approve.py)
 - **Optional rules** in `parts_rules.yaml` (defaults apply when absent; strict validation, a bad
@@ -305,6 +317,91 @@ checker is the fallback for everything it did not verify.)
   page text and retried next run.
 - `plan_and_stage` stores the booking's car model as `vehicle_model` (sanitised, ≤ 80 chars).
 
+## Daily summary (summary.py, .github/workflows/daily-summary.yml)
+- Workflow `MECA Daily Summary`: cron `45 5 * * *` (05:45 UTC every day, 07:45 Swedish summer
+  time) plus `workflow_dispatch`. `permissions: contents: read`, own concurrency group
+  `meca-summary`, `timeout-minutes: 5`. It installs nothing: `python3 summary.py` is stdlib +
+  `notifier`. It persists nothing and has no "Alert on failure" step: the watchdog covers it
+  (`stale_summary`, label "dagssammanfattningen"). Run it by hand from the Actions tab.
+- Reads `config/orders.json`, `config/alerts.json`, `config/watchdog_alerts.json` (optional) and
+  `logs/run_history.jsonl` (last 5 rows) as plain JSON, sends ONE message, never writes state,
+  never opens a browser, and always exits 0 (a send failure is only logged).
+- Only booking numbers and plates (`<id> · <plate>`), never customer data. Sections, in order, each
+  booking in at most ONE of the four booking sections (an elif chain over the records, sorted by id):
+  1. `Väntar på ditt godkännande`: status `pending`.
+  2. `Väntar på Klar`: status `ordered` or `blocked` and `klar_outstanding`, the mirror of
+     `orders_state._open_klar` (int `klar_message_id`, not `handled`, not `klar_closed`,
+     `klar_sent_at` not older than 14 days; a missing or unparseable time never expires). The line
+     is annotated `(blockerad)` and/or `(ej verifierad)`; such a booking is listed only here.
+  3. `Beställt, ej verifierat`: status `ordered` without `verified_at` (and not in section 2).
+  4. `Kräver åtgärd`: `blocked`/`failed`/`expired`, `updated_at` within 7 days or missing/unparseable
+     (fail-open), shown as `<id> (<status>)`.
+  5. `Larm`: active (unresolved) alerts from both alert files, newest first, text whitespace-collapsed
+     and cut to 120 characters.
+  Each section shows at most 10 items then `+N till`; the whole text is capped at 3000 characters
+  (the longest section is collapsed one item at a time). An empty day gives one line:
+  `Inget väntar. Senaste lyckade körning: <date> UTC`. The footer is `Senaste lyckade körning:
+  <YYYY-MM-DD> UTC` (last history row with no `login_failed`) or `Ingen körning registrerad`.
+- A file that is missing (orders.json, run_history.jsonl) or unreadable gives empty data plus a line
+  `OBS: <fil> kunde inte läsas` at the top (a missing alerts.json / watchdog_alerts.json is normal and
+  silent; a corrupt one gets the note). The notes travel in `orders["_notes"]`.
+- `ordered` + verified records that are not waiting for Klar appear in no section (nothing to do).
+
+## Order status tracking (approve.py: track_statuses, orders_state: tracked_orders)
+- The checker already reads "Skickade Beställningar"; its "Beställningsstatus" column is the row's
+  `order_status`. Record fields (whitelisted in `orders_state`): `portal_status` (text, at most
+  80 chars, markup and control/format characters stripped) and `status_changed_at` (ISO time).
+- **Tracked** = status `ordered` + `verified_at` and `verified_numbers` + not `handled` and not
+  `klar_closed` + younger than 21 days (`orders_state.TRACK_MAX_AGE`, counted from `verified_at`,
+  else `updated_at`). Tracking therefore ends at Klar or after 21 days. The row is found with
+  `order_match.find_row(rows, verified_numbers)`; none or several rows: nothing happens.
+- First sighting is silent (stored only). A different status: message `Orderstatus <label>: <old> →
+  <new>` and the new status is stored ONLY after the send succeeded, so an undelivered message is
+  sent again next run (never lost, never twice). Texts are never logged, only their length.
+- The portal's placeholder (`-`, en dash, em dash: `STATUS_PLACEHOLDERS`) counts as empty: it is never
+  stored or sent, and after a real status it leaves that status and its timestamp unchanged.
+- One `list_sent_orders` read per run: `_SentOrders` is shared by `_verify_orders` and
+  `track_statuses` (a portal error gives `None` for both, logged by class and code only).
+- An undelivered status message or a crash inside tracking (e.g. the state write after a send) makes
+  the approve run exit 1; the rest of the run is not affected.
+- `approve.py --check` prints `has_pending=true` while `orders_state.outstanding_tracking()` is true,
+  so the daily approve run installs Chromium and opens the portal (about one browser run a day, for
+  up to 21 days per order, shared with all other approve work).
+
+## Margin warning (parts_order_helpers.margin_line, rules.min_margin_pct)
+- Shown as one line in the approval message right after `Totalt:` (before the fluids); it never
+  blocks or changes an order and is only informational. `auto` mode sends no approval text.
+- Prices: the MECA booking page lists prices **ex VAT**, and a part row's `price` is the **row total**
+  (unit x qty), so quantities are NOT multiplied again. The pro.meca.se cart total is **incl. 25 %
+  VAT**, so the purchase is `cart_total / VAT_FACTOR` (1.25) before comparing. Only the ordered rows
+  count (`parts_order.split_lines(booking)[0]`); fluid rows are excluded. Fees added at checkout are
+  not in the cart total, so a loss can be slightly understated.
+- Texts: `OBS: inköp exkl. moms X SEK över bokningens delpris Y SEK` when the purchase exceeds the
+  booking's parts price; otherwise, when `min_margin_pct` > 0 and the margin is below it,
+  `OBS: marginal N,N % (under M %)` (margin = (price - purchase) / price, rounded DOWN to one decimal).
+  Equal prices give no line.
+- No line when anything is unknown (a row without a readable price or quantity, a missing cart total).
+- `min_margin_pct` (rules key): integer 0-90, default 0 = warn only on a loss; invalid values make the
+  whole rules file invalid (fail closed).
+- The ordered-rows price is stored as `plan["parts_price_sek"]` at the first staging and reused by a swap
+  restage (the swap booking carries no prices). Plans staged before this change have none, so they show
+  no margin line after a swap.
+
+## Dashboard: tiles and search (web/)
+- `summarize.js` whitelists, per order, `portalStatus` (<= 80), `verifiedNumbers` (<= 120) and
+  `klarOpen` (same predicate as the Klar section above). `vm.counts` holds the per-status counts plus
+  `waiting`, `klar`, `needsAction`; the four tiles (`render.tiles`, headline too) read only these:
+  `waiting` = pending; `klar` = ordered/blocked with `klarOpen`; `ordered` = status ordered and NOT
+  under Klar (so `counts.ordered` is not the plain per-status total); `needsAction` = blocked/failed/
+  expired updated within 7 days or of unknown age, not under Klar. They add up without overlap and
+  have the meaning of the Telegram summary's sections, except that the summary has no section for
+  plain verified `ordered` records.
+- Above the orders list: a search box and a status filter (`render.filterOrders`, pure, client-side
+  over the loaded orders, limit 200): case-insensitive substring over booking id and number, plate
+  (spaces ignored for the plate only), status key and Swedish label, `portalStatus` and
+  `verifiedNumbers`. No fetch while typing; `Inga träffar` when nothing matches. Text is set with
+  `textContent`, no inline script. The demo data (`demo.js`) includes a `portal_status`.
+
 ## Parts rules
 - Only parts under **"Kopplade reservdelar"** (linked to the loaded vehicle) are candidates.
   Discontinued ("Produkten har utgått") and replaced ("Ersätts av") items are excluded.
@@ -340,12 +437,15 @@ checker is the fallback for everything it did not verify.)
 | `.github/workflows/bookings.yml` | daily 15:00 UTC, Mon–Sat (`0 15 * * 1-6`) | `python agent.py`, commits `config/seen_ids.txt`, `config/orders.json`, `logs/run_history.jsonl`, `config/no_button_*.txt`, `config/alerts.json` |
 | `.github/workflows/approve.yml` | daily 06:00 UTC, every day (`0 6 * * *`) | `python approve.py --check`, then `python approve.py` if anything is pending; commits `config/orders.json`, `config/alerts.json` |
 | `.github/workflows/watchdog.yml` | every 6 h at :17 (`17 */6 * * *`) | `python watchdog.py`, commits `config/watchdog_alerts.json` only |
+| `.github/workflows/daily-summary.yml` | daily 05:45 UTC, every day (`45 5 * * *`) | `python3 summary.py` (stdlib only), sends one Telegram overview, persists nothing |
 | `.github/workflows/weekly-improve.yml` | Mondays 06:00 UTC | `python improve.py --apply-all`, opens a PR |
 
 bookings.yml and approve.yml share the concurrency group `meca-bookings`, so they never overlap
 (single writer of `orders.json`, one cart per vehicle). Run approve.yml by hand from the Actions
 tab to process a tap immediately. Telegram keeps unread taps for 24 h only, so the poller runs
 every day; tap within ~36 h of the staging message.
+daily-summary.yml has its own group `meca-summary`, `contents: read`, writes nothing and has no
+failure-alert step (the watchdog watches it); run it by hand from the Actions tab.
 watchdog.yml has its own group `meca-watchdog` and writes only `config/watchdog_alerts.json`;
 `config/alerts.json` is written only by bookings/approve (see "Alerts and guards").
 **Every file the workflows read must be committed in the repo:** the first GitHub run once lost
@@ -431,6 +531,9 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
   activity; the duplicate guard reads only the first ~50 sent rows and, to proceed by hand, the
   owner orders in pro.meca.se manually.
 - An approve run killed mid-checkout is only reported by the next daily booking run's sweep.
+- The portal's order-status vocabulary is unknown, so nothing depends on specific words; tracking
+  costs about one browser run a day per order for up to 21 days. The margin warning ignores fees at
+  checkout and hard-codes 25 % VAT. The Telegram summary shows at most 10 items per section.
 - `approve.py` repeats the "invalid rules" warning every poll; a missing secret turns every poll red.
 - Cancel clears the whole vehicle cart, including anything the owner added by hand.
 - `logs/agent.log` (a 14-day workflow artifact) can contain full booking details.

@@ -80,3 +80,12 @@ As packages 1-2 (offline tests, Swedish fixed owner texts, no customer data beyo
 plate, model, order numbers, never place real orders, no push, commit trailer
 `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`, `agent.py` stays CRLF). Python suite
 1760 + web 122 stay green. Update both SKILL.md files, README, `parts_rules.yaml` comments.
+
+## Status (2026-10-22)
+Built and reviewed. The code is the truth where this design differs:
+- **Tiles, not a counts row.** The dashboard shows four tiles read from `vm.counts` (waiting, klar, ordered, needsAction; the headline uses the same numbers); there is no separate counts row. `counts.ordered` is non-overlapping (status `ordered` and no open Klar button), so the four add up, and each booking is in one of them, like the summary's elif chain. Search: the whitespace-insensitive match applies to the plate only.
+- **Margin figures are ex VAT.** Booking prices are ex VAT and a part row's `price` is the row total (not per unit, no quantity multiplication); the cart total (incl. 25 % VAT) is divided by `VAT_FACTOR` 1.25. Only ordered rows count (fluids excluded). Text: `OBS: inköp exkl. moms X SEK över bokningens delpris Y SEK`; the margin is rounded down to one decimal (`OBS: marginal N,N % (under M %)`). The ordered-rows price is stored as `plan["parts_price_sek"]` for swap restages; older plans show no line after a swap.
+- **Tracking ends at Klar.** Tracked = ordered, verified (`verified_at` and `verified_numbers`), not `handled`/`klar_closed`, under 21 days from `verified_at`. The row is found with `order_match.find_row`. `-` (also en/em dash) counts as empty. A status is stored only after its message was sent; an undelivered message or a tracking crash exits 1. The shared read is `approve._SentOrders`.
+- **No failure-alert step in the summary workflow**; the watchdog covers it (`stale_summary`, `Spec.minute` = 45). Step timeout is 5 minutes, not 3.
+- **Summary details:** the Klar predicate mirrors `orders_state._open_klar` in stdlib-only code (a missing or unparseable `klar_sent_at` never expires); a Klar-waiting booking is listed only under `Väntar på Klar` (annotated), each section shows at most 10 items; unreadable files add an `OBS: <fil> kunde inte läsas` line; the footer is the date of the last successful run.
+- The Python suite is 1902 tests and the web suite 131 (the design said 1760 and 122).

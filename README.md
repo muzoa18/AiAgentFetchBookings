@@ -78,6 +78,8 @@ hand; a pro.meca.se error is retried silently on the next run, but the 3-day war
 comes. Only the first page of "Skickade Beställningar" (about 50 rows, newest first) is read,
 so the checker is meant for recent orders.
 
+**Daily summary and status messages:** see "What you receive and when" below.
+
 Parts rules (owner-editable in [`parts_rules.yaml`](parts_rules.yaml), no code change needed):
 Bosch preferred, then another brand; never ProMeister; never fluids or oils; only parts linked to
 the vehicle ("Kopplade reservdelar"); ceiling **10,000 SEK** per booking; `mode: approve` (ask the
@@ -155,6 +157,7 @@ invalid and the agent refuses to order rather than guess):
 | `expensive_ratio` | `1.5` | A part is "dyr" when an alternative costs at most 1/ratio of it. A number above 1. |
 | `expensive_min_diff_sek` | `100` | ...and saves at least this much per unit. Whole number, 0 or more. |
 | `max_alternatives` | `1` | 0-3. 0 turns alternatives off. At most ONE alternative is ever offered, so 2 and 3 behave like 1. |
+| `min_margin_pct` | `0` | 0-90. Margin warning, see "Margin warning" below. 0 = warn only when you would pay more than the booking charges for the parts. |
 
 Worked example:
 
@@ -177,6 +180,60 @@ from "Kopplade reservdelar" that the part picker is confident about.
 
 ---
 
+## What you receive and when
+
+**Daily summary.** Every day at about 07:45 Swedish summer time (05:45 UTC, 06:45 in winter) one
+Telegram message arrives from `daily-summary.yml`. It lists, with booking number and plate only
+(never customer data), at most 10 per section and at most 3000 characters in all:
+
+- `Väntar på ditt godkännande`: parts orders waiting for Godkänn / Avbryt;
+- `Väntar på Klar`: placed (or blocked) orders whose Klar button is still open (sent within 14 days;
+  marked `(blockerad)` or `(ej verifierad)` where that applies);
+- `Beställt, ej verifierat`: placed orders not yet found in "Skickade Beställningar";
+- `Kräver åtgärd`: blocked, failed or expired orders from the last 7 days;
+- `Larm`: active alerts;
+- a last line `Senaste lyckade körning: <datum> UTC`.
+
+Each booking appears once. A quiet day gives one line, `Inget väntar. Senaste lyckade körning: …`.
+If a state file cannot be read the message starts with `OBS: <fil> kunde inte läsas`. The summary
+only reads the saved state: it opens no browser, writes nothing and never touches an order. If it
+stops arriving, the watchdog raises `stale_summary`.
+
+**Run the summary by hand:** GitHub → Actions → "MECA Daily Summary" → *Run workflow*. It needs
+the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` secrets.
+
+**Status messages.** After an order is verified, the daily approve run follows the portal's
+"Beställningsstatus" (in "Skickade Beställningar") for up to 21 days, or until you tap Klar. The
+first status it sees is only stored. When it changes you get `Orderstatus <bokning · reg>: <gammal>
+→ <ny>`. The wording is the portal's own. A `-` in the portal means "no status yet" and is
+ignored. If a message cannot be delivered it is sent again at the next run, and the run shows as
+failed. The cost: while an order is followed, the daily approve run opens the portal (about one
+browser run a day, up to 21 days per order, shared with the other approve work).
+
+**Margin warning.** The approval message gets an extra line, right after `Totalt:`, when the parts
+cost you more than you charge for them. It never blocks an order. The booking's prices are ex VAT
+and row totals; the pro.meca.se cart total includes 25 % VAT, so the agent divides it by 1.25
+first. Only the parts that are ordered count (not fluids). Fees added at checkout are not in the
+cart total.
+
+- `OBS: inköp exkl. moms X SEK över bokningens delpris Y SEK`: the purchase is more than the
+  booking charges for the parts.
+- `OBS: marginal N,N % (under M %)`: only when `min_margin_pct` is above 0 and the margin is lower.
+- No line at all when a price is missing or unreadable.
+
+Worked example: the booking charges 1 000 SEK for the ordered parts; the cart total is 1 500 SEK
+incl. VAT, i.e. 1 200 SEK ex VAT. With the default `min_margin_pct: 0` you get `OBS: inköp exkl.
+moms 1200.00 SEK över bokningens delpris 1000.00 SEK`. If the cart were 1 000 SEK incl. VAT (800
+ex VAT, margin 20 %), there is no line at 0, and with `min_margin_pct: 25` you get `OBS: marginal
+20,0 % (under 25 %)`. Set the key in `parts_rules.yaml` (whole number 0-90).
+
+**Dashboard.** Four tiles show the same counts as the summary (waiting for approval, waiting for
+Klar, ordered, needs action; each booking counted once). Above the orders list a search box and a
+status filter narrow the loaded orders by booking number, plate, status, portal status or order
+number. See [`web/README.md`](web/README.md).
+
+---
+
 ## Alerts: what they mean and what to do
 
 Nothing should fail silently. Every alert is a Telegram message (at most once per 24 h per
@@ -188,7 +245,7 @@ when the problem is gone.
 | `state_unreadable` ("config/orders.json saknas" / "kan inte läsas") | The order state is missing or broken. All ordering is stopped before the portal is touched, so nothing can be ordered twice. | Restore `config/orders.json` from git history (it must be committed) and run the workflow again. |
 | `crash_<name>` / `run_failed_<name>` | `agent.py` (`booking_agent`) or `approve.py` (`approve`) crashed or ended with an error. | Open the GitHub Actions log. Fix the cause (often a portal selector) or re-run. |
 | `workflow_failed_<workflow>` | The whole GitHub workflow failed or was cancelled: a failed install, the main step's own timeout (13 min bookings / 8 min approve), the job timeout (20 / 15 min, a cancel), a manual cancel, or a crash before our code started. Not sent when the same run already sent a more specific alert (`state_unreadable`, `crash_<name>`, `run_failed_<name>`), so one fault gives one message. A later successful run clears it (step "Mark OK"). | Open the run link in the message. |
-| `stale_bookings` / `stale_approve` | The watchdog (every 6 h) found no successful booking run (Mon–Sat 15:00 UTC) or approval poll (daily 06:00 UTC) within 3 h of its slot. | Check the Actions tab; run the workflow by hand. A GitHub API error never raises this alert. |
+| `stale_bookings` / `stale_approve` / `stale_summary` | The watchdog (every 6 h) found no successful booking run (Mon–Sat 15:00 UTC), approval poll (daily 06:00 UTC) or daily summary (daily 05:45 UTC) within 3 h of its slot. | Check the Actions tab; run the workflow by hand. A GitHub API error never raises this alert. |
 
 **Limit:** the watchdog is itself a scheduled workflow, so it cannot notice GitHub disabling
 scheduled workflows after 60 days without repository activity. If the dashboard shows no
@@ -257,11 +314,12 @@ Repo → **Settings → Actions → General → Workflow permissions** →
 | [`bookings.yml`](.github/workflows/bookings.yml) | `0 15 * * 1-6` (17:00 summer / 16:00 winter, Mon–Sat) | booking run, stages parts orders |
 | [`approve.yml`](.github/workflows/approve.yml) | `0 6 * * *` (every day) | Approve / Cancel / Klar taps, expiry |
 | [`watchdog.yml`](.github/workflows/watchdog.yml) | `17 */6 * * *` (every 6 h) | dead-man switch: alerts when a run was missed |
+| [`daily-summary.yml`](.github/workflows/daily-summary.yml) | `45 5 * * *` (07:45 summer, every day) | one Telegram overview |
 | [`weekly-improve.yml`](.github/workflows/weekly-improve.yml) | `0 6 * * 1` (Mondays) | self-improve PR |
 
 `Actions` tab → pick a workflow → *Run workflow* to run it now (e.g. approve.yml to process a tap
 immediately). bookings and approve share one concurrency group and never overlap; the watchdog
-has its own group.
+and the summary each have their own group.
 
 **Every file the workflows read must be committed in the repo.** The first GitHub run once lost
 order state because `config/orders.json` had never been committed (the run saw an empty state).
@@ -318,6 +376,7 @@ alerts.py              # Alert store (config/alerts.json): Telegram + dashboard,
 preflight.py           # State guard (orders.json must exist) and guarded() run wrapper
 alerts_cli.py          # Workflow-level failure alert (used by bookings.yml / approve.yml)
 watchdog.py            # Dead-man switch (watchdog.yml): alerts when a scheduled run is missed
+summary.py             # Daily Telegram overview (daily-summary.yml), stdlib only, writes nothing
 approve.py             # Daily poller: Approve / Cancel / Byt / Klar taps, expiry, order checker
 order_match.py         # Order checker: match a placed order to a "Skickade Beställningar" row
 notifier.py            # Telegram Bot API client
@@ -330,7 +389,7 @@ parts_portal.py        # pro.meca.se: login, vehicle, search, cart, checkout
 parts_portal_parse.py  # pro.meca.se HTML parsers
 orders_state.py        # config/orders.json — one status per booking, never order twice
 rules.py               # Loads parts_rules.yaml
-parts_rules.yaml       # Owner-editable parts rules (brands, ceiling, mode, stock/price options)
+parts_rules.yaml       # Owner-editable parts rules (brands, ceiling, mode, stock/price/margin options)
 state.py               # config/seen_ids.txt — notified once
 run_logger.py          # logs/run_history.jsonl — structured run history
 config_loader.py       # env-first config (GitHub Secrets) + config.yaml fallback
@@ -341,6 +400,7 @@ tests/                 # Offline pytest suite
   bookings.yml         # Daily booking run
   approve.yml          # Daily approval poller
   watchdog.yml         # Dead-man switch, every 6 h
+  daily-summary.yml    # Daily Telegram overview (05:45 UTC)
   weekly-improve.yml   # Weekly improve → Pull Request
 config/
   config.example.yaml  # Template (copy to config.yaml locally)
