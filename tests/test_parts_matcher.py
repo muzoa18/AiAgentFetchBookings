@@ -796,7 +796,7 @@ def test_declined_main_pick_gives_empty_choice_and_no_more_calls():
 def test_out_of_stock_choice_replaced_by_confident_in_stock_candidate():
     bosch, other = scand("Bosch Oljefilter", in_stock=False), scand("Purflux Oljefilter")
     picker = scripted((0, 0.95), (0, 0.9))
-    assert choose_with_alternatives(LINE, [bosch, other], P2, picker) == Choice(other, ())
+    assert choose_with_alternatives(LINE, [bosch, other], P2, picker) == Choice(other, (), bosch)
     assert picker.seen == [[bosch], [other]]
 
 
@@ -805,7 +805,7 @@ def test_replacement_keeps_brand_order_among_in_stock_candidates():
     other, bosch = scand("Purflux Oljefilter"), scand("Bosch Oljefilter B")
     picker = scripted((0, 0.95), (0, 0.9))
     assert choose_with_alternatives(LINE, [out, other, bosch], P2, picker).chosen is bosch
-    assert picker.seen[1] == [bosch, other]
+    assert picker.seen[1] == [bosch]  # preferred in-stock stage first
 
 
 def test_unconfident_replacement_keeps_original_without_second_alternative_call():
@@ -842,7 +842,7 @@ def test_replacement_pool_is_the_filtered_ranked_list():
     banned = [scand("ProMeister Bromsbelägg", placement="Framaxel"),
               scand("Bromsbelägg Purflux", placement="Bakaxel")]
     picker = scripted((0, 0.95), (0, 0.9))
-    assert choose_with_alternatives(line, banned + [chosen, good], P2, picker) == Choice(good, ())
+    assert choose_with_alternatives(line, banned + [chosen, good], P2, picker) == Choice(good, (), chosen)
     assert picker.seen == [[chosen], [good]]
 
 
@@ -998,7 +998,7 @@ def test_replacement_is_then_checked_for_price():
     result = choose_with_alternatives(LINE, [out, repl, cheap], P2, picker)
     assert result.chosen is repl
     assert result.alternatives == ({**cheap, "alt_reason": "dyr", "saving_sek": 800},)
-    assert picker.seen == [[out, repl], [repl, cheap], [cheap]]
+    assert picker.seen == [[out, repl], [repl], [cheap]]
 
 
 def test_fractional_prices_saving_rounded():
@@ -1006,3 +1006,130 @@ def test_fractional_prices_saving_rounded():
     picker = scripted((0, 0.95), (0, 0.9))
     alt = choose_with_alternatives(LINE, [bosch, cheap], P2, picker).alternatives
     assert alt[0]["saving_sek"] == 149.25
+
+
+# --- Task 2 fix round 1 ---
+
+def test_replacement_never_swaps_preferred_brand_for_unlisted_one():
+    bosch_a = scand("Bosch Oljefilter A", in_stock=False)
+    bosch_b, acme = scand("Bosch Oljefilter B"), scand("Acme Oljefilter")
+    seen = []
+
+    def picker(line, ranked):  # main pick: Bosch A; afterwards always the LAST candidate offered
+        seen.append(list(ranked))
+        return (0, 0.95) if len(seen) == 1 else (len(ranked) - 1, 0.9)
+
+    result = choose_with_alternatives(LINE, [bosch_a, bosch_b, acme], P2, picker)
+    assert result.chosen is bosch_b  # was Acme when the replacement saw [Bosch B, Acme] at once
+    assert seen == [[bosch_a, bosch_b], [bosch_b]]
+
+
+def test_replacement_preferred_stage_confident():
+    bosch_a = scand("Bosch Oljefilter A", in_stock=False)
+    bosch_b, acme = scand("Bosch Oljefilter B"), scand("Acme Oljefilter")
+    picker = scripted((0, 0.95), (0, 0.9))
+    result = choose_with_alternatives(LINE, [bosch_a, bosch_b, acme], P2, picker)
+    assert result.chosen is bosch_b
+    assert picker.seen == [[bosch_a, bosch_b], [bosch_b]]
+
+
+def test_replacement_falls_to_all_in_stock_when_preferred_stage_declines():
+    bosch_a = scand("Bosch Oljefilter A", in_stock=False)
+    bosch_b, acme = scand("Bosch Oljefilter B"), scand("Acme Oljefilter")
+    picker = scripted((0, 0.95), (0, 0.3), (1, 0.9))
+    result = choose_with_alternatives(LINE, [bosch_a, bosch_b, acme], P2, picker)
+    assert result.chosen is acme
+    assert picker.seen == [[bosch_a, bosch_b], [bosch_b], [bosch_b, acme]]
+
+
+def test_replacement_uses_per_part_brands_in_preferred_stage():
+    rules = by_part(("Oljefilter", ("Mann",)))
+    out = scand("Mann Oljefilter A", in_stock=False)
+    mann_b, acme = scand("Mann Oljefilter B"), scand("Acme Oljefilter")
+    picker = scripted((0, 0.95), (0, 0.9))
+    assert choose_with_alternatives(LINE, [out, acme, mann_b], rules, picker).chosen is mann_b
+    assert picker.seen[1] == [mann_b]
+
+
+def test_replacement_without_preferred_in_stock_goes_straight_to_second_stage():
+    bosch = scand("Bosch Oljefilter", in_stock=False)
+    acme, other = scand("Acme Oljefilter"), scand("Purflux Oljefilter")
+    picker = scripted((0, 0.95), (1, 0.9))
+    result = choose_with_alternatives(LINE, [bosch, acme, other], P2, picker)
+    assert result.chosen is other
+    assert picker.seen == [[bosch], [acme, other]]
+
+
+def test_replacement_all_in_stock_preferred_single_stage():
+    out = scand("Bosch Oljefilter A", in_stock=False)
+    b, c = scand("Bosch Oljefilter B"), scand("Bosch Oljefilter C")
+    picker = scripted((0, 0.95), (1, 0.9))
+    assert choose_with_alternatives(LINE, [out, b, c], P2, picker).chosen is c
+    assert picker.seen == [[out, b, c], [b, c]]
+
+
+def test_replacement_declined_in_both_stages_keeps_original():
+    bosch_a = scand("Bosch Oljefilter A", in_stock=False)
+    bosch_b, acme = scand("Bosch Oljefilter B"), scand("Acme Oljefilter")
+    picker = scripted((0, 0.95), (0, 0.3), (0, 0.3))
+    result = choose_with_alternatives(LINE, [bosch_a, bosch_b, acme], P2, picker)
+    assert result == Choice(bosch_a, ())
+    assert result.replaced is None
+    assert len(picker.seen) == 3  # no "slut" call: the full in-stock list was just declined
+
+
+def test_replaced_holds_a_copy_of_the_original_pick():
+    bosch, other = scand("Bosch Oljefilter", in_stock=False), scand("Purflux Oljefilter")
+    snapshot = dict(bosch)
+    result = choose_with_alternatives(LINE, [bosch, other], P2, scripted((0, 0.95), (0, 0.9)))
+    assert result.chosen is other
+    assert result.replaced == bosch and result.replaced is not bosch
+    result.replaced["title"] = "changed"
+    assert bosch == snapshot
+
+
+@pytest.mark.parametrize("rules,cands,script", [
+    (P2, lambda: [scand("Bosch Oljefilter")], [(0, 0.95)]),                                    # in stock
+    (P2, lambda: [scand("Bosch Oljefilter", in_stock=None), scand("Acme Oljefilter")], [(0, 0.95)]),
+    (P2, lambda: [scand("Bosch Oljefilter", in_stock=False), scand("Acme Oljefilter")], [(0, 0.95), (0, 0.1)]),
+    (replace(P2, prefer_in_stock=False),
+     lambda: [scand("Bosch Oljefilter", in_stock=False), scand("Acme Oljefilter")], [(0, 0.95), (0, 0.9)]),
+])
+def test_replaced_is_none_without_a_replacement(rules, cands, script):
+    result = choose_with_alternatives(LINE, cands(), rules, scripted(*script))
+    assert result.chosen is not None and result.replaced is None
+
+
+def test_empty_choice_has_no_replaced():
+    assert Choice(None).replaced is None
+
+
+@pytest.mark.parametrize("price", [0, 0.0, -5])
+def test_zero_or_negative_price_is_never_cheaper_enough(price):
+    bosch, free = scand("Bosch Oljefilter", 900), scand("Purflux Oljefilter", price)
+    picker = scripted((0, 0.95))
+    assert choose_with_alternatives(LINE, [bosch, free], P2, picker) == Choice(bosch, ())
+    assert len(picker.seen) == 1
+
+
+@pytest.mark.parametrize("price", [0, 0.0, -5])
+def test_zero_or_negative_chosen_price_never_flags(price):
+    chosen, cheap = scand("Bosch Oljefilter", price), scand("Purflux Oljefilter", 1)
+    picker = scripted((0, 0.95))
+    assert choose_with_alternatives(LINE, [chosen, cheap], P2, picker) == Choice(chosen, ())
+    assert len(picker.seen) == 1
+
+
+def test_dyr_needs_a_positive_saving_even_with_zero_min_diff():
+    rules = replace(P2, expensive_ratio=1.000000001, expensive_min_diff_sek=0)  # within _EPS
+    bosch, same = scand("Bosch Oljefilter", 100), scand("Purflux Oljefilter", 100)
+    picker = scripted((0, 0.95))
+    assert choose_with_alternatives(LINE, [bosch, same], rules, picker) == Choice(bosch, ())
+    assert len(picker.seen) == 1
+
+
+def test_dyr_with_zero_min_diff_flags_a_real_saving():
+    rules = replace(P2, expensive_ratio=1.1, expensive_min_diff_sek=0)
+    bosch, cheap = scand("Bosch Oljefilter", 110), scand("Purflux Oljefilter", 100)
+    alt = choose_with_alternatives(LINE, [bosch, cheap], rules, scripted((0, 0.95), (0, 0.9))).alternatives
+    assert [a["saving_sek"] for a in alt] == [10]

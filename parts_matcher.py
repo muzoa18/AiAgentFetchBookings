@@ -288,16 +288,31 @@ def choose(line: dict, candidates: list[dict], rules: Rules, picker) -> dict | N
 @dataclass(frozen=True)
 class Choice:
     """Result of choose_with_alternatives(). Every alternative is a copy of an allowed,
-    picker-confirmed candidate plus "alt_reason" ("slut" or "dyr") and "saving_sek"."""
+    picker-confirmed candidate plus "alt_reason" ("slut" or "dyr") and "saving_sek".
+    `replaced` is a copy of the original out-of-stock pick when an in-stock part replaced it
+    (the owner must be told), else None."""
     chosen: dict | None
     alternatives: tuple[dict, ...] = ()
+    replaced: dict | None = None
 
 
 def _price(cand: dict) -> float | None:
+    """A usable price, or None. Zero or negative ("price on request" placeholders) is unknown."""
     value = cand.get("price_sek")
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    return value
+    return value if value > 0 else None
+
+
+def _pick_preferred_first(line: dict, pool: list[dict], prefer: list[str], picker) -> dict | None:
+    """The main-pick order on `pool`: its preferred-brand candidates first (only when they are a
+    strict subset), then the whole pool if that stage declines. At most two picker calls."""
+    preferred = [c for c in pool if _rank_in(c, prefer) < len(prefer)]
+    if preferred and len(preferred) < len(pool):
+        chosen = _pick(line, preferred, picker)
+        if chosen is not None:
+            return chosen
+    return _pick(line, pool, picker)
 
 
 # Float slack for the "cheaper enough" boundary (exactly ratio x and exactly min diff qualify).
@@ -312,13 +327,15 @@ def choose_with_alternatives(line: dict, candidates: list[dict], rules: Rules, p
     rebuilt from the raw candidates, so a brand list can never bring a forbidden part back.
 
     1. Main pick as choose(), with the line's per-part brands ranked before the global list.
-    2. If rules.prefer_in_stock and the pick is out of stock (in_stock is False), one picker
-       call on the in-stock ranked candidates; a confident pick replaces it.
+    2. If rules.prefer_in_stock and the pick is out of stock (in_stock is False), the in-stock
+       ranked candidates get the same two stages as the main pick (preferred brands first, then
+       all; up to two calls); a confident pick replaces it and `replaced` keeps a copy of it.
     3. If rules.max_alternatives > 0, at most one more picker call:
        - "slut": the chosen part is out of stock -> an in-stock ranked candidate (skipped when
          step 2 already asked the picker about that same list);
        - "dyr": otherwise, when the chosen price is known -> an in-stock ranked candidate with
-         price * expensive_ratio <= chosen price and a saving >= expensive_min_diff_sek.
+         price * expensive_ratio <= chosen price and a saving >= expensive_min_diff_sek
+         (and always > 0). Prices <= 0 or non-finite count as unknown.
     in_stock None means unknown: never "slut", never a replacement or alternative.
     """
     name = line.get("name", "")
@@ -329,45 +346,42 @@ def choose_with_alternatives(line: dict, candidates: list[dict], rules: Rules, p
     ranked = _placement_filter(name, allowed)
     if not ranked:
         return Choice(None)
-    preferred = [c for c in ranked if _rank_in(c, prefer) < len(prefer)]
-    chosen = None
-    if preferred and len(preferred) < len(ranked):
-        chosen = _pick(line, preferred, picker)
-    if chosen is None:
-        chosen = _pick(line, ranked, picker)
+    chosen = _pick_preferred_first(line, ranked, prefer, picker)
     if chosen is None:
         return Choice(None)
 
     in_stock = [c for c in ranked if c is not chosen and c.get("in_stock") is True]
-    asked_in_stock = False
+    asked_in_stock, replaced = False, None
     if rules.prefer_in_stock and chosen.get("in_stock") is False and in_stock:
-        asked_in_stock = True
-        replacement = _pick(line, in_stock, picker)
+        asked_in_stock = True  # if declined, the whole in-stock list was declined (stage 2)
+        replacement = _pick_preferred_first(line, in_stock, prefer, picker)
         if replacement is not None:
-            chosen = replacement
+            replaced, chosen = dict(chosen), replacement
             in_stock = [c for c in ranked if c is not chosen and c.get("in_stock") is True]
 
     if rules.max_alternatives <= 0:
-        return Choice(chosen)
+        return Choice(chosen, (), replaced)
     if chosen.get("in_stock") is False:
         if not in_stock or asked_in_stock:
-            return Choice(chosen)
+            return Choice(chosen, (), replaced)
         alt = _pick(line, in_stock, picker)
-        return Choice(chosen, () if alt is None else ({**alt, "alt_reason": "slut", "saving_sek": 0},))
+        alts = () if alt is None else ({**alt, "alt_reason": "slut", "saving_sek": 0},)
+        return Choice(chosen, alts, replaced)
     chosen_price = _price(chosen)
     if chosen_price is None:
-        return Choice(chosen)
+        return Choice(chosen, (), replaced)
     cheaper = [c for c in in_stock
                if (p := _price(c)) is not None
                and p * rules.expensive_ratio <= chosen_price + _EPS
+               and chosen_price - p > 0
                and chosen_price - p >= rules.expensive_min_diff_sek - _EPS]
     if not cheaper:
-        return Choice(chosen)
+        return Choice(chosen, (), replaced)
     alt = _pick(line, cheaper, picker)
     if alt is None:
-        return Choice(chosen)
+        return Choice(chosen, (), replaced)
     saving = round(chosen_price - _price(alt), 2)
-    return Choice(chosen, ({**alt, "alt_reason": "dyr", "saving_sek": saving},))
+    return Choice(chosen, ({**alt, "alt_reason": "dyr", "saving_sek": saving},), replaced)
 
 
 def make_claude_picker(api_key: str, client=None):
