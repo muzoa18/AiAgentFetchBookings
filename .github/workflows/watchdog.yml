@@ -1,0 +1,60 @@
+name: MECA Watchdog
+
+# Dead-man switch: alerts when the booking run or the approval poll has not
+# succeeded for a scheduled slot. Stdlib only: nothing is installed.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: meca-bookings
+  cancel-in-progress: false
+
+permissions:
+  contents: write                  # commit config/alerts.json
+  actions: read                    # read workflow run history
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check last successful runs
+        env:
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python watchdog.py
+
+      - name: Persist state back to repo
+        if: ${{ always() }}
+        run: |
+          git config user.name  "meca-agent[bot]"
+          git config user.email "meca-agent[bot]@users.noreply.github.com"
+          git add config/alerts.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: update alert state [skip ci]"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main && git push; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying."
+            # Undo a half-done rebase; --abort also restores the autostash.
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          echo "Could not push state after 3 attempts."
+          exit 1

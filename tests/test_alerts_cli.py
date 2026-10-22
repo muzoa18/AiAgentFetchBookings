@@ -89,5 +89,7 @@ def test_workflows_list_alerts_json_in_persist(name):
     alert = steps[names.index("Alert on failure")]
     assert names.index("Alert on failure") < names.index("Persist state back to repo")
     assert alert["if"] == "${{ failure() }}"
-    assert "alerts_cli.py workflow-failed" in alert["run"]
-    assert set(alert["env"]) == {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+    assert alert["run"].strip() == 'python3 alerts_cli.py workflow-failed "$WORKFLOW_NAME"'
+    assert "${{" not in alert["run"]
+    assert set(alert["env"]) == {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "WORKFLOW_NAME"}
+    assert alert["env"]["WORKFLOW_NAME"] == "${{ github.workflow }}"

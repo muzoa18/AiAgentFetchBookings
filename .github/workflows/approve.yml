@@ -76,7 +76,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python alerts_cli.py workflow-failed "${{ github.workflow }}"
+          WORKFLOW_NAME:      ${{ github.workflow }}
+        run: python3 alerts_cli.py workflow-failed "$WORKFLOW_NAME"
 
       - name: Persist state back to repo
         if: ${{ always() }}
