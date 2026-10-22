@@ -466,3 +466,41 @@ test('demo mode: password "demo", cookie without Secure, all statuses present', 
   assert.ok(v.includes('verified') && v.includes('unverified'));
   assert.ok(s.json.orders.some((o) => o.detailUrl), 'demo links pass the allow-list');
 });
+
+test('status fetches both alert files; a missing alert file is just null', async () => {
+  const { h, source } = setup();
+  const r = res();
+  await h.status(authed({ method: 'GET' }), r);
+  const paths = source.calls.filter((c) => c[0] === 'getFile').map((c) => c[1]);
+  assert.ok(paths.includes('config/alerts.json'));
+  assert.ok(paths.includes('config/watchdog_alerts.json'));
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(r.json.alerts, []);
+});
+
+test('status merges alerts from both files', async () => {
+  const entry = (text) => ({ text, severity: 'warning', first_seen: '2026-10-21T08:00:00+00:00',
+    last_seen: '2026-10-21T09:00:00+00:00', count: 1, last_sent: null, resolved_at: null });
+  const source = fakeSource({
+    async getFile(path) {
+      if (path === 'config/alerts.json') return JSON.stringify({ alerts: { a: entry('<b>A</b>') } });
+      if (path === 'config/watchdog_alerts.json') return JSON.stringify({ alerts: { w: entry('W') } });
+      return null;
+    },
+  });
+  const { h } = setup({ source });
+  const r = res();
+  await h.status(authed({ method: 'GET' }), r);
+  assert.deepEqual(r.json.alerts.map((a) => a.text).sort(), ['<b>A</b>', 'W']);
+});
+
+test('demo mode shows one warning and one error alert', async () => {
+  const h = buildHandlers({}, { demo: true });
+  const login = res();
+  await h.login(req({ body: { password: 'demo' }, headers: { origin: undefined } }), login);
+  const token = login.headers['set-cookie'].split(';')[0];
+  const s = res();
+  await h.status(req({ method: 'GET', headers: { cookie: token } }), s);
+  assert.deepEqual(s.json.alerts.map((a) => a.severity).sort(), ['error', 'warning']);
+  assert.equal(typeof s.json.lastSuccessAgeHours, 'number');
+});

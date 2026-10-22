@@ -16,6 +16,8 @@ export const STATE_FILES = {
   orders: 'config/orders.json',
   history: 'logs/run_history.jsonl',
   seen: 'config/seen_ids.txt',
+  alerts: 'config/alerts.json',
+  watchdogAlerts: 'config/watchdog_alerts.json',
 };
 
 // The only workflows the dashboard may start. Key = request value, value = file.
@@ -156,13 +158,15 @@ export function createHandlers({ env, source, now = Date.now, log, demo = false,
     if (!authed(req)) return sendJson(res, 401, demo ? { error: 'Inte inloggad', demo: true } : { error: 'Inte inloggad' });
     try {
       const src = source();
-      const [ordersText, historyText, seenText, commit] = await Promise.all([
+      const [ordersText, historyText, seenText, alertsText, watchdogAlertsText, commit] = await Promise.all([
         src.getFile(STATE_FILES.orders),
         src.getFile(STATE_FILES.history),
         src.getFile(STATE_FILES.seen),
+        src.getFile(STATE_FILES.alerts),
+        src.getFile(STATE_FILES.watchdogAlerts),
         src.getLatestCommit(),
       ]);
-      const vm = summarize({ ordersText, historyText, seenText, commit, now: now() });
+      const vm = summarize({ ordersText, historyText, seenText, alertsText, watchdogAlertsText, commit, now: now() });
       if (demo && /[?&]stale=1(&|$)/.test(req.url ?? '')) {
         vm.freshness = { ...vm.freshness, ageHours: 52, stale: true,
           committedAt: new Date(now() - 52 * 3_600_000).toISOString() };

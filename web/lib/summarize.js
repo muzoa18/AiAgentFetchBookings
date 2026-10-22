@@ -1,7 +1,8 @@
 // Turns the agent's state files into the dashboard's view model.
 //
-// Input is the raw text of config/orders.json, logs/run_history.jsonl and
-// config/seen_ids.txt (null when a file is missing). Output contains only the
+// Input is the raw text of config/orders.json, logs/run_history.jsonl,
+// config/seen_ids.txt, config/alerts.json and config/watchdog_alerts.json (null
+// when a file is missing). Output contains only the
 // fields the UI shows: whitelisted, type-checked and length-limited. Nothing
 // here throws on bad input; problems are listed in `problems`.
 import { safeHref } from '../public/links.js';
@@ -11,6 +12,7 @@ export const ORDERS_LIMIT = 200;
 export const STALE_HOURS = 36;
 const STR_MAX = 300;
 const LIST_MAX = 50;
+export const ALERTS_LIMIT = 20;
 
 export const STATUSES = ['attempted', 'pending', 'ordered', 'blocked', 'failed', 'cancelled', 'expired'];
 const NEEDS_ACTION = new Set(['blocked', 'failed', 'expired']);
@@ -67,6 +69,54 @@ function parseOrders(text, problems) {
     return [];
   }
   return Object.entries(bookings).filter(([, r]) => obj(r));
+}
+
+// One alerts file ({"alerts": {key: entry}}) -> unresolved entries, or [] plus a problem.
+function parseAlerts(text, problemCode, problems) {
+  if (text == null) return [];
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    problems.push(problemCode);
+    return [];
+  }
+  const entries = obj(obj(data)?.alerts);
+  if (!entries) {
+    problems.push(problemCode);
+    return [];
+  }
+  const out = [];
+  for (const [key, raw] of Object.entries(entries)) {
+    const e = obj(raw);
+    if (!e || e.resolved_at) continue;
+    const text = str(e.text);
+    const cleanKey = str(key, 80);
+    if (!text || !cleanKey) continue;
+    out.push({
+      key: cleanKey,
+      text,
+      severity: e.severity === 'warning' ? 'warning' : 'error',
+      firstSeen: time(e.first_seen),
+      lastSeen: time(e.last_seen),
+      count: Number.isInteger(e.count) && e.count > 0 ? e.count : 1,
+    });
+  }
+  return out;
+}
+
+// Both files, merged: the same key in both keeps the later last_seen.
+function mergeAlerts(files, problems) {
+  const byKey = new Map();
+  for (const [text, code] of files) {
+    for (const a of parseAlerts(text, code, problems)) {
+      const prev = byKey.get(a.key);
+      if (!prev || (a.lastSeen ?? '') > (prev.lastSeen ?? '')) byKey.set(a.key, a);
+    }
+  }
+  return [...byKey.values()]
+    .sort((a, b) => (b.lastSeen ?? '').localeCompare(a.lastSeen ?? '') || a.key.localeCompare(b.key))
+    .slice(0, ALERTS_LIMIT);
 }
 
 function lines(list) {
@@ -176,7 +226,8 @@ function run({ entry, timestamp }) {
   };
 }
 
-export function summarize({ ordersText = null, historyText = null, seenText = null, commit = null,
+export function summarize({ ordersText = null, historyText = null, seenText = null, alertsText = null,
+  watchdogAlertsText = null, commit = null,
   now = Date.now(), historyLimit = HISTORY_LIMIT } = {}) {
   const problems = [];
 
@@ -198,6 +249,12 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
   const { runs, skipped } = parseHistory(historyText);
   runs.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   const history = runs.slice(-historyLimit).map(run);
+
+  const alerts = mergeAlerts([[alertsText, 'alerts_unreadable'],
+    [watchdogAlertsText, 'watchdog_alerts_unreadable']], problems);
+  const lastSuccess = runs.findLast((r) => !r.entry.login_failed);
+  const lastSuccessAgeHours = lastSuccess
+    ? Math.round(Math.max(0, (now - Date.parse(lastSuccess.timestamp)) / 3_600_000) * 10) / 10 : null;
 
   const committedAt = time(commit?.date);
   const ageHours = committedAt ? Math.max(0, (now - Date.parse(committedAt)) / 3_600_000) : null;
@@ -223,6 +280,8 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
     historyTotal: runs.length,
     skippedHistoryLines: skipped,
     seenCount,
+    alerts,
+    lastSuccessAgeHours,
     problems,
   };
 }

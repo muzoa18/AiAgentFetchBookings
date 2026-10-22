@@ -139,6 +139,28 @@ function historyFile(now) {
   return lines.join('\n') + '\n';
 }
 
+function alertsFile(now) {
+  const t = (h) => iso(now - h * HOUR);
+  return JSON.stringify({ alerts: {
+    parts_orders_unmatched: {
+      text: 'Skickade ordrar kunde inte matchas, delbeställningar pausas', severity: 'error',
+      first_seen: t(5), last_seen: t(0.4), count: 6, last_sent: t(5), resolved_at: null,
+    },
+    login_slow: {
+      text: 'Inloggningen på portalen tog ovanligt lång tid', severity: 'warning',
+      first_seen: t(26), last_seen: t(2), count: 3, last_sent: null, resolved_at: null,
+    },
+    old_resolved: {
+      text: 'Löst larm som inte ska visas', severity: 'error',
+      first_seen: t(60), last_seen: t(50), count: 1, last_sent: null, resolved_at: t(49),
+    },
+  } }, null, 2);
+}
+
+function watchdogAlertsFile() {
+  return JSON.stringify({ alerts: {} });
+}
+
 function seenFile() {
   return Array.from({ length: 214 }, (_, i) => `DEMO-${1000 + i}`).join('\n') + '\n';
 }
@@ -151,6 +173,8 @@ export function createDemoSource(now = Date.now) {
       if (path === 'config/orders.json') return ordersFile(t);
       if (path === 'logs/run_history.jsonl') return historyFile(t);
       if (path === 'config/seen_ids.txt') return seenFile();
+      if (path === 'config/alerts.json') return alertsFile(t);
+      if (path === 'config/watchdog_alerts.json') return watchdogAlertsFile();
       return null;
     },
     async getLatestCommit() {

@@ -3,6 +3,8 @@
 // Functions take the document as their first argument so tests can pass a fake.
 import { safeHref } from './links.js';
 
+const STALE_HOURS = 36;
+
 export const STATUS = {
   attempted: { label: 'Förbereds', tone: 'neutral', mark: '○' },
   pending: { label: 'Väntar på godkännande', tone: 'wait', mark: '◷' },
@@ -259,14 +261,30 @@ export function orders(doc, vm, now) {
   return h(doc, 'ul', { class: 'orders', role: 'list' }, vm.orders.map((o) => orderCard(doc, o, vm, now)));
 }
 
+/** Banner of active alerts, or null when there are none. */
+export function alerts(doc, vm, now) {
+  const list = vm.alerts ?? [];
+  if (!list.length) return null;
+  return h(doc, 'ul', { class: 'alert-list', role: 'list' }, list.map((a) => h(doc, 'li', {
+    class: `alert-item alert-${a.severity === 'warning' ? 'warning' : 'error'}`,
+  },
+  h(doc, 'span', { class: 'state-mark', 'aria-hidden': 'true' }, a.severity === 'warning' ? '!' : '✕'),
+  h(doc, 'span', { class: 'alert-text' }, a.text),
+  a.lastSeen ? h(doc, 'span', { class: 'alert-time small' }, 'sedan ', time(doc, a.lastSeen, now)) : null)));
+}
+
 export function freshness(doc, vm, now) {
   const f = vm.freshness ?? {};
   const line = f.sha
     ? h(doc, 'span', {}, 'Data från repot, senaste commit ', h(doc, 'code', {}, f.sha), ' ', time(doc, f.committedAt, now))
     : h(doc, 'span', {}, 'Data från repot, ingen commit hittades');
-  return h(doc, 'div', { class: `freshness ${f.stale ? 'is-stale' : ''}` },
+  const noSuccess = typeof vm.lastSuccessAgeHours === 'number' && vm.lastSuccessAgeHours > STALE_HOURS;
+  return h(doc, 'div', { class: `freshness ${f.stale || noSuccess ? 'is-stale' : ''}` },
     line,
     f.stale ? h(doc, 'span', { class: 'stale-warn', role: 'note' },
       h(doc, 'span', { class: 'state-mark', 'aria-hidden': 'true' }, '!'),
-      'Över 36 timmar gammal. Körs agenten lokalt? Pusha statefilerna för att se dem här.') : null);
+      'Över 36 timmar gammal. Körs agenten lokalt? Pusha statefilerna för att se dem här.') : null,
+    noSuccess ? h(doc, 'span', { class: 'stale-warn', role: 'note' },
+      h(doc, 'span', { class: 'state-mark', 'aria-hidden': 'true' }, '!'),
+      `Senaste lyckade körning för över ${STALE_HOURS} timmar sedan.`) : null);
 }

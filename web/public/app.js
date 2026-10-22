@@ -53,6 +53,9 @@ function showLoadError(message) {
 function render(vm) {
   const now = Date.now();
   replace('freshness', R.freshness(document, vm, now));
+  const banner = R.alerts(document, vm, now);
+  $('alerts').hidden = !banner;
+  $('alerts').replaceChildren(...(banner ? [banner] : []));
   $('headline').textContent = R.headline(vm);
   replace('tiles', R.tiles(document, vm));
   replace('orders', R.orders(document, vm, now));
@@ -63,6 +66,8 @@ function render(vm) {
   const foot = [`${vm.seenCount} bokningar sedda totalt`];
   if (vm.demo) foot.push('Demoläge med påhittade data');
   if (vm.problems?.includes('orders_unreadable')) foot.push('orders.json kunde inte läsas');
+  if (vm.problems?.includes('alerts_unreadable')) foot.push('alerts.json kunde inte läsas');
+  if (vm.problems?.includes('watchdog_alerts_unreadable')) foot.push('watchdog_alerts.json kunde inte läsas');
   $('foot').textContent = foot.join('. ') + '.';
   document.body.classList.toggle('is-demo', Boolean(vm.demo));
 }

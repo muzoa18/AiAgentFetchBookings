@@ -199,3 +199,121 @@ test('an XSS payload survives as plain data', () => {
   const vm = summarize({ ordersText: orders({ a: rec('pending', {}, { expected_lines: [{ title: evil, qty: 1 }] }) }), commit, now: NOW });
   assert.equal(vm.orders[0].lines[0].title, evil);
 });
+
+// ---- alerts (config/alerts.json + config/watchdog_alerts.json) ----
+const alertEntry = (extra = {}) => ({
+  text: 'Inloggningen misslyckades', severity: 'error', first_seen: '2026-10-21T08:00:00+00:00',
+  last_seen: '2026-10-21T09:00:00+00:00', count: 2, last_sent: null, resolved_at: null, ...extra,
+});
+const alertsFile = (alerts) => JSON.stringify({ alerts });
+
+test('alerts: unresolved only, sorted by lastSeen desc, shaped for the UI', () => {
+  const vm = summarize({
+    alertsText: alertsFile({
+      old: alertEntry({ text: 'Gammal', last_seen: '2026-10-20T09:00:00+00:00' }),
+      done: alertEntry({ text: 'Löst', resolved_at: '2026-10-21T09:30:00+00:00' }),
+      newer: alertEntry({ text: 'Nyare', severity: 'warning', last_seen: '2026-10-21T11:00:00+00:00' }),
+    }),
+    now: NOW,
+  });
+  assert.deepEqual(vm.alerts.map((a) => a.key), ['newer', 'old']);
+  assert.deepEqual(vm.alerts[0], {
+    key: 'newer', text: 'Nyare', severity: 'warning', firstSeen: '2026-10-21T08:00:00Z',
+    lastSeen: '2026-10-21T11:00:00Z', count: 2,
+  });
+  assert.deepEqual(vm.problems, []);
+});
+
+test('alerts: both files are merged; the same key keeps the later last_seen', () => {
+  const vm = summarize({
+    alertsText: alertsFile({
+      shared: alertEntry({ text: 'från alerts', last_seen: '2026-10-21T09:00:00+00:00' }),
+      a: alertEntry({ text: 'bara A', last_seen: '2026-10-21T07:00:00+00:00' }),
+    }),
+    watchdogAlertsText: alertsFile({
+      shared: alertEntry({ text: 'från watchdog', last_seen: '2026-10-21T10:00:00+00:00' }),
+      w: alertEntry({ text: 'bara W', last_seen: '2026-10-21T08:00:00+00:00' }),
+    }),
+    now: NOW,
+  });
+  assert.deepEqual(vm.alerts.map((a) => [a.key, a.text]), [['shared', 'från watchdog'], ['w', 'bara W'], ['a', 'bara A']]);
+  const flipped = summarize({
+    alertsText: alertsFile({ shared: alertEntry({ text: 'från alerts', last_seen: '2026-10-21T11:00:00+00:00' }) }),
+    watchdogAlertsText: alertsFile({ shared: alertEntry({ text: 'från watchdog' }) }),
+    now: NOW,
+  });
+  assert.equal(flipped.alerts.length, 1);
+  assert.equal(flipped.alerts[0].text, 'från alerts');
+});
+
+test('alerts: a resolved copy of a key in one file an unresolved copy still shows when the other file has it resolved', () => {
+  const vm = summarize({
+    alertsText: alertsFile({ k: alertEntry({ resolved_at: '2026-10-21T09:30:00+00:00', last_seen: '2026-10-21T11:00:00+00:00' }) }),
+    watchdogAlertsText: alertsFile({ k: alertEntry({ text: 'aktiv' }) }),
+    now: NOW,
+  });
+  assert.deepEqual(vm.alerts.map((a) => a.text), ['aktiv']);
+});
+
+test('alerts: capped at 20, newest first', () => {
+  const many = {};
+  for (let i = 0; i < 25; i++) {
+    many[`k${i}`] = alertEntry({ text: `a${i}`, last_seen: new Date(Date.parse('2026-10-21T00:00:00Z') + i * 60000).toISOString() });
+  }
+  const vm = summarize({ alertsText: alertsFile(many), now: NOW });
+  assert.equal(vm.alerts.length, 20);
+  assert.equal(vm.alerts[0].key, 'k24');
+  assert.equal(vm.alerts[19].key, 'k5');
+});
+
+test('alerts: corrupt JSON in each file is its own problem and never throws', () => {
+  const good = alertsFile({ ok: alertEntry({ text: 'ok' }) });
+  const a = summarize({ alertsText: '{kaputt', watchdogAlertsText: good, now: NOW });
+  assert.deepEqual(a.problems, ['alerts_unreadable']);
+  assert.deepEqual(a.alerts.map((x) => x.key), ['ok']);
+  const w = summarize({ alertsText: good, watchdogAlertsText: '[]', now: NOW });
+  assert.deepEqual(w.problems, ['watchdog_alerts_unreadable']);
+  assert.deepEqual(w.alerts.map((x) => x.key), ['ok']);
+  const both = summarize({ alertsText: 'x', watchdogAlertsText: '{"alerts": 5}', now: NOW });
+  assert.deepEqual(both.problems, ['alerts_unreadable', 'watchdog_alerts_unreadable']);
+  assert.deepEqual(both.alerts, []);
+});
+
+test('alerts: missing files are not an error', () => {
+  const vm = summarize({ alertsText: null, watchdogAlertsText: null, now: NOW });
+  assert.deepEqual(vm.alerts, []);
+  assert.deepEqual(vm.problems, []);
+  assert.deepEqual(summarize({ now: NOW }).alerts, []);
+});
+
+test('alerts: control characters stripped, long text limited, severity coerced', () => {
+  const vm = summarize({
+    alertsText: alertsFile({
+      a: alertEntry({ text: 'rad1\u0000\u001b[31m\nrad2', severity: 'critical' }),
+      b: alertEntry({ text: 'x'.repeat(1000), severity: 'warning', last_seen: '2026-10-21T08:30:00Z' }),
+      c: alertEntry({ text: '   ', last_seen: '2026-10-21T08:20:00Z' }),
+      d: alertEntry({ text: 'ok', severity: null, last_seen: '2026-10-21T08:10:00Z', count: 'many' }),
+    }),
+    now: NOW,
+  });
+  const byKey = Object.fromEntries(vm.alerts.map((x) => [x.key, x]));
+  assert.ok(!/[\u0000-\u001f]/.test(byKey.a.text));
+  assert.equal(byKey.a.severity, 'error');
+  assert.ok(byKey.b.text.length <= 300);
+  assert.equal(byKey.b.severity, 'warning');
+  assert.equal(byKey.c, undefined, 'an alert without text is dropped');
+  assert.equal(byKey.d.severity, 'error');
+  assert.equal(byKey.d.count, 1);
+});
+
+test('lastSuccessAgeHours: newest run without login_failed, from a fixed now', () => {
+  const history = [
+    { timestamp: '2026-10-21T06:00:00', agent: 'booking_agent', login_failed: false },
+    { timestamp: '2026-10-21T09:00:00', agent: 'approve_agent' },
+    { timestamp: '2026-10-21T10:00:00', agent: 'booking_agent', login_failed: true },
+  ].map((e) => JSON.stringify(e)).join('\n');
+  assert.equal(summarize({ historyText: history, now: NOW }).lastSuccessAgeHours, 3);
+  const allFailed = JSON.stringify({ timestamp: '2026-10-21T10:00:00', login_failed: true });
+  assert.equal(summarize({ historyText: allFailed, now: NOW }).lastSuccessAgeHours, null);
+  assert.equal(summarize({ now: NOW }).lastSuccessAgeHours, null);
+});

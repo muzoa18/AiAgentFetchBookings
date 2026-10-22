@@ -209,6 +209,15 @@ It says so when the newest commit is older than 36 hours. After you press
 "Kör nu", the result appears once the workflow has committed. The page
 refreshes every 60 s while the tab is visible.
 
+Active alerts are read from two files, one writer group each:
+`config/alerts.json` (agent, approve and alerts_cli workflows) and
+`config/watchdog_alerts.json` (the watchdog only). Either may be missing. The
+page merges them (same key in both: the later `last_seen` wins), drops resolved
+ones, shows at most 20 newest first in a red (error) or amber (warning) banner
+above the orders, and lists an unreadable file under `problems` in the status
+response and in the page footer. The stale warning also fires when the newest
+run without `login_failed` is over 36 hours old (`lastSuccessAgeHours`).
+
 ## Files
 
 ```
@@ -216,6 +225,7 @@ web/
   api/        login.js logout.js status.js run.js  (Vercel functions, thin wrappers)
   lib/        auth.js github.js summarize.js ratelimit.js http.js handlers.js runtime.js demo.js
               cli.js preview-transport.js
+              (state files read: orders.json run_history.jsonl seen_ids.txt alerts.json watchdog_alerts.json)
   public/     index.html app.js render.js links.js session.js transport.js style.css robots.txt
   test/       node:test suites (no network)
   dev-server.js  local server for the demo (--demo, --port N), or live mode with real env vars

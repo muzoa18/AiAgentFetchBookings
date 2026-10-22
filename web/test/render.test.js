@@ -138,3 +138,26 @@ test('secrets are never in client code', () => {
     assert.ok(!/GITHUB_TOKEN|SESSION_SECRET|DASHBOARD_PASSWORD|ghp_|github_pat_/.test(src), name);
   }
 });
+
+test('alerts banner: error and warning items, text set via textContent, relative time', () => {
+  const vm = { alerts: [
+    { key: 'a', text: '<img src=x onerror=alert(1)> inloggning', severity: 'error', firstSeen: '2026-10-21T08:00:00Z', lastSeen: '2026-10-21T09:00:00Z', count: 3 },
+    { key: 'b', text: 'Varning', severity: 'warning', firstSeen: '2026-10-21T08:00:00Z', lastSeen: '2026-10-21T09:00:00Z', count: 1 },
+  ] };
+  const el = R.alerts(doc, vm, NOW);
+  const nodes = all(el);
+  assert.ok(nodes.every((n) => n.tagName !== 'img'));
+  assert.ok(nodes.some((n) => /\balert-error\b/.test(n.className)));
+  assert.ok(nodes.some((n) => /\balert-warning\b/.test(n.className)));
+  assert.ok(el.textContent.includes('<img src=x onerror=alert(1)> inloggning'));
+  assert.match(el.textContent, /sedan /);
+  assert.equal(R.alerts(doc, { alerts: [] }, NOW), null);
+  assert.equal(R.alerts(doc, {}, NOW), null);
+});
+
+test('stale warning also appears when the last successful run is over 36 h old', () => {
+  const fresh = { freshness: { sha: 'abc1234', committedAt: '2026-10-21T10:00:00Z', stale: false }, lastSuccessAgeHours: 40 };
+  assert.ok(R.freshness(doc, fresh, NOW).textContent.includes('Senaste lyckade körning'));
+  const ok = { freshness: { sha: 'abc1234', committedAt: '2026-10-21T10:00:00Z', stale: false }, lastSuccessAgeHours: 5 };
+  assert.ok(!R.freshness(doc, ok, NOW).textContent.includes('Senaste lyckade körning'));
+});
