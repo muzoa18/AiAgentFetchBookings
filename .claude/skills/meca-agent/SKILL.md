@@ -19,6 +19,12 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   Approve/Cancel message) → `run_logger.log_run`.
 - `approve.py` (daily 06:00 UTC): `notifier.get_updates` → Approve: `parts_order.execute_order`;
   Cancel: clear cart; Klar: `mark_booking_handled`; expire approvals older than 48 h.
+- Both entry points run inside `preflight.guarded` and first call the state guard
+  (`check_state_or_alert`): a missing/unreadable `config/orders.json` stops all ordering before
+  portal contact (exit 1, alert `state_unreadable`). Before any cart action `parts_order._stage`
+  runs the duplicate-order guard (below).
+- `watchdog.py` (every 6 h, `watchdog.yml`): alerts `stale_bookings` / `stale_approve` when a
+  scheduled run has not succeeded; writes only `config/watchdog_alerts.json`.
 - `improve.py --apply-all` (Mondays 06:00 UTC): proposals → PR; only `state.py`, `run_logger.py`
   and new `tests/test_*.py` files are ever written; everything else becomes a suggestion.
 
@@ -31,8 +37,16 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   10,000 SEK ceiling, never ProMeister, never fluids/oils, only "Kopplade reservdelar", ambiguity
   means no order. Rules live in `parts_rules.yaml` (`mode: approve`).
 - **Only the owner's private chat can approve** (`TELEGRAM_CHAT_ID`, never a group).
+- **Alerts, never silence.** A crash (`crash_<name>`), a non-zero exit (`run_failed_<name>`), a
+  failed workflow (`workflow_failed_<workflow name>`, `alerts_cli.py`), an unreadable order state
+  (`state_unreadable`) and a missed schedule (`stale_bookings`, `stale_approve`) each raise a
+  Telegram message (once per 24 h per key) and a dashboard banner; success resolves them.
+  `alerts.py` never raises. Alert texts never carry exception messages, only the class name.
+- **Every file the workflows read must be committed.** The first GitHub run lost order state
+  because `config/orders.json` was never committed; a missing file now stops ordering.
 - **State is committed back to `main`** by the workflows (`seen_ids.txt`, `orders.json`,
-  `no_button_*.txt`, `run_history.jsonl`). Those files show as modified locally after a pull;
+  `no_button_*.txt`, `run_history.jsonl`, `alerts.json`; the watchdog commits
+  `watchdog_alerts.json`, its own file). Those files show as modified locally after a pull;
   that is normal, don't "clean" them.
 - **No secrets in git.** Config is env-first (`config_loader.py`); `config/config.yaml` is gitignored.
 - **Improve agent opens PRs only** and writes only `state.py`, `run_logger.py` and new test
@@ -49,6 +63,10 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   confirm with the user before running against the live portals with real credentials.
 - Selector breakage is the usual failure. Use `inspect_portal.py` to look at the live HTML, and prefer
   exact-text matching, which is what the scrapers already do (see "Scraper selectors" in `SKILL.md`).
+- Alerts: `alerts.py` (store, 24 h de-dup), `preflight.py` (state guard, `guarded`),
+  `alerts_cli.py` (workflow-level), `watchdog.py`. New entry points should run inside
+  `preflight.guarded`. The watchdog cannot see GitHub disabling scheduled workflows after 60 days
+  of repo inactivity. To get past a duplicate-order block, order by hand in pro.meca.se.
 - Cron times in the workflows are UTC; Sweden is UTC+1/+2.
 - After changing behaviour, update the root `SKILL.md`. It is the improve agent's only picture of the
   system, and stale text there produces bad weekly PRs.

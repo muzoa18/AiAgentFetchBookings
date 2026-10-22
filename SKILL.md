@@ -40,6 +40,11 @@ orders_state.py          config/orders.json: one status per booking, never order
 rules.py                 Loads + validates parts_rules.yaml (fails closed)
 parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling_sek, mode
 config_loader.py         Env-first config (GitHub Secrets) with config/config.yaml fallback
+alerts.py                Alert store config/alerts.json: Telegram + dashboard, 24 h de-dup, never raises
+preflight.py             Fail-closed guards: state_problems / check_state_or_alert, guarded(name, fn)
+alerts_cli.py            Workflow-level failure alert (stdlib only), called by the workflows
+watchdog.py              Dead-man switch (stdlib only): stale bookings / approve run -> alert
+web/                     Read-only owner dashboard (Node): active alerts, last successful run age
 state.py                 config/seen_ids.txt (notified once) + no-Hanterad-button bookkeeping
 run_logger.py            Appends one structured line per run to logs/run_history.jsonl
 improve.py               Weekly self-improve → PR (file allowlist enforced in code; rest = suggestions)
@@ -108,6 +113,37 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   as already handled by hand. Klar buttons older than 14 days are withdrawn once with a notice.
 - `python approve.py --check` (stdlib only) prints `has_pending=true|false`; the workflow skips
   installing Playwright when nothing is pending.
+
+## Alerts and guards (alerts.py, preflight.py, alerts_cli.py, watchdog.py)
+- **Alert store** `config/alerts.json` (`{"alerts": {key: {text, severity, first_seen, last_seen,
+  count, last_sent, resolved_at}}}`, no customer data). `alerts.raise_alert` records the alert and
+  sends one Telegram message at most every 24 h per key (an unresolved alert is re-sent after 24 h);
+  `alerts.resolve` closes it. Nothing in `alerts.py` ever raises. A corrupt file is renamed to
+  `alerts.json.corrupt` and starts empty.
+- **State guard** (`preflight.check_state_or_alert`, alert key `state_unreadable`): a missing or
+  unreadable `config/orders.json` stops ALL ordering before the portal is contacted and the run
+  exits 1 (`orders_state._load()` alone treats a missing file as empty, which once re-staged an
+  order that was already placed). agent.py calls it first in `run()`; approve.py checks it before
+  taps are handled and resolves the alert once the file is back.
+- **Run guard** (`preflight.guarded(name, fn)`, wired around `agent.py` as `booking_agent` and
+  `approve.py` as `approve`): an exception raises `crash_<name>`, a non-zero exit raises
+  `run_failed_<name>`; a clean exit resolves both and `workflow_failed_<workflow name>`
+  ("MECA Booking Agent" / "MECA Approval Poller"). Alert texts are fixed Swedish strings with the
+  exception class name only, never the message.
+- **Workflow alert** (`alerts_cli.py workflow-failed <name>`, step "Alert on failure",
+  `if: failure()`, in bookings.yml and approve.yml): key `workflow_failed_<workflow name>`; stdlib
+  only, so it also covers a failed install, a timeout or a crash before our code starts. It runs
+  before the persist step; always exits 0.
+- **Watchdog** (`watchdog.py`, watchdog.yml, cron `17 */6 * * *`, own concurrency group
+  `meca-watchdog`): asks the GitHub API when bookings.yml and approve.yml last succeeded. Alerts
+  `stale_bookings` (expected Mon-Sat 15:00 UTC) and `stale_approve` (daily 06:00 UTC) when the
+  last slot is more than 3 h past with no success; it resolves them when fine. A GitHub API error
+  never raises an alert. It writes ONLY `config/watchdog_alerts.json` (so its state commit cannot
+  conflict with bookings/approve, which write `config/alerts.json`). Limit: it cannot detect
+  GitHub disabling scheduled workflows after 60 days of repo inactivity (the watchdog is itself
+  scheduled).
+- **Dashboard** (`web/`): shows a banner with the active alerts from BOTH files and warns when the
+  last successful run is older than 36 h.
 
 ## Duplicate-order guard (parts_order._stage, before any cart action)
 - Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"
@@ -182,18 +218,19 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
 ## Workflows and schedules (cron is UTC; Sweden is UTC+1 winter / UTC+2 summer)
 | Workflow | Schedule | Runs |
 |---|---|---|
-| `.github/workflows/bookings.yml` | daily 15:00 UTC, Mon–Sat (`0 15 * * 1-6`) | `python agent.py`, commits `config/seen_ids.txt`, `config/orders.json`, `logs/run_history.jsonl`, `config/no_button_*.txt` |
-| `.github/workflows/approve.yml` | daily 06:00 UTC, every day (`0 6 * * *`) | `python approve.py --check`, then `python approve.py` if anything is pending; commits `config/orders.json` |
+| `.github/workflows/bookings.yml` | daily 15:00 UTC, Mon–Sat (`0 15 * * 1-6`) | `python agent.py`, commits `config/seen_ids.txt`, `config/orders.json`, `logs/run_history.jsonl`, `config/no_button_*.txt`, `config/alerts.json` |
+| `.github/workflows/approve.yml` | daily 06:00 UTC, every day (`0 6 * * *`) | `python approve.py --check`, then `python approve.py` if anything is pending; commits `config/orders.json`, `config/alerts.json` |
+| `.github/workflows/watchdog.yml` | every 6 h at :17 (`17 */6 * * *`) | `python watchdog.py`, commits `config/watchdog_alerts.json` only |
 | `.github/workflows/weekly-improve.yml` | Mondays 06:00 UTC | `python improve.py --apply-all`, opens a PR |
 
 bookings.yml and approve.yml share the concurrency group `meca-bookings`, so they never overlap
 (single writer of `orders.json`, one cart per vehicle). Run approve.yml by hand from the Actions
 tab to process a tap immediately. Telegram keeps unread taps for 24 h only, so the poller runs
 every day; tap within ~36 h of the staging message.
-watchdog.yml (every 6 h at :17) has its own group `meca-watchdog` and writes only
-`config/watchdog_alerts.json` (stale_bookings / stale_approve); `config/alerts.json` is written
-only by bookings/approve, and a successful run (`preflight.guarded`) resolves its
-`workflow_failed_<workflow name>` alert.
+watchdog.yml has its own group `meca-watchdog` and writes only `config/watchdog_alerts.json`;
+`config/alerts.json` is written only by bookings/approve (see "Alerts and guards").
+**Every file the workflows read must be committed in the repo:** the first GitHub run once lost
+order state because `config/orders.json` had never been committed.
 
 ### Weekly self-improve
 `python improve.py --apply-all` sends source + SKILL.md + recent logs to Claude
@@ -249,6 +286,10 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
 - Only the owner's private chat can approve, cancel or Klar, on the booking's own message.
 - Every booking with parts ends in a message (ordered, blocked or failed); a message that cannot
   be delivered turns the run red.
+- A missing or unreadable `config/orders.json` stops all ordering before any portal contact
+  (alert `state_unreadable`); an order for the same vehicle already in "Skickade Beställningar"
+  within 7 days blocks staging (see the duplicate-order guard). Failures are never silent: a crash,
+  a non-zero exit, a failed workflow or a stale schedule each raise an alert.
 - Owner messages are Swedish and never carry raw exception text; customer data is never written
   to `config/orders.json` (it is committed to git).
 - No secrets in git. The improve agent only opens PRs, only writes `state.py`, `run_logger.py`
@@ -261,6 +302,9 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
 - The axle-specific part list is incomplete (bromsbackar, bromsslang, English lines); title-only
   matching is used when the portal gives no ids; brand preference is enforced within one search
   term only.
+- The watchdog cannot see GitHub disabling scheduled workflows after 60 days without repo
+  activity; the duplicate guard reads only the first ~50 sent rows and, to proceed by hand, the
+  owner orders in pro.meca.se manually.
 - An approve run killed mid-checkout is only reported by the next daily booking run's sweep.
 - `approve.py` repeats the "invalid rules" warning every poll; a missing secret turns every poll red.
 - Cancel clears the whole vehicle cart, including anything the owner added by hand.

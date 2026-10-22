@@ -83,6 +83,33 @@ owner first).
 
 ---
 
+## Alerts: what they mean and what to do
+
+Nothing should fail silently. Every alert is a Telegram message (at most once per 24 h per
+problem, repeated as a reminder while it lasts) and a banner on the dashboard; it clears itself
+when the problem is gone.
+
+| Alert | Meaning | What to do |
+|---|---|---|
+| `state_unreadable` ("config/orders.json saknas" / "kan inte läsas") | The order state is missing or broken. All ordering is stopped before the portal is touched, so nothing can be ordered twice. | Restore `config/orders.json` from git history (it must be committed) and run the workflow again. |
+| `crash_<name>` / `run_failed_<name>` | `agent.py` (`booking_agent`) or `approve.py` (`approve`) crashed or ended with an error. | Open the GitHub Actions log. Fix the cause (often a portal selector) or re-run. |
+| `workflow_failed_<workflow>` | The whole GitHub workflow failed, e.g. a failed install or a timeout, possibly before our code started. | Open the run link in the message. |
+| `stale_bookings` / `stale_approve` | The watchdog (every 6 h) found no successful booking run (Mon–Sat 15:00 UTC) or approval poll (daily 06:00 UTC) within 3 h of its slot. | Check the Actions tab; run the workflow by hand. A GitHub API error never raises this alert. |
+
+**Limit:** the watchdog is itself a scheduled workflow, so it cannot notice GitHub disabling
+scheduled workflows after 60 days without repository activity. If the dashboard shows no
+recent run, check the Actions tab.
+
+**Order already placed.** Before staging, the agent reads "Skickade Beställningar" and blocks the
+booking if an order for the same vehicle was sent in the last 7 days ("order finns redan i
+pro.meca.se"), or if the list cannot be matched ("kan inte kontrollera tidigare order"). If
+you still need the parts, order them by hand in pro.meca.se. Only the first ~50 sent rows are read.
+
+**Dashboard** (`web/`): shows active alerts from both alert files and warns when the last
+successful run is older than 36 h.
+
+---
+
 ## Architecture choices (why it's built this way)
 
 - **GitHub Actions, not Vercel.** The core is a real browser driving two JS portals — that
@@ -134,10 +161,23 @@ Repo → **Settings → Actions → General → Workflow permissions** →
 |---|---|---|
 | [`bookings.yml`](.github/workflows/bookings.yml) | `0 15 * * 1-6` (17:00 summer / 16:00 winter, Mon–Sat) | booking run, stages parts orders |
 | [`approve.yml`](.github/workflows/approve.yml) | `0 6 * * *` (every day) | Approve / Cancel / Klar taps, expiry |
+| [`watchdog.yml`](.github/workflows/watchdog.yml) | `17 */6 * * *` (every 6 h) | dead-man switch: alerts when a run was missed |
 | [`weekly-improve.yml`](.github/workflows/weekly-improve.yml) | `0 6 * * 1` (Mondays) | self-improve PR |
 
 `Actions` tab → pick a workflow → *Run workflow* to run it now (e.g. approve.yml to process a tap
-immediately). bookings and approve share one concurrency group and never overlap.
+immediately). bookings and approve share one concurrency group and never overlap; the watchdog
+has its own group.
+
+**Every file the workflows read must be committed in the repo.** The first GitHub run once lost
+order state because `config/orders.json` had never been committed (the run saw an empty state).
+A missing or unreadable `config/orders.json` now stops all ordering, but the file still has to
+be there.
+
+State files the workflows commit back to `main` (they show as modified locally after a pull;
+that is normal): `config/seen_ids.txt`, `config/orders.json`, `config/no_button_ids.txt`,
+`config/no_button_seen_once.txt`, `logs/run_history.jsonl`, `config/alerts.json` (bookings and
+approve) and `config/watchdog_alerts.json` (watchdog only). The two alert files are created by
+the workflows the first time an alert is raised, so they may not exist yet.
 
 ### 4. First live order
 
@@ -177,6 +217,10 @@ that the GitHub runs never see.
 
 ```
 agent.py               # Daily booking run: scrape, notify once, Hanterad or stage order
+alerts.py              # Alert store (config/alerts.json): Telegram + dashboard, 24 h de-dup
+preflight.py           # State guard (orders.json must exist) and guarded() run wrapper
+alerts_cli.py          # Workflow-level failure alert (used by bookings.yml / approve.yml)
+watchdog.py            # Dead-man switch (watchdog.yml): alerts when a scheduled run is missed
 approve.py             # Daily poller: Approve / Cancel / Klar taps, expiry, order checker
 order_match.py         # Order checker: match a placed order to a "Skickade Beställningar" row
 notifier.py            # Telegram Bot API client
@@ -198,6 +242,7 @@ tests/                 # Offline pytest suite
 .github/workflows/
   bookings.yml         # Daily booking run
   approve.yml          # Daily approval poller
+  watchdog.yml         # Dead-man switch, every 6 h
   weekly-improve.yml   # Weekly improve → Pull Request
 config/
   config.example.yaml  # Template (copy to config.yaml locally)
