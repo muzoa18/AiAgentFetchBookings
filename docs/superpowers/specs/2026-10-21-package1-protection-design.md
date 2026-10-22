@@ -15,7 +15,8 @@ Telegram (the owner works from the phone) and the dashboard.
 1. **State guard.** A missing or unreadable `config/orders.json` stops all parts
    ordering for the run and raises an alert; it is never treated as "no orders".
 2. **Crash and failure alerts.** Any failed run, crash (even before Python starts, e.g.
-   a dependency install) or timeout produces one Telegram message and one dashboard alert.
+   a dependency install) or timeout produces one Telegram message and one dashboard alert
+   (the watchdog's later `stale_*` reminder is separate, see below).
 3. **Dead-man switch.** If the booking run or the approval poll has not succeeded when
    it should have, an alert is raised (separate scheduled workflow, stdlib only).
 4. **Duplicate-order guard at staging.** Before a cart is filled for a booking that has
@@ -49,12 +50,37 @@ wraps `run()` of both scripts: an uncaught exception raises alert `crash_<name>`
 class name only) and exits 1. A clean run resolves `crash_<name>`, `run_failed_<name>`.
 A non-zero exit from the counters in `agent.run()` raises `run_failed_booking_agent`.
 
+*Revised (final review):* `approve.py --check` runs outside `guarded` (the "Anything
+pending?" step has no secrets and `load_config` would `sys.exit(1)`; `_config` now also
+contains `SystemExit`). So the approve state guard runs only in the full run: a missing
+orders.json reads as empty in `--check` (`has_pending=false`, no approve alert), a corrupt one
+makes `--check` exit 1 (generic `workflow_failed_` only). A clean run resolves its alerts
+without loading a config. **One fault, one message:** `guarded` does not add
+`run_failed_<name>` when the same run already raised `state_unreadable` or `crash_<name>`.
+
 ### Workflow failure step (`alerts_cli.py`, stdlib only)
 Last step of `bookings.yml` and `approve.yml`, `if: failure()`: `python alerts_cli.py
 workflow-failed <workflow name>`; sends the Telegram message (with the run URL from
 `GITHUB_SERVER_URL/GITHUB_REPOSITORY/actions/runs/GITHUB_RUN_ID`) and writes the alert,
 then the persist step commits `config/alerts.json` (added to both persist loops). Covers
 failures that happen before or outside Python.
+
+*Revised (final review):*
+- Condition `if: failure() || cancelled()`. A job-level `timeout-minutes` hit is a cancel,
+  which `failure()` alone skips. The main steps get their own step timeout below the job's
+  ("Run booking agent" 13 of 15 min, "Handle approvals" 8 of 10): a step timeout fails the
+  step, so `failure()` fires. A manual cancel also alerts (accepted).
+- Suppression: `workflow-failed` raises nothing when `state_unreadable`, `crash_<short>` or
+  `run_failed_<short>` of this workflow (`<short>` = `preflight.DISPLAY_NAMES` inverted) is
+  active and its `last_seen` is within 60 min: that alert came from this run and already told
+  the owner. It logs the suppression. An unknown workflow name is never suppressed. A failed
+  install has no specific alert, so it still raises `workflow_failed_<name>`.
+- **Mark OK** step, `if: success()`, after the agent/approve step and before the persist
+  step, env `WORKFLOW_NAME` only: `python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"`
+  resolves `workflow_failed_<name>`, `run_failed_<short>`, `crash_<short>`. Needed because most
+  approve runs stop after `--check` and never reach `guarded`.
+- The watchdog's `stale_*` alert stays a separate message: it fires hours later as a reminder
+  that no run has succeeded since (accepted; not part of the one-message rule).
 
 ### Dead-man switch (`watchdog.py`, `.github/workflows/watchdog.yml`)
 Cron every 6 hours (`17 */6 * * *`, off the hour), stdlib only, permissions `contents:
@@ -95,6 +121,14 @@ rare at 1-2 bookings a week; the message says how to proceed (order by hand).
 `alerts` (active only, whitelisted fields, max 20) and `lastSuccessAgeHours`; the page
 shows a red banner above the orders list when an alert is active, and a stale-run warning
 beyond `STALE_HOURS` (existing constant). Demo data gets one alert.
+
+*Revised (final review):* a run counts as a success only when neither `login_failed` nor
+`state_unreadable` is set (agent.py now logs `state_unreadable`, true when the state guard
+stops it). The last-success warning has its own schedule-aware threshold
+`LAST_SUCCESS_STALE_HOURS = 52`: Saturday 15:00 to Monday 15:00 UTC is 48 h with no Sunday
+booking run, and 36 h false-alarmed every Monday morning. `STALE_HOURS = 36` stays for commit
+age. Both reach the page in the view model (`lastSuccessStaleHours`, `freshness.staleHours`)
+so the server and page cannot drift.
 
 ## Constraints (all tasks)
 

@@ -123,13 +123,22 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
 - **State guard** (`preflight.check_state_or_alert`, alert key `state_unreadable`): a missing or
   unreadable `config/orders.json` stops ALL ordering before the portal is contacted and the run
   exits 1 (`orders_state._load()` alone treats a missing file as empty, which once re-staged an
-  order that was already placed). agent.py calls it first in `run()`; approve.py checks it before
-  taps are handled and resolves the alert once the file is back.
+  order that was already placed). agent.py calls it first in `run()` and logs
+  `state_unreadable: true` in run_history. approve.py checks it only in the full run ("Handle
+  approvals"), which runs only when `approve.py --check` printed `has_pending=true`. `--check` runs
+  first, outside `guarded`: with a MISSING orders.json it sees an empty state, prints
+  `has_pending=false` and the approve run ends green without any alert (the next booking run's
+  guard raises `state_unreadable`); with a CORRUPT file `--check` exits 1, the step fails and the
+  owner gets only the generic `workflow_failed_MECA Approval Poller`. The full run resolves
+  `state_unreadable` once the file is back.
 - **Run guard** (`preflight.guarded(name, fn)`, wired around `agent.py` as `booking_agent` and
-  `approve.py` as `approve`): an exception raises `crash_<name>`, a non-zero exit raises
-  `run_failed_<name>`; a clean exit resolves both and `workflow_failed_<workflow name>`
-  ("MECA Booking Agent" / "MECA Approval Poller"). Alert texts are fixed Swedish strings with the
-  exception class name only, never the message.
+  `approve.py` as `approve`, but not around `approve.py --check`): an exception raises
+  `crash_<name>`, a non-zero exit raises `run_failed_<name>` unless this run already raised
+  `state_unreadable` or `crash_<name>` (one fault, one message); a clean exit resolves both and
+  `workflow_failed_<workflow name>` ("MECA Booking Agent" / "MECA Approval Poller") without
+  loading the config. A config that cannot load (`load_config` calls `sys.exit`, contained by
+  `preflight._config`) only means no alert can be sent. Alert texts are fixed Swedish strings
+  with the exception class name only, never the message.
 - **Workflow alert** (`alerts_cli.py workflow-failed <name>`, step "Alert on failure",
   `if: failure() || cancelled()`, in bookings.yml and approve.yml): key
   `workflow_failed_<workflow name>`; stdlib only. It covers a failed install, the main step's own
@@ -300,7 +309,8 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
 - A missing or unreadable `config/orders.json` stops all ordering before any portal contact
   (alert `state_unreadable`); an order for the same vehicle already in "Skickade Beställningar"
   within 7 days blocks staging (see the duplicate-order guard). Failures are never silent: a crash,
-  a non-zero exit, a failed workflow or a stale schedule each raise an alert.
+  a non-zero exit, a failed or timed-out workflow or a stale schedule each raise an alert (one
+  message per fault; the watchdog's `stale_*` is a separate later reminder).
 - Owner messages are Swedish and never carry raw exception text; customer data is never written
   to `config/orders.json` (it is committed to git).
 - No secrets in git. The improve agent only opens PRs, only writes `state.py`, `run_logger.py`

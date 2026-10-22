@@ -172,7 +172,9 @@ has its own group.
 **Every file the workflows read must be committed in the repo.** The first GitHub run once lost
 order state because `config/orders.json` had never been committed (the run saw an empty state).
 A missing or unreadable `config/orders.json` now stops all ordering, but the file still has to
-be there.
+be there. The booking run reports it as `state_unreadable`. The approval poller's first step
+(`approve.py --check`) cannot: it treats a missing file as "nothing pending" (green run, no
+alert) and fails on a corrupt file (only the generic `workflow_failed_` alert).
 
 State files the workflows commit back to `main` (they show as modified locally after a pull;
 that is normal): `config/seen_ids.txt`, `config/orders.json`, `config/no_button_ids.txt`,

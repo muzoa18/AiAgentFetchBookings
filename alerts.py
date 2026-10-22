@@ -87,6 +87,17 @@ def parse_time(value):
 _parse = parse_time
 
 
+def _count(value) -> int:
+    """A stored count; anything but a whole number >= 0 (a hand-edited file) is 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 0
+
+
 def raise_alert(config: dict, key: str, text: str, severity: str = "error",
                 now: datetime | None = None) -> bool:
     """Record the alert and notify. True = sent or suppressed (sent < 24 h ago);
@@ -100,9 +111,14 @@ def raise_alert(config: dict, key: str, text: str, severity: str = "error",
         if not isinstance(entry, dict) or entry.get("resolved_at"):
             entry = {"first_seen": _iso(now), "count": 0, "last_sent": None}
         entry.update(text=text, severity=severity, last_seen=_iso(now),
-                     count=int(entry.get("count", 0)) + 1, resolved_at=None)
+                     count=_count(entry.get("count")) + 1, resolved_at=None)
 
         last_sent = _parse(entry.get("last_sent"))
+        if last_sent is not None and last_sent > now:
+            # A future timestamp (hand edit, clock skew) would suppress sending until
+            # then; clamp it so it suppresses at most RESEND_AFTER from now.
+            last_sent = now
+            entry["last_sent"] = _iso(now)
         due = last_sent is None or now - last_sent >= RESEND_AFTER
         ok = True
         if due:

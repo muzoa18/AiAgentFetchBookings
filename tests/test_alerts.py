@@ -125,3 +125,54 @@ def test_text_is_truncated_and_control_chars_removed(env):
     assert len(stored) <= 500
     assert not any(unicodedata.category(c) == "Cc" for c in stored)
     assert sent[0] == "⚠️ " + stored
+
+
+# ── FIX F: a hand-edited alerts.json must not silence raise_alert ────────────
+
+def _write(path, entry):
+    path.write_text(json.dumps({"alerts": {"k": entry}}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("bad", ["abc", None, [], 2.5, "7x"])
+def test_bad_count_falls_back_to_0(env, bad):
+    sent, _, path = env
+    _write(path, {"text": "x", "count": bad, "first_seen": T0.isoformat(), "last_sent": None,
+                  "resolved_at": None})
+    assert alerts.raise_alert({}, "k", "Fel", now=T0) is True
+    assert sent == ["⚠️ Fel"]
+    assert json.loads(path.read_text(encoding="utf-8"))["alerts"]["k"]["count"] == 1
+
+
+def test_numeric_string_count_still_counts(env):
+    _, _, path = env
+    _write(path, {"text": "x", "count": "4", "last_sent": None, "resolved_at": None})
+    alerts.raise_alert({}, "k", "Fel", now=T0)
+    assert json.loads(path.read_text(encoding="utf-8"))["alerts"]["k"]["count"] == 5
+
+
+def test_naive_last_sent_is_utc(env):
+    sent, _, path = env
+    _write(path, {"text": "x", "count": 1, "last_sent": "2026-10-21T07:00:00",
+                  "resolved_at": None})
+    assert alerts.raise_alert({}, "k", "Fel", now=T0) is True   # 1 h later: suppressed
+    assert sent == []
+    assert alerts.raise_alert({}, "k", "Fel", now=T0 + timedelta(hours=23)) is True
+    assert sent == ["⚠️ Fel"]
+
+
+def test_future_last_sent_suppresses_at_most_resend_after(env):
+    sent, _, path = env
+    _write(path, {"text": "x", "count": 1, "last_sent": "2027-10-21T08:00:00+00:00",
+                  "resolved_at": None})
+    assert alerts.raise_alert({}, "k", "Fel", now=T0) is True
+    assert sent == []
+    assert json.loads(path.read_text(encoding="utf-8"))["alerts"]["k"]["last_sent"] == T0.isoformat()
+    alerts.raise_alert({}, "k", "Fel", now=T0 + alerts.RESEND_AFTER)
+    assert sent == ["⚠️ Fel"]
+
+
+def test_parse_time_naive_is_utc():
+    assert alerts.parse_time("2026-10-21T08:00:00") == T0
+    assert alerts.parse_time("2026-10-21T10:00:00+02:00") == T0
+    assert alerts.parse_time("nonsense") is None
+    assert alerts.parse_time(None) is None

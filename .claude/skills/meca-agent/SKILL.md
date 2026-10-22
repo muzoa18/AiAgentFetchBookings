@@ -21,7 +21,10 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   Cancel: clear cart; Klar: `mark_booking_handled`; expire approvals older than 48 h.
 - Both entry points run inside `preflight.guarded` and first call the state guard
   (`check_state_or_alert`): a missing/unreadable `config/orders.json` stops all ordering before
-  portal contact (exit 1, alert `state_unreadable`). Before any cart action `parts_order._stage`
+  portal contact (exit 1, alert `state_unreadable`). Exception: `approve.py --check` runs
+  outside `guarded` (no secrets in that step). It sees a missing orders.json as empty
+  (`has_pending=false`, no alert from approve) and exits 1 on a corrupt one (generic
+  `workflow_failed_` alert only); the guard in approve runs only in the full run. Before any cart action `parts_order._stage`
   runs the duplicate-order guard (below).
 - `watchdog.py` (every 6 h, `watchdog.yml`): alerts `stale_bookings` / `stale_approve` when a
   scheduled run has not succeeded; writes only `config/watchdog_alerts.json`.
@@ -40,7 +43,12 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
 - **Alerts, never silence.** A crash (`crash_<name>`), a non-zero exit (`run_failed_<name>`), a
   failed workflow (`workflow_failed_<workflow name>`, `alerts_cli.py`), an unreadable order state
   (`state_unreadable`) and a missed schedule (`stale_bookings`, `stale_approve`) each raise a
-  Telegram message (once per 24 h per key) and a dashboard banner; success resolves them.
+  Telegram message (once per 24 h per key) and a dashboard banner; success resolves them
+  (`guarded` and the "Mark OK" step, `alerts_cli.py workflow-ok`). One fault, one message: no
+  `run_failed_` after `state_unreadable`/`crash_` in the same run, and "Alert on failure"
+  (`if: failure() || cancelled()`) stays quiet when a specific alert of this workflow is active
+  and was seen within 60 min. Main steps have their own `timeout-minutes` (13 / 8) below the
+  job's (15 / 10) so a hang fails the step; a job timeout is a cancel, covered by `cancelled()`.
   `alerts.py` never raises. Alert texts never carry exception messages, only the class name.
 - **Every file the workflows read must be committed.** The first GitHub run lost order state
   because `config/orders.json` was never committed; a missing file now stops ordering.
@@ -64,7 +72,7 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
 - Selector breakage is the usual failure. Use `inspect_portal.py` to look at the live HTML, and prefer
   exact-text matching, which is what the scrapers already do (see "Scraper selectors" in `SKILL.md`).
 - Alerts: `alerts.py` (store, 24 h de-dup), `preflight.py` (state guard, `guarded`),
-  `alerts_cli.py` (workflow-level), `watchdog.py`. New entry points should run inside
+  `alerts_cli.py` (workflow-level: `workflow-failed`, `workflow-ok`), `watchdog.py`. New entry points should run inside
   `preflight.guarded`. The watchdog cannot see GitHub disabling scheduled workflows after 60 days
   of repo inactivity. To get past a duplicate-order block, order by hand in pro.meca.se.
 - Cron times in the workflows are UTC; Sweden is UTC+1/+2.
