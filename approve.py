@@ -592,5 +592,10 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # --check runs in the "Anything pending?" step: no secrets, nothing pip-installed.
+    # It stays outside guarded(), which may load the config (sys.exit without secrets),
+    # and its success is recorded by the workflow's "Mark OK" step instead.
+    if "--check" in sys.argv[1:]:
+        sys.exit(main())
     import preflight
     sys.exit(preflight.guarded("approve", main))

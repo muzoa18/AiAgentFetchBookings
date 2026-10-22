@@ -75,11 +75,16 @@ def _save(alerts: dict) -> None:
     os.replace(tmp, path)
 
 
-def _parse(value):
+def parse_time(value):
+    """An ISO 8601 timestamp as an aware datetime (naive = UTC); None if unusable."""
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
     except Exception:
         return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+_parse = parse_time
 
 
 def raise_alert(config: dict, key: str, text: str, severity: str = "error",

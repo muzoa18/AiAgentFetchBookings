@@ -67,6 +67,14 @@ jobs:
           ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
         run: python approve.py
 
+      # Clears this workflow's alerts (workflow_failed, run_failed, crash) after a good
+      # run, including approve runs that stop after --check. Stdlib only, no secrets.
+      - name: Mark OK
+        if: ${{ success() }}
+        env:
+          WORKFLOW_NAME:      ${{ github.workflow }}
+        run: python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"
+
       # Covers failures outside our Python code (pip/playwright install, the
       # 10 min timeout, a crash before approve.py starts). Stdlib only: nothing
       # needs installing. Runs before the persist step so config/alerts.json is

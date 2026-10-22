@@ -69,10 +69,13 @@ def test_bad_arguments_still_exit_0(env, sent):
 
 def test_alerts_cli_and_its_imports_are_stdlib_only():
     import sys
-    for name in ("alerts_cli", "alerts", "notifier"):
+    # preflight (DISPLAY_NAMES) pulls in orders_state and config_loader; config_loader
+    # imports yaml only inside try/except ImportError (indented, so not matched here).
+    ours = ("alerts", "notifier", "preflight", "orders_state", "config_loader")
+    for name in ("alerts_cli",) + ours:
         src = (ROOT / f"{name}.py").read_text(encoding="utf-8")
         for mod in re.findall(r"^(?:import|from)\s+([A-Za-z_][\w]*)", src, re.M):
-            assert mod in sys.stdlib_module_names or mod in ("alerts", "notifier"), (name, mod)
+            assert mod in sys.stdlib_module_names or mod in ours, (name, mod)
 
 
 def _steps(name):
@@ -94,3 +97,122 @@ def test_workflows_list_alerts_json_in_persist(name):
     assert "${{" not in alert["run"]
     assert set(alert["env"]) == {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "WORKFLOW_NAME"}
     assert alert["env"]["WORKFLOW_NAME"] == "${{ github.workflow }}"
+
+
+# ── workflow-ok (FIX B) and the workflow-failed suppression (FIX C) ──────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+
+def _keys():
+    return sorted(a["key"] for a in alerts.active())
+
+
+@pytest.mark.parametrize("display,short", [("MECA Booking Agent", "booking_agent"),
+                                           ("MECA Approval Poller", "approve")])
+def test_workflow_ok_resolves_the_workflows_alerts(sent, display, short):
+    for key in (f"workflow_failed_{display}", f"run_failed_{short}", f"crash_{short}",
+                "workflow_failed_Other", "run_failed_other", "state_unreadable"):
+        alerts.raise_alert({}, key, "x")
+    assert alerts_cli.main(["workflow-ok", display]) == 0
+    assert _keys() == sorted(["workflow_failed_Other", "run_failed_other",
+                              "state_unreadable"])
+
+
+def test_workflow_ok_unknown_name_resolves_only_its_workflow_failed(sent):
+    for key in ("workflow_failed_Nope", "run_failed_approve", "crash_booking_agent"):
+        alerts.raise_alert({}, key, "x")
+    assert alerts_cli.main(["workflow-ok", "Nope"]) == 0
+    assert _keys() == ["crash_booking_agent", "run_failed_approve"]
+
+
+def test_workflow_ok_needs_no_token_and_sends_nothing(monkeypatch, sent):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    alerts.raise_alert({}, "workflow_failed_MECA Approval Poller", "x")
+    sent.clear()
+    assert alerts_cli.main(["workflow-ok", "MECA Approval Poller"]) == 0
+    assert alerts.active() == []
+    assert sent == []
+
+
+def test_workflow_ok_never_raises(monkeypatch, sent):
+    monkeypatch.setattr(alerts, "resolve", lambda key: 1 / 0)
+    assert alerts_cli.main(["workflow-ok", "MECA Approval Poller"]) == 0
+
+
+@pytest.mark.parametrize("key", ["state_unreadable", "crash_approve", "run_failed_approve"])
+def test_workflow_failed_suppressed_by_a_fresh_specific_alert(env, sent, key, caplog):
+    caplog.set_level("INFO")
+    alerts.raise_alert({}, key, "specific")
+    sent.clear()
+    assert alerts_cli.main(["workflow-failed", "MECA Approval Poller"]) == 0
+    assert sent == []
+    assert "workflow_failed_MECA Approval Poller" not in _keys()
+    assert "suppressed" in caplog.text
+
+
+def test_workflow_failed_not_suppressed_by_an_old_specific_alert(env, sent):
+    old = datetime.now(timezone.utc) - timedelta(minutes=61)
+    alerts.raise_alert({}, "run_failed_approve", "specific", now=old)
+    sent.clear()
+    alerts_cli.main(["workflow-failed", "MECA Approval Poller"])
+    assert len(sent) == 1
+    assert "workflow_failed_MECA Approval Poller" in _keys()
+
+
+def test_workflow_failed_not_suppressed_by_a_resolved_alert(env, sent):
+    alerts.raise_alert({}, "crash_approve", "specific")
+    alerts.resolve("crash_approve")
+    sent.clear()
+    alerts_cli.main(["workflow-failed", "MECA Approval Poller"])
+    assert len(sent) == 1
+
+
+def test_workflow_failed_not_suppressed_by_the_other_workflows_alert(env, sent):
+    alerts.raise_alert({}, "run_failed_booking_agent", "specific")
+    sent.clear()
+    alerts_cli.main(["workflow-failed", "MECA Approval Poller"])
+    assert len(sent) == 1
+
+
+def test_workflow_failed_install_failure_raises(env, sent):
+    # A pip/Chromium install failure: our code never ran, no specific alert exists.
+    alerts_cli.main(["workflow-failed", "MECA Booking Agent"])
+    assert len(sent) == 1
+    assert _keys() == ["workflow_failed_MECA Booking Agent"]
+
+
+def test_workflow_failed_unknown_name_is_never_suppressed(env, sent):
+    alerts.raise_alert({}, "state_unreadable", "specific")
+    sent.clear()
+    alerts_cli.main(["workflow-failed", "Other"])
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("args", [["workflow-ok", "MECA Booking Agent"],
+                                  ["workflow-failed", "MECA Booking Agent"]])
+def test_alerts_cli_runs_without_site_packages(tmp_path, args):
+    # -S: no site-packages (nothing pip-installed), as on the runner before the install.
+    proc = subprocess.run([sys.executable, "-S", str(ROOT / "alerts_cli.py"), *args],
+                          cwd=tmp_path, env={"PATH": "/usr/bin:/bin"},
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "ModuleNotFoundError" not in proc.stderr
+    assert "alerts_cli failed" not in proc.stderr
+
+
+@pytest.mark.parametrize("name,run_step", [("bookings.yml", "Run booking agent"),
+                                           ("approve.yml", "Handle approvals")])
+def test_workflows_mark_ok_after_the_run_and_before_persist(name, run_step):
+    steps = _steps(name)
+    names = [s["name"] for s in steps]
+    ok = steps[names.index("Mark OK")]
+    assert names.index(run_step) < names.index("Mark OK") < names.index(
+        "Persist state back to repo")
+    assert ok["if"] == "${{ success() }}"
+    assert ok["run"].strip() == 'python3 alerts_cli.py workflow-ok "$WORKFLOW_NAME"'
+    assert set(ok["env"]) == {"WORKFLOW_NAME"}
+    assert ok["env"]["WORKFLOW_NAME"] == "${{ github.workflow }}"

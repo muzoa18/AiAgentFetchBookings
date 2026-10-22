@@ -112,3 +112,79 @@ def test_display_names_are_the_workflow_names():
              for f in ("bookings.yml", "approve.yml")}
     assert preflight.DISPLAY_NAMES == {"booking_agent": names["bookings.yml"],
                                        "approve": names["approve.yml"]}
+
+
+# ── Final fix round: FIX A (SystemExit from load_config), B (resolve without config),
+#    C (one fault, one message) ───────────────────────────────────────────────────
+
+def _exiting_config():
+    import sys
+    sys.exit(1)   # what config_loader.load_config does when secrets are missing
+
+
+def test_config_systemexit_is_contained(env):
+    assert preflight._config(_exiting_config) is None
+
+
+def test_guarded_with_exiting_config_keeps_the_code(env):
+    assert preflight.guarded("approve", lambda: 0, config_loader=_exiting_config) == 0
+    assert preflight.guarded("approve", lambda: 4, config_loader=_exiting_config) == 4
+    assert preflight.guarded("approve", lambda: 1 / 0, config_loader=_exiting_config) == 1
+
+
+def test_guarded_does_not_swallow_keyboard_interrupt(env):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        preflight.guarded("approve", lambda: 2, config_loader=interrupted)
+
+
+@pytest.mark.parametrize("name,display", [("booking_agent", "MECA Booking Agent"),
+                                          ("approve", "MECA Approval Poller")])
+def test_guarded_success_resolves_without_a_config(env, name, display):
+    for key in (f"crash_{name}", f"run_failed_{name}", f"workflow_failed_{display}"):
+        alerts.raise_alert({}, key, "x")
+    assert preflight.guarded(name, lambda: 0, config_loader=_exiting_config) == 0
+    assert alerts.active() == []
+
+
+def test_guarded_success_never_loads_the_config(env):
+    calls = []
+    assert preflight.guarded("approve", lambda: 0,
+                             config_loader=lambda: calls.append(1) or {}) == 0
+    assert calls == []
+
+
+def test_guarded_no_run_failed_after_state_alert(env):
+    _, sent = env
+
+    def run():
+        assert preflight.check_state_or_alert({}) is False   # orders.json missing
+        return 1
+
+    assert preflight.guarded("booking_agent", run, config_loader=lambda: {}) == 1
+    assert [a["key"] for a in alerts.active()] == ["state_unreadable"]
+    assert len(sent) == 1
+
+
+def test_guarded_flag_is_reset_per_run(env):
+    def bad_state():
+        preflight.check_state_or_alert({})
+        return 1
+
+    preflight.guarded("approve", bad_state, config_loader=lambda: {})
+    assert preflight.guarded("approve", lambda: 2, config_loader=lambda: {}) == 2
+    assert "run_failed_approve" in [a["key"] for a in alerts.active()]
+
+
+def test_guarded_crash_raises_only_the_crash_alert(env):
+    _, sent = env
+
+    def boom():
+        raise RuntimeError("x")
+
+    assert preflight.guarded("approve", boom, config_loader=lambda: {}) == 1
+    assert [a["key"] for a in alerts.active()] == ["crash_approve"]
+    assert len(sent) == 1
+    assert preflight._specific_alert_raised is True
