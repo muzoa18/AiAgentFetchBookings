@@ -609,3 +609,106 @@ def test_swaps_is_kept_by_put_update_fields_and_begin():
     orders_state.update_fields("B2", swaps=2)
     assert orders_state.begin("B2") is True
     assert orders_state.get("B2")["swaps"] == 2
+
+
+# ── Order status tracking (package 3 task 3) ─────────────────────────────────
+
+VERIFIED = "90000002 · 01000011/01000012"
+
+
+def _tracked_record(days_ago=1.0, **fields):
+    when = (NOW - timedelta(days=days_ago)).isoformat()
+    return {"status": "ordered", "plan": {"booking_nr": "OLRD-0001"}, "message_id": 7,
+            "updated_at": when, "verified_at": when, "verified_numbers": VERIFIED, **fields}
+
+
+def test_tracked_orders_are_young_verified_open_ordered_records(orders_file):
+    _write(orders_file, {
+        "B1": _tracked_record(),
+        "B2": {k: v for k, v in _tracked_record().items() if k != "verified_numbers"},
+        "B3": {k: v for k, v in _tracked_record().items() if k != "verified_at"},
+        "B4": _tracked_record(days_ago=21.01),
+        "B5": _tracked_record(klar_closed=True),
+        "B6": _tracked_record(handled=True),
+        "B7": {**_tracked_record(), "status": "failed"},
+        "B8": _tracked_record(days_ago=20.9, klar_closed=False, handled=False),
+        "B9": _tracked_record(portal_status="Bekräftad",
+                              status_changed_at="2026-10-30T06:00:00+00:00"),
+    })
+    assert [b for b, _ in orders_state.tracked_orders(NOW)] == ["B1", "B8", "B9"]
+    assert orders_state.outstanding_tracking(NOW) is True
+
+
+def test_tracking_age_counts_from_verified_at_not_updated_at(orders_file):
+    old = (NOW - timedelta(days=30)).isoformat()
+    young = (NOW - timedelta(days=2)).isoformat()
+    _write(orders_file, {"B1": _tracked_record(updated_at=old, verified_at=young),
+                         "B2": _tracked_record(updated_at=young, verified_at=old)})
+    assert [b for b, _ in orders_state.tracked_orders(NOW)] == ["B1"]
+
+
+def test_tracking_max_age_is_21_days_and_adjustable(orders_file):
+    _write(orders_file, {"B1": _tracked_record(days_ago=5)})
+    assert orders_state.tracked_orders(NOW, max_age=timedelta(days=4)) == []
+    assert len(orders_state.tracked_orders(NOW)) == 1
+    assert orders_state.TRACK_MAX_AGE == timedelta(days=21)
+
+
+def test_outstanding_tracking_false_when_nothing_is_tracked(orders_file):
+    assert orders_state.outstanding_tracking() is False
+    _write(orders_file, {"B1": _tracked_record(days_ago=22), "B2": _tracked_record(handled=True)})
+    assert orders_state.outstanding_tracking(NOW) is False
+
+
+def test_outstanding_tracking_defaults_to_now(orders_file):
+    recent = datetime.now(timezone.utc) - timedelta(days=1)
+    _write(orders_file, {"B1": {**_tracked_record(), "verified_at": recent.isoformat()}})
+    assert orders_state.outstanding_tracking() is True
+
+
+@pytest.mark.parametrize("field,value", [
+    ("portal_status", "Bekräftad"), ("portal_status", "x" * 80), ("portal_status", ""),
+    ("status_changed_at", "2026-10-22T06:00:01+00:00")])
+def test_status_tracking_fields_load(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    assert orders_state.get("B1")[field] == value
+
+
+@pytest.mark.parametrize("field,value", [
+    ("portal_status", "x" * 81), ("portal_status", "Lev\nererad"), ("portal_status", "a\x00"),
+    ("portal_status", "a​b"), ("portal_status", 3), ("portal_status", None),
+    ("status_changed_at", "2026-10-22T06:00:01"), ("status_changed_at", "igår"),
+    ("status_changed_at", 1)])
+def test_bad_status_tracking_fields_raise(orders_file, field, value):
+    _write(orders_file, {"B1": {**OLD_RECORD, field: value}})
+    with pytest.raises(ValueError, match="B1"):
+        orders_state.get("B1")
+
+
+def test_update_fields_validates_status_tracking_fields(orders_file):
+    orders_state.put("B1", "ordered")
+    for bad in ({"portal_status": "x" * 81}, {"portal_status": "a\tb"},
+                {"status_changed_at": "2026-10-22"}):
+        with pytest.raises(ValueError):
+            orders_state.update_fields("B1", **bad)
+    assert "portal_status" not in orders_state.get("B1")
+
+
+def test_status_tracking_fields_survive_put_update_fields_and_restage(orders_file):
+    orders_state.put("B1", "ordered", plan={"a": 1}, message_id=3)
+    orders_state.update_fields("B1", portal_status="Bekräftad",
+                               status_changed_at="2026-10-22T06:00:01+00:00")
+    orders_state.update_fields("B1", handled=True)
+    orders_state.put("B1", "ordered")
+    rec = orders_state.get("B1")
+    assert rec["portal_status"] == "Bekräftad"
+    assert rec["status_changed_at"] == "2026-10-22T06:00:01+00:00"
+    assert orders_state._extras(rec)["portal_status"] == "Bekräftad"
+    # restage() rewrites the record through _extras as well
+    orders_state.put("B2", "blocked", plan={"reason": "ingen säker träff för 'X'"})
+    orders_state.update_fields("B2", cart_touched=False, portal_status="Skickad",
+                               status_changed_at="2026-10-22T06:00:01+00:00")
+    assert orders_state.restage("B2") is True
+    assert orders_state.get("B2")["portal_status"] == "Skickad"
+    assert orders_state.begin("B2") is True
+    assert orders_state.get("B2")["status_changed_at"] == "2026-10-22T06:00:01+00:00"

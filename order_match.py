@@ -153,6 +153,21 @@ def claim_tokens(verified_numbers) -> set[str]:
     return set(re.findall(r"[0-9A-Za-z-]+", str(verified_numbers or "")))
 
 
+def find_row(rows, verified_numbers) -> dict | None:
+    """The one row of a verified order (status tracking): the row whose supplier number or a
+    portal order number is among the claim_tokens of the stored `verified_numbers`. None when
+    nothing is stored, no row or several rows match (never guesses)."""
+    if not isinstance(verified_numbers, str):
+        return None
+    stored = claim_tokens(verified_numbers)
+    if not stored:
+        return None
+    found = [row for row in rows or []
+             if claim_tokens(f"{row.get('supplier_no') or ''} {row.get('order_numbers') or ''}")
+             & stored]
+    return found[0] if len(found) == 1 else None
+
+
 def _has_reg_column(rows) -> bool:
     return any(row.get("reg_nr") is not None for row in rows or [])
 

@@ -2169,3 +2169,216 @@ def test_stale_approve_button_is_also_told_as_a_plain_message(tgs):
     assert tgs["answers"] == [("cb1", "Knappen är inte längre giltig.")]
     (text,) = tgs["sent"]
     assert "OLRD-0001" in text and "inte längre giltig" in text
+
+
+# ── Package 3 task 3: order status tracking ──────────────────────────────────
+
+RIO_NUMBERS = "90000002 · 01000011/01000012"
+
+
+def tracked(booking_id="B1", days=1.0, numbers=RIO_NUMBERS, **fields):
+    """A verified 'ordered' record whose Klar is not handled yet: status tracking follows it."""
+    when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    placed(booking_id, age=timedelta(days=days), handled=False, verified_at=when,
+           verified_numbers=numbers, **fields)
+
+
+def rio_rows(order_status="Bekräftad"):
+    rows = [dict(r) for r in ROWS]
+    rows[1]["order_status"] = order_status
+    return rows
+
+
+def test_first_sighting_stores_the_status_silently(tg, run_main, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    tracked()
+    assert check_output(capsys) == "has_pending=true"
+    factory = PortalFactory(SentPortal())
+    assert run_main(factory) == 0
+    record = orders_state.get("B1")
+    assert record["portal_status"] == "Bekräftad"
+    assert orders_state._parse_time(record["status_changed_at"]) is not None
+    assert tg["sent"] == []
+    assert factory.opened == 1 and factory.portal.calls == ["list_sent_orders"]
+    assert record["verified_numbers"] == RIO_NUMBERS and record["status"] == "ordered"
+
+
+def test_a_changed_status_is_sent_once_and_stored(tg, run_main):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    assert run_main(PortalFactory(SentPortal(rio_rows("Levererad")))) == 0
+    assert tg["sent"] == ["Orderstatus OLRD-0001: Bekräftad → Levererad"]
+    assert tg["klar"] == []
+    record = orders_state.get("B1")
+    assert record["portal_status"] == "Levererad"
+    assert record["status_changed_at"] != "2026-10-20T06:00:00+00:00"
+    assert run_main(PortalFactory(SentPortal(rio_rows("Levererad")))) == 0
+    assert len(tg["sent"]) == 1
+
+
+def test_an_unchanged_status_is_silent(tg, run_main):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert tg["sent"] == []
+    assert orders_state.get("B1")["status_changed_at"] == "2026-10-20T06:00:00+00:00"
+
+
+def test_a_failed_status_message_keeps_the_old_value_and_is_sent_next_run(tg, run_main):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    tg["send_ok"] = False
+    assert run_main(PortalFactory(SentPortal(rio_rows("Skickad")))) == 1   # shows as failed
+    record = orders_state.get("B1")
+    assert record["portal_status"] == "Bekräftad"
+    assert record["status_changed_at"] == "2026-10-20T06:00:00+00:00"
+    tg["send_ok"] = True
+    assert run_main(PortalFactory(SentPortal(rio_rows("Skickad")))) == 0
+    assert run_main(PortalFactory(SentPortal(rio_rows("Skickad")))) == 0
+    assert tg["sent"] == ["Orderstatus OLRD-0001: Bekräftad → Skickad"] * 2   # failed + sent
+    assert orders_state.get("B1")["portal_status"] == "Skickad"
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [sent_row("90000005", ASTRA, "01000041/01000042")],
+    [sent_row("90000002", RIO, ""), sent_row("90000099", RIO, "01000011")],   # ambiguous
+])
+def test_a_missing_or_ambiguous_row_changes_nothing(tg, run_main, rows):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    before = orders_state.get("B1")
+    for r in rows:
+        r["order_status"] = "Levererad"
+    assert run_main(PortalFactory(SentPortal(rows))) == 0
+    assert tg["sent"] == [] and orders_state.get("B1") == before
+
+
+def test_an_empty_portal_status_is_never_stored(tg, run_main):
+    tracked()
+    assert run_main(PortalFactory(SentPortal(rio_rows("  ​ ")))) == 0
+    assert "portal_status" not in orders_state.get("B1") and tg["sent"] == []
+
+
+@pytest.mark.parametrize("fields", [
+    {"days": 21.01},
+    {"klar_closed": True},
+    {"handled": True},
+])
+def test_old_or_klar_closed_orders_are_not_tracked(tg, run_main, monkeypatch, capsys, fields):
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    days = fields.pop("days", 1.0)
+    when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    placed(age=timedelta(days=days), verified_at=when, verified_numbers=RIO_NUMBERS,
+           **{"handled": False, **fields})
+    assert orders_state.tracked_orders(datetime.now(timezone.utc)) == []
+    assert check_output(capsys) == "has_pending=false"
+    assert run_main(PortalFactory(allowed=False)) == 0          # early exit: no browser
+    assert tg["offsets"] == [] and tg["sent"] == []
+    assert "portal_status" not in orders_state.get("B1")
+
+
+def test_status_text_is_sanitised_and_never_logged(tg, run_main, caplog):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    raw = "Skickad\x07\n<b>till</b>​  lager‮ SECRET" + "x" * 200
+    with caplog.at_level("DEBUG"):
+        assert run_main(PortalFactory(SentPortal(rio_rows(raw)))) == 0
+    stored = orders_state.get("B1")["portal_status"]
+    assert stored.startswith("Skickad till lager SECRET") and len(stored) == 80
+    assert all(c.isprintable() for c in stored) and "<" not in stored
+    assert tg["sent"] == [f"Orderstatus OLRD-0001: Bekräftad → {stored}"]
+    assert "SECRET" not in caplog.text and "Skickad" not in caplog.text
+    assert approve._clean_status(raw) == stored
+    assert approve._clean_status(None) == "" and approve._clean_status(5) == ""
+
+
+def test_one_sent_orders_read_serves_the_checker_and_the_tracking(tg, run_main):
+    tracked("B1")
+    placed("B2", booking_nr="OLRD-0002", model="OPELASTRA (J)(2012)")      # ambiguous: 2 rows
+    placed("B3", booking_nr="OLRD-0003", model="KIANIRO (I)")              # not found
+    factory = PortalFactory(SentPortal())
+    assert run_main(factory) == 0
+    assert factory.opened == 1 and factory.portal.calls == ["list_sent_orders"]
+    assert orders_state.get("B1")["portal_status"] == "Bekräftad"
+    assert orders_state.get("B2")["verify_warned"] is True
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Flera ordrar")
+
+
+def test_an_order_verified_in_this_run_gets_its_first_status_silently(tg, run_main):
+    placed(handled=False)
+    factory = PortalFactory(SentPortal())
+    assert run_main(factory) == 0
+    record = orders_state.get("B1")
+    assert record["verified_numbers"] == RIO_NUMBERS and record["portal_status"] == "Bekräftad"
+    assert len(tg["sent"]) == 1 and tg["sent"][0].startswith("Beställning verifierad")
+    assert factory.portal.calls == ["list_sent_orders"]
+
+
+@pytest.mark.parametrize("error", [
+    PartsPortalError("SECRET-PAGE-TEXT 0701234567", "search_timeout"),
+    RuntimeError("SECRET-PAGE-TEXT 0701234567"),
+])
+def test_tracking_portal_errors_are_logged_by_class_and_change_nothing(tg, run_main, caplog,
+                                                                      error):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    before = orders_state.get("B1")
+    with caplog.at_level("INFO"):
+        assert run_main(PortalFactory(SentPortal(error=error))) == 0
+    assert tg["sent"] == [] and orders_state.get("B1") == before
+    assert "SECRET-PAGE-TEXT" not in caplog.text and "0701234567" not in caplog.text
+
+
+def test_tracking_with_a_portal_that_cannot_open_changes_nothing(tg, run_main):
+    tracked()
+    assert run_main(PortalFactory(open_fails=True)) == 0
+    assert tg["sent"] == [] and "portal_status" not in orders_state.get("B1")
+
+
+def test_tracking_crash_never_breaks_the_run(tg, run_main, monkeypatch):
+    tracked()
+
+    def broken(*a, **k):
+        raise RuntimeError("tracking broke")
+
+    monkeypatch.setattr(approve, "track_statuses", broken)
+    assert run_main(PortalFactory(SentPortal())) == 0
+    assert tg["offsets"] == [None]
+
+
+def test_track_statuses_alone(tg):
+    tracked("B1", portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    tracked("B2", booking_nr="OLRD-0002", numbers="90000004 · 01000031/01000032")
+    now = datetime.now(timezone.utc)
+    rows = rio_rows("Restnoterad")
+    rows[2]["order_status"] = "Bekräftad"
+    assert approve.track_statuses(CONFIG, rows, now) is True
+    assert tg["sent"] == ["Orderstatus OLRD-0001: Bekräftad → Restnoterad"]
+    assert orders_state.get("B1")["status_changed_at"] == now.isoformat()
+    assert orders_state.get("B2")["portal_status"] == "Bekräftad"
+    tg["send_ok"] = False
+    rows[2]["order_status"] = "Skickad"
+    assert approve.track_statuses(CONFIG, rows, now) is False
+    assert orders_state.get("B2")["portal_status"] == "Bekräftad"
+    assert approve.track_statuses(CONFIG, [], now) is True
+
+
+def test_check_with_only_a_tracked_order_is_stdlib_only(tmp_path):
+    (tmp_path / "config").mkdir(exist_ok=True)
+    when = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    (tmp_path / "config" / "orders.json").write_text(json.dumps(
+        {"last_update_id": None, "bookings": {"B1": {
+            "status": "ordered", "plan": {"booking_nr": "OLRD-0001"}, "message_id": 77,
+            "updated_at": when, "verified_at": when, "verified_numbers": RIO_NUMBERS}}}),
+        encoding="utf-8")
+    code = (
+        "import sys, approve\n"
+        "rc = approve.main(['--check'])\n"
+        "heavy = [m for m in ('playwright', 'anthropic', 'yaml', 'notifier', 'rules',\n"
+        "         'parts_order', 'config_loader', 'parts_portal', 'portal_scraper',\n"
+        "         'order_match') if m in sys.modules]\n"
+        "print('HEAVY', heavy)\n"
+        "sys.exit(rc)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    env.pop("GITHUB_OUTPUT", None)
+    out = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert "has_pending=true" in out.stdout
+    assert "HEAVY []" in out.stdout

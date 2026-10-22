@@ -12,7 +12,8 @@ Stored as config/orders.json (committed back to the repo by the workflows):
                                    "handled", "last_reason", "gave_up",
                                    "klar_message_id", "klar_sent_at", "klar_closed",
                                    "vehicle_model", "verified_at", "verified_numbers",
-                                   "verify_warned", "swaps"}}}
+                                   "verify_warned", "swaps", "portal_status",
+                                   "status_changed_at"}}}
 
 Optional fields (absent in older records) are kept by put()/begin() and set with
 update_fields(). Unknown record keys are rejected. Never store customer data here.
@@ -59,10 +60,18 @@ OPTIONAL_FIELDS = {
     # One-tap swap (approve.py): how often the owner swapped a part to its alternative
     # (0..MAX_SWAPS); parts_order shows no swap buttons once it reaches MAX_SWAPS.
     "swaps": int,
+    # Order status tracking (approve.track_statuses, package 3): the last "Beställningsstatus"
+    # of the order's Skickade Beställningar row the owner was told about (sanitised portal
+    # text, <= STATUS_MAX, no control or format characters) and when it was stored.
+    "portal_status": str,
+    "status_changed_at": str,  # ISO 8601 with time zone
 }
 MAX_SWAPS = 2
 MODEL_MAX = 80
 NUMBERS_MAX = 120
+STATUS_MAX = 80
+# A verified order's portal status is followed this long (from verified_at), or until Klar.
+TRACK_MAX_AGE = timedelta(days=21)
 KLAR_MAX_AGE = timedelta(days=14)
 MAX_TRIES = 10
 REASON_MAX = 200
@@ -122,13 +131,15 @@ def _field_problem(key: str, value) -> str | None:
         return f"'swaps' is not 0-{MAX_SWAPS}"
     if key == "klar_message_id" and value < 1:
         return "'klar_message_id' is not positive"
-    if key in ("klar_sent_at", "verified_at") and _parse_time(value) is None:
+    if key in ("klar_sent_at", "verified_at", "status_changed_at") and _parse_time(value) is None:
         return f"{key!r} is not an ISO time with a time zone"
-    limit = {"vehicle_model": MODEL_MAX, "verified_numbers": NUMBERS_MAX}.get(key)
+    limit = {"vehicle_model": MODEL_MAX, "verified_numbers": NUMBERS_MAX,
+             "portal_status": STATUS_MAX}.get(key)
     if limit is not None:
         if len(value) > limit:
             return f"{key!r} is longer than {limit} characters"
-        if any(unicodedata.category(c) == "Cc" for c in value):
+        banned = ("Cc", "Cf") if key == "portal_status" else ("Cc",)
+        if any(unicodedata.category(c) in banned for c in value):
             return f"{key!r} contains control characters"
     return None
 
@@ -343,6 +354,33 @@ def unverified_orders() -> list[tuple[str, dict]]:
     bookings = _load()["bookings"]
     return [(bid, bookings[bid]) for bid in sorted(bookings)
             if bookings[bid].get("status") == "ordered" and "verified_at" not in bookings[bid]]
+
+
+def tracked_orders(now: datetime | None = None,
+                   max_age: timedelta = TRACK_MAX_AGE) -> list[tuple[str, dict]]:
+    """'ordered' records whose portal status is followed (approve.track_statuses): verified
+    (verified_at and verified_numbers), younger than `max_age` (counted from verified_at,
+    else updated_at) and not Klar-closed (neither handled nor klar_closed)."""
+    now = now or datetime.now(timezone.utc)
+    bookings = _load()["bookings"]
+    out = []
+    for bid in sorted(bookings):
+        rec = bookings[bid]
+        if (rec.get("status") != "ordered" or "verified_at" not in rec
+                or not rec.get("verified_numbers")
+                or rec.get("handled") is True or rec.get("klar_closed") is True):
+            continue
+        since = _parse_time(rec["verified_at"])
+        if since is None and isinstance(rec.get("updated_at"), str):
+            since = _parse_time(rec["updated_at"])
+        if since is not None and now - since < max_age:
+            out.append((bid, rec))
+    return out
+
+
+def outstanding_tracking(now: datetime | None = None) -> bool:
+    """True while some order's portal status is followed (approve.py --check)."""
+    return bool(tracked_orders(now))
 
 
 def last_update_id() -> int | None:

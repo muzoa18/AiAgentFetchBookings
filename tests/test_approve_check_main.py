@@ -51,3 +51,30 @@ def test_check_through_main_exits_0_without_secrets(tmp_path, monkeypatch, pendi
     assert f"has_pending={expected}" in proc.stdout.splitlines()
     assert output.read_text(encoding="utf-8") == f"has_pending={expected}\n"
     assert not (work / "config" / "alerts.json").exists()
+
+
+def _tracked_record(days_ago, **fields):
+    from datetime import datetime, timedelta, timezone
+    when = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+    return {"status": "ordered", "plan": {"booking_nr": "OLRD-0001"}, "message_id": 7,
+            "updated_at": when, "verified_at": when,
+            "verified_numbers": "90000002 · 01000011/01000012", **fields}
+
+
+@pytest.mark.parametrize("record,expected", [
+    (_tracked_record(1), "true"),                        # tracked: the browser run is needed
+    (_tracked_record(22), "false"),                      # older than 21 days
+    (_tracked_record(1, klar_closed=True), "false"),     # Klar withdrawn
+    (_tracked_record(1, handled=True), "false"),         # Klar tapped (Hanterad)
+])
+def test_check_through_main_follows_status_tracking(tmp_path, monkeypatch, record, expected):
+    work = _workdir(tmp_path, monkeypatch, pending=False)
+    (work / "config" / "orders.json").write_text(
+        json.dumps({"last_update_id": None, "bookings": {"B1": record}}), encoding="utf-8")
+    output = tmp_path / "github_output"
+    proc = subprocess.run([sys.executable, "approve.py", "--check"], cwd=work,
+                          env=_secret_free_env(output), capture_output=True, text=True,
+                          timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"has_pending={expected}" in proc.stdout.splitlines()
+    assert output.read_text(encoding="utf-8") == f"has_pending={expected}\n"

@@ -32,6 +32,12 @@ registration (order_match). Exactly one row: its order numbers are stored and th
 is told. Several rows: the owner is asked once to check which one. Nothing found for
 3 days: one warning. Portal errors are retried silently on the next run.
 
+Status tracking (track_statuses) follows every verified order for 21 days or until its
+Klar is done (orders_state.tracked_orders): its row is found again in the same Skickade
+Beställningar read (by the stored order numbers, order_match.find_row) and a changed
+"Beställningsstatus" is told to the owner once ("Orderstatus <label>: <old> → <new>"); the
+first status seen is only stored. Read-only, like the checker.
+
 A Klar tap is accepted with the same checks (owner, private chat, the booking's
 stored klar_message_id) and only once the order is resolved: never while it is
 "pending" or "attempted". A failed Hanterad keeps the button so the owner can tap
@@ -44,8 +50,9 @@ unconfirmed and retried on the next poll; nothing after it is processed.
 
   python approve.py --check   prints has_pending=true|false (stdlib only); true when an
                               order awaits approval, a Klar button is
-                              outstanding or due to be withdrawn, or a placed
-                              order still awaits the order checker
+                              outstanding or due to be withdrawn, a placed
+                              order still awaits the order checker, or a
+                              verified order's portal status is tracked
   python approve.py           handles taps; exit 1 if anything failed
 """
 
@@ -74,6 +81,7 @@ AMBIGUOUS_TEXT = ("Flera ordrar för {model} i Skickade Beställningar – kontr
                   "är {label}: {rows}.")
 NOT_VERIFIED_TEXT = ("Kunde inte verifiera beställningen för {label} i Skickade Beställningar "
                      "efter 3 dagar – kontrollera i portalen.")
+STATUS_TEXT = "Orderstatus {label}: {old} → {new}"
 CART_CLEARED = "Varukorgen är tömd."
 CART_MANUAL = "Varukorgen kunde inte tömmas – töm varukorgen på pro.meca.se för hand."
 CART_LEFT = "Varukorgen på pro.meca.se innehåller fortfarande delarna – töm varukorgen för hand."
@@ -552,7 +560,29 @@ def _send_once(config, booking_id, text) -> bool:
     return True
 
 
-def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
+class _SentOrders:
+    """pro.meca.se "Skickade Beställningar", read at most once per run and shared by the
+    order checker and the status tracking. get() -> the rows, or None after a portal error
+    (logged by class and error code only: never raw page text)."""
+
+    def __init__(self, session: "_Portal"):
+        self.session, self.read, self.rows = session, False, None
+
+    def get(self) -> list[dict] | None:
+        if not self.read:
+            self.read = True
+            from parts_order_helpers import error_code
+            try:
+                self.rows = self.session.get().list_sent_orders()
+            except Exception as e:  # retried next run; never raw page text in the log
+                code = error_code(e)
+                log.warning("Could not read Skickade Beställningar (%s%s); retried on the "
+                            "next run.", type(e).__name__, f", {code}" if code else "")
+        return self.rows
+
+
+def _verify_orders(config: dict, session: "_Portal", now: datetime,
+                   sent: _SentOrders | None = None) -> bool:
     """Find unverified placed orders in pro.meca.se "Skickade Beställningar" (read-only).
 
     The portal is opened (once, through `session`) only when a record can be matched (a
@@ -560,10 +590,10 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
     (order_match.resolve_orders), so two orders for the same car never swap rows.
     Returns True when a message was not delivered. An undelivered "verified" message is
     NOT sent again: the stored state is correct and the run exits 1 so it shows.
+    The rows come from `sent` (one read per run, shared with track_statuses).
     """
     import notifier
     from order_match import match_key, numbers_text, order_facts, resolve_orders, verified_text
-    from parts_order_helpers import error_code
 
     todo = _to_verify()
     if not todo:
@@ -575,13 +605,8 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
                  if key is not None}
     results = {}
     if checkable:
-        try:
-            rows = session.get().list_sent_orders()
-        except Exception as e:  # retried next run; never raw page text in the log
-            code = error_code(e)
-            log.warning("Could not read Skickade Beställningar (%s%s); retried on the "
-                        "next run.", type(e).__name__, f", {code}" if code else "")
-        else:
+        rows = (sent or _SentOrders(session)).get()
+        if rows is not None:
             results = resolve_orders(checkable, rows, _claimed())
 
     problem = False
@@ -609,6 +634,56 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
     return problem
 
 
+# ── Status tracking ──────────────────────────────────────────────────────────
+
+def _clean_status(text) -> str:
+    """A row's "Beställningsstatus" made safe to store and send: page markup and format
+    characters dropped, control characters as spaces, single spaces, at most
+    orders_state.STATUS_MAX characters; "" for anything that is not a string."""
+    import re
+    import unicodedata
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r"<[^>]*>", " ", text)
+    kept = "".join(" " if unicodedata.category(c) == "Cc" else c for c in text
+                   if unicodedata.category(c) != "Cf" and c not in "<>")
+    return " ".join(kept.split())[:orders_state.STATUS_MAX].strip()
+
+
+def track_statuses(config: dict, rows: list[dict], now: datetime) -> bool:
+    """Tell the owner when a tracked order's portal status changed. True when every needed
+    message was delivered.
+
+    For each orders_state.tracked_orders(now) record, its row is the one order_match.find_row
+    finds by the stored verified_numbers (none or several: nothing happens). The first status
+    seen is stored silently; a different one is sent as STATUS_TEXT and stored only after the
+    send succeeded, so an undelivered message is sent again on the next run (never lost,
+    never twice). The status text itself is never logged, only its length."""
+    import notifier
+    from order_match import find_row
+    delivered = True
+    for booking_id, record in orders_state.tracked_orders(now):
+        row = find_row(rows, record.get("verified_numbers"))
+        new = _clean_status(row.get("order_status")) if row is not None else ""
+        old = record.get("portal_status")
+        if not new or new == old:
+            continue
+        stamp = now.isoformat()
+        if not old:
+            orders_state.update_fields(booking_id, portal_status=new, status_changed_at=stamp)
+            log.info("Order status of %s first seen (%d chars); stored.", booking_id, len(new))
+            continue
+        text = STATUS_TEXT.format(label=_label(booking_id, record), old=old, new=new)
+        if not notifier.send_message(config, text):
+            log.error("Status message for %s was not delivered; retried next run.", booking_id)
+            delivered = False
+            continue
+        orders_state.update_fields(booking_id, portal_status=new, status_changed_at=stamp)
+        log.info("Order status of %s changed (%d chars); the owner was told.",
+                 booking_id, len(new))
+    return delivered
+
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def make_portal(config: dict):
@@ -625,7 +700,8 @@ def make_portal(config: dict):
 def _check() -> int:
     try:
         has_pending = (bool(orders_state.pending()) or bool(orders_state.outstanding_klar())
-                       or bool(orders_state.expired_klar()) or bool(_to_verify()))
+                       or bool(orders_state.expired_klar()) or bool(_to_verify())
+                       or orders_state.outstanding_tracking())
     except Exception as e:
         print(f"Order state unreadable: {e}", file=sys.stderr)
         return 1
@@ -661,8 +737,10 @@ def main(argv=None) -> int:
 
     try:
         if not (orders_state.pending() or orders_state.outstanding_klar()
-                or orders_state.expired_klar() or _to_verify()):
-            log.info("No pending approvals, no outstanding Klar buttons, no order to verify.")
+                or orders_state.expired_klar() or _to_verify()
+                or orders_state.outstanding_tracking()):
+            log.info("No pending approvals, no outstanding Klar buttons, no order to verify "
+                     "or track.")
             return 0
     except Exception:
         log.exception("Order state file unreadable — no approvals handled.")
@@ -689,16 +767,28 @@ def main(argv=None) -> int:
     except Exception:
         log.exception("Withdrawing expired Klar buttons failed.")
         expire_problem = True
-    with ExitStack() as stack:  # one pro.meca.se session for the taps and the order checker
+    # One pro.meca.se session for the taps, the order checker and the status tracking; it is
+    # closed when this block ends, and Skickade Beställningar is read at most once (_SentOrders).
+    with ExitStack() as stack:
         session = _Portal(lambda: make_portal(config), stack)
         actions, problem = _handle(config, None, rules, session=session)
         log.info("Approval poll done: %d action(s).", actions)
+        now = datetime.now(timezone.utc)
+        sent = _SentOrders(session)
         try:
-            verify_problem = _verify_orders(config, session, datetime.now(timezone.utc))
+            verify_problem = _verify_orders(config, session, now, sent)
         except Exception:
             log.exception("The order checker failed; it runs again next time.")
             verify_problem = False
-    return 1 if expire_problem or problem or verify_problem else 0
+        track_problem = False
+        try:
+            if orders_state.outstanding_tracking(now):
+                rows = sent.get()
+                if rows is not None:
+                    track_problem = not track_statuses(config, rows, now)
+        except Exception:
+            log.exception("Status tracking failed; it runs again next time.")
+    return 1 if expire_problem or problem or verify_problem or track_problem else 0
 
 
 if __name__ == "__main__":

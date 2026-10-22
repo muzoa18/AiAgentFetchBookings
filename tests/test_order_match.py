@@ -261,3 +261,50 @@ def test_the_input_rows_are_not_modified():
     before = [dict(r) for r in rows]
     match_sent_order(rows, "KIARIO", D, {"x"})
     assert rows == before
+
+
+# ── find_row (package 3 task 3: order status tracking) ───────────────────────
+
+import order_match  # noqa: E402
+
+
+def find_row(rows, stored):
+    return order_match.find_row(rows, stored)
+
+STORED = "90000002 · 01000011/01000012"
+
+
+def test_find_row_by_the_supplier_number():
+    rows = [row("90000001", "x", numbers=""), row("90000002", "y", numbers="01000011/01000012"),
+            row("90000003", "z", numbers="01000031")]
+    assert find_row(rows, STORED)["supplier_no"] == "90000002"
+
+
+def test_find_row_by_a_portal_order_number_alone():
+    rows = [row("90000077", "y", numbers="01000012"), row("90000003", "z", numbers="01000031")]
+    assert find_row(rows, STORED)["supplier_no"] == "90000077"
+
+
+def test_find_row_never_matches_a_part_of_a_number():
+    rows = [row("9000000", "y", numbers="0100001"), row("900000021", "y", numbers="1000011")]
+    assert find_row(rows, STORED) is None
+
+
+@pytest.mark.parametrize("stored", ["", None, "   ", 90000002])
+def test_find_row_without_stored_numbers_is_none(stored):
+    assert find_row([row("90000002", "y", numbers="")], stored) is None
+
+
+def test_find_row_none_when_nothing_or_several_rows_match():
+    assert find_row([], STORED) is None
+    assert find_row(None, STORED) is None
+    assert find_row([row("90000005", "y", numbers="01000051")], STORED) is None
+    two = [row("90000002", "y", numbers=""), row("90000099", "y", numbers="01000011")]
+    assert find_row(two, STORED) is None
+
+
+def test_find_row_uses_the_claim_tokens_of_the_stored_text():
+    # A stored text cut at a number boundary: only whole numbers are compared.
+    rows = [row("90000002", "y", numbers="01000011/01000012/01000013")]
+    assert find_row(rows, "90000002 · 01000011") is rows[0]
+    assert claim_tokens("90000002 · 01000011") == {"90000002", "01000011"}
