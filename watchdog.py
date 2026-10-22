@@ -9,7 +9,7 @@ it is logged and nothing is raised.
 Its alerts live in their own file, config/watchdog_alerts.json (WATCHDOG_ALERTS_FILE),
 never config/alerts.json: the watchdog has its own concurrency group, so a shared file
 could make its state commit conflict with a bookings/approve commit. The dashboard
-merges both files. workflow_failed_* alerts are resolved by preflight.guarded.
+merges both files. workflow_failed_* alerts are resolved by preflight.guarded and the "Mark OK" workflow step.
 
 Env: GITHUB_TOKEN, GITHUB_REPOSITORY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
 Always exits 0.

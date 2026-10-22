@@ -68,11 +68,11 @@ failures that happen before or outside Python.
 *Revised (final review):*
 - Condition `if: failure() || cancelled()`. A job-level `timeout-minutes` hit is a cancel,
   which `failure()` alone skips. The main steps get their own step timeout below the job's
-  ("Run booking agent" 13 of 15 min, "Handle approvals" 8 of 10): a step timeout fails the
+  ("Run booking agent" 13 of 20 min, "Handle approvals" 8 of 15): a step timeout fails the
   step, so `failure()` fires. A manual cancel also alerts (accepted).
 - Suppression: `workflow-failed` raises nothing when `state_unreadable`, `crash_<short>` or
   `run_failed_<short>` of this workflow (`<short>` = `preflight.DISPLAY_NAMES` inverted) is
-  active and its `last_seen` is within 60 min: that alert came from this run and already told
+  active and its `last_seen` is within 20 min: that alert came from this run and already told
   the owner. It logs the suppression. An unknown workflow name is never suppressed. A failed
   install has no specific alert, so it still raises `workflow_failed_<name>`.
 - **Mark OK** step, `if: success()`, after the agent/approve step and before the persist

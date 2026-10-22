@@ -143,10 +143,10 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   `if: failure() || cancelled()`, in bookings.yml and approve.yml): key
   `workflow_failed_<workflow name>`; stdlib only. It covers a failed install, the main step's own
   `timeout-minutes` ("Run booking agent" 13, "Handle approvals" 8: the step fails, so `failure()`
-  fires), the job timeout (15 / 10 min: that is a cancel, hence `cancelled()`; a manual cancel
+  fires), the job timeout (20 / 15 min: that is a cancel, hence `cancelled()`; a manual cancel
   alerts too) and a crash before our code starts. Suppressed when this workflow's
   `state_unreadable`, `crash_<short>` or `run_failed_<short>` is active and was last seen within
-  60 min (this run already told the owner). It runs before the persist step; always exits 0.
+  20 min (this run already told the owner). It runs before the persist step; always exits 0.
 - **Mark OK** (`alerts_cli.py workflow-ok <name>`, `if: success()`, after the agent/approve step and
   before the persist step, env WORKFLOW_NAME only): resolves `workflow_failed_<name>`,
   `run_failed_<short>`, `crash_<short>`. Needed because most approve runs stop after `--check`,

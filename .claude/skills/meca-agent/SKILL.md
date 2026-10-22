@@ -47,8 +47,8 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   (`guarded` and the "Mark OK" step, `alerts_cli.py workflow-ok`). One fault, one message: no
   `run_failed_` after `state_unreadable`/`crash_` in the same run, and "Alert on failure"
   (`if: failure() || cancelled()`) stays quiet when a specific alert of this workflow is active
-  and was seen within 60 min. Main steps have their own `timeout-minutes` (13 / 8) below the
-  job's (15 / 10) so a hang fails the step; a job timeout is a cancel, covered by `cancelled()`.
+  and was seen within 20 min. Main steps have their own `timeout-minutes` (13 / 8) below the
+  job's (20 / 15) so a hang fails the step; a job timeout is a cancel, covered by `cancelled()`.
   `alerts.py` never raises. Alert texts never carry exception messages, only the class name.
 - **Every file the workflows read must be committed.** The first GitHub run lost order state
   because `config/orders.json` was never committed; a missing file now stops ordering.

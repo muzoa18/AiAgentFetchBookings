@@ -19,7 +19,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
         run: python agent.py
 
       # Clears this workflow's alerts (workflow_failed, run_failed, crash) after a good
-      # run, including approve runs that stop after --check. Stdlib only, no secrets.
+      # run. Stdlib only, no secrets.
       - name: Mark OK
         if: ${{ success() }}
         env:

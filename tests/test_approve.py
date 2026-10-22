@@ -1051,7 +1051,7 @@ def test_approve_workflow_shape():
     assert on["schedule"] == [{"cron": "0 6 * * *"}]
     assert "workflow_dispatch" in on
     (job,) = wf["jobs"].values()
-    assert job["timeout-minutes"] == 10
+    assert job["timeout-minutes"] == 15
     assert wf["concurrency"] == {"group": "meca-bookings", "cancel-in-progress": False}
     assert _workflow("bookings.yml")["concurrency"]["group"] == "meca-bookings"
 

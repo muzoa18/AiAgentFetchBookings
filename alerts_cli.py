@@ -36,7 +36,7 @@ from preflight import DISPLAY_NAMES, STATE_ALERT_KEY
 log = logging.getLogger("alerts_cli")
 
 SHORT_NAMES = {display: short for short, display in DISPLAY_NAMES.items()}
-FRESH = timedelta(minutes=60)
+FRESH = timedelta(minutes=20)
 
 
 def _specific_keys(name: str) -> list[str]:

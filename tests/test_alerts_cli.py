@@ -220,8 +220,8 @@ def test_workflows_mark_ok_after_the_run_and_before_persist(name, run_step):
 
 
 @pytest.mark.parametrize("name,run_step,step_timeout,job_timeout",
-                         [("bookings.yml", "Run booking agent", 13, 15),
-                          ("approve.yml", "Handle approvals", 8, 10)])
+                         [("bookings.yml", "Run booking agent", 13, 20),
+                          ("approve.yml", "Handle approvals", 8, 15)])
 def test_main_step_times_out_before_the_job(name, run_step, step_timeout, job_timeout):
     # A step timeout fails the step (failure() fires); a job timeout only cancels.
     wf = yaml.safe_load((ROOT / ".github/workflows" / name).read_text(encoding="utf-8"))
