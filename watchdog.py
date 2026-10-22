@@ -2,7 +2,7 @@
 watchdog.py
 -----------
 Dead-man switch (stdlib only: runs without pip install). Asks the GitHub API
-when bookings.yml and approve.yml last succeeded and raises a Telegram alert if
+when bookings.yml, approve.yml and daily-summary.yml last succeeded and raises a Telegram alert if
 a scheduled slot was missed. A failing API call is NOT evidence of a stale run:
 it is logged and nothing is raised.
 
@@ -44,6 +44,7 @@ class Spec:
     key: str
     label: str
     display_name: str    # the workflow's `name:`, used in workflow_failed_<name>
+    minute: int = 0      # UTC
 
 
 SPECS = {
@@ -53,6 +54,9 @@ SPECS = {
     "approve": Spec(file="approve.yml", days=(0, 1, 2, 3, 4, 5, 6), hour=6,
                     key="stale_approve", label="godkännandekontrollen",
                     display_name="MECA Approval Poller"),
+    "summary": Spec(file="daily-summary.yml", days=(0, 1, 2, 3, 4, 5, 6), hour=5,
+                    key="stale_summary", label="dagssammanfattningen",
+                    display_name="MECA Daily Summary", minute=45),
 }
 
 
@@ -70,7 +74,7 @@ def last_slot(now: datetime, spec: Spec) -> datetime:
         day = now - timedelta(days=back)
         if day.weekday() not in spec.days:
             continue
-        slot = day.replace(hour=spec.hour, minute=0, second=0, microsecond=0)
+        slot = day.replace(hour=spec.hour, minute=spec.minute, second=0, microsecond=0)
         if slot <= now:
             return slot
     raise WatchdogError("no slot found")

@@ -1,0 +1,36 @@
+name: MECA Daily Summary
+
+# One Telegram overview per day (07:45 Swedish summer time). Reads the committed state
+# files only: no browser, no state written, nothing installed. The watchdog checks that
+# this workflow keeps succeeding, so it has no failure-alert step of its own.
+on:
+  schedule:
+    - cron: "45 5 * * *"
+  workflow_dispatch:
+
+# Its own group: never blocks or replaces a pending bookings/approve run.
+concurrency:
+  group: meca-summary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Send daily summary
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 summary.py

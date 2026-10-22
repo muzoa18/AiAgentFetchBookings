@@ -238,3 +238,22 @@ def test_watchdog_workflow_structure():
     assert "chore: update watchdog state [skip ci]" in persist["run"]
     assert "pip install" not in yaml.safe_dump(wf)
     assert "cache" not in yaml.safe_dump(steps[1])
+
+
+def test_summary_spec_and_slot():
+    S = SPECS["summary"]
+    assert S.file == "daily-summary.yml" and S.days == tuple(range(7)) and S.hour == 5
+    assert S.minute == 45
+    assert S.key == "stale_summary" and S.label == "dagssammanfattningen"
+    assert S.display_name == "MECA Daily Summary"
+    assert last_slot(utc(2026, 10, 21, 5, 44), S) == utc(2026, 10, 20, 5, 45)
+    assert last_slot(utc(2026, 10, 21, 5, 45), S) == utc(2026, 10, 21, 5, 45)
+
+
+def test_summary_overdue_boundary():
+    S = SPECS["summary"]
+    ok = utc(2026, 10, 21, 5, 47)
+    assert not is_overdue(utc(2026, 10, 21, 8, 45), None, S)       # exactly at grace end
+    assert is_overdue(utc(2026, 10, 21, 8, 46), None, S)
+    assert not is_overdue(utc(2026, 10, 21, 8, 46), ok, S)
+    assert is_overdue(utc(2026, 10, 21, 8, 46), utc(2026, 10, 20, 5, 47), S)
