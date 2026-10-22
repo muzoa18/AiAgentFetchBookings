@@ -10,7 +10,7 @@ import unicodedata
 from collections import Counter
 
 from parts_matcher import has_non_latin, is_fluid, is_forbidden
-from parts_portal_parse import PartsPortalError
+from parts_portal_parse import PartsPortalError, parse_sek
 from rules import Rules
 
 PREPARE_HEADER = "Förbered (finns på lager):"
@@ -256,18 +256,71 @@ def reference_line(ref) -> str:
     return f"Ordernummer: {ref}"
 
 
+# The MECA booking page lists prices EXCLUDING VAT ("Totalt exklusive moms"; fixture
+# booking_delar.html: 6 285,64 ex vs "Att betala" 7 857 = x 1.25), and a part row's `price` is
+# that row's TOTAL (unit x qty, e.g. 4 x 143,90 = 575,60). The pro.meca.se cart total is
+# INCLUDING 25 % Swedish VAT, so it is divided by VAT_FACTOR before it is compared.
+VAT_FACTOR = 1.25
+
+
+def _booking_parts_price(parts) -> float | None:
+    """Sum of the booking's part row totals (ex VAT), or None when any row is unusable."""
+    if not isinstance(parts, list) or not parts:
+        return None
+    total = 0.0
+    for row in parts:
+        if not isinstance(row, dict) or parse_qty(row.get("qty")) is None:
+            return None
+        price = row.get("price")
+        if not isinstance(price, str):
+            return None
+        value = parse_sek(price)
+        if value is None or not value > 0:
+            return None
+        total += value
+    return round(total, 2)
+
+
+def margin_line(booking: dict, cart_total, rules: Rules) -> str | None:
+    """Informational warning for the approval message, or None. Compares the purchase (cart
+    total incl. VAT, converted to ex VAT) with what the booking charges for the parts (ex
+    VAT). A loss gives "OBS: inköp exkl. moms X SEK över bokningens delpris Y SEK"; else a
+    margin under rules.min_margin_pct (when > 0) gives "OBS: marginal N % (under M %)".
+    Anything unknown (a missing or unparsable price on any row, other currency, bad total)
+    gives None: never a false alarm. Never blocks anything."""
+    if isinstance(cart_total, bool) or not isinstance(cart_total, (int, float)) \
+            or not math.isfinite(cart_total) or cart_total < 0:
+        return None
+    customer = _booking_parts_price(booking.get("parts") if isinstance(booking, dict) else None)
+    if customer is None:
+        return None
+    purchase = round(cart_total / VAT_FACTOR, 2)
+    if purchase > customer:
+        return (f"OBS: inköp exkl. moms {purchase:.2f} SEK över bokningens delpris "
+                f"{customer:.2f} SEK")
+    minimum = rules.min_margin_pct
+    margin = (customer - purchase) / customer * 100
+    if minimum > 0 and margin < minimum:
+        return f"OBS: marginal {margin:.0f} % (under {minimum} %)"
+    return None
+
+
 def build_summary(booking: dict, cart: dict, fluids: list[dict], parts: list[dict],
-                  alternatives: bool = True, notes: bool = True) -> str:
+                  alternatives: bool = True, notes: bool = True,
+                  margin: str | None = None) -> str:
     """Approval text: booking header, chosen parts (with any in-stock replacement), cart
     total, fluids, then, after a blank line, one line per alternative. Plain text.
     `alternatives` / `notes` False leave out the alternative block / the "Bytt från" notes
-    (the length guard in parts_order); both False is the pre-package-2 summary."""
+    (the length guard in parts_order); both False is the pre-package-2 summary. `margin` is
+    the optional margin_line text, shown after the total."""
     reg = str(booking.get("reg_nr") or "–").strip()
     label = booking.get("booking_nr") or booking.get("id") or "okänd bokning"
     alt = alternative_lines(parts) if alternatives else []
+    body = order_body(parts, cart.get("total_sek"), fluids, notes=notes)
+    if margin:  # right after the "Totalt:" line, before the fluids
+        body.insert(1 + len(parts) + 1, margin)
     return "\n".join([
         f"Delbeställning {label}",
         f"Kund: {booking.get('driver_name') or booking.get('customer_line') or '–'}",
         f"Fordon: {reg} {booking.get('vehicle') or ''}".rstrip(),
-    ] + order_body(parts, cart.get("total_sek"), fluids, notes=notes)
-        + ([""] + alt if alt else []))
+    ] + body + ([""] + alt if alt else []))

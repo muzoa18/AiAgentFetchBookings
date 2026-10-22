@@ -3444,3 +3444,194 @@ def test_swap_title_check_ignores_case_and_spacing(tg):
                         cart=_cart(650.0, lines))
 
     assert _restage(record, portal) == "pending"
+
+
+# ── Margin warning (package 3, task 2) ────────────────────────────────────────
+# Booking part rows: `price` is the ROW TOTAL (unit x qty) of the booking page, EXCLUDING
+# VAT; the cart total is INCLUDING 25 % VAT (see margin_line).
+from parts_order_helpers import VAT_FACTOR, margin_line  # noqa: E402
+
+MARGIN_RULES = Rules(("Bosch",), ("ProMeister",), 10000, "approve", min_margin_pct=0)
+
+
+def _mbooking(*rows):
+    return {"parts": [{"name": f"Del {i}", "qty": q, "price": p}
+                      for i, (q, p) in enumerate(rows)]}
+
+
+def test_vat_factor_is_the_swedish_25_percent():
+    assert VAT_FACTOR == 1.25
+
+
+def test_margin_line_loss_compares_the_cart_ex_vat():
+    # cart 250 incl VAT = 200.00 ex VAT; the customer pays 150 ex VAT for the parts.
+    line = margin_line(_mbooking(("1", "100,00 SEK"), ("x2", "50,00 SEK")), 250.0, MARGIN_RULES)
+    assert line == "OBS: inköp exkl. moms 200.00 SEK över bokningens delpris 150.00 SEK"
+
+
+def test_margin_line_cart_inclusive_total_is_not_compared_directly():
+    # cart 120 incl VAT = 96 ex VAT < customer 100 ex VAT: profit, so no line (a direct
+    # comparison 120 > 100 would be a false alarm).
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 120.0, MARGIN_RULES) is None
+
+
+def test_margin_line_exactly_equal_ex_vat_is_none():
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 125.0, MARGIN_RULES) is None
+
+
+def test_margin_line_one_krona_over_is_a_loss():
+    line = margin_line(_mbooking(("1", "100,00 SEK")), 126.25, MARGIN_RULES)
+    assert line == "OBS: inköp exkl. moms 101.00 SEK över bokningens delpris 100.00 SEK"
+
+
+def test_margin_line_under_minimum():
+    rules = Rules(("Bosch",), (), 10000, "approve", min_margin_pct=30)
+    # purchase ex VAT 80, customer 100: margin 20 % < 30 %
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 100.0, rules) \
+        == "OBS: marginal 20 % (under 30 %)"
+
+
+def test_margin_line_at_or_above_minimum_is_none():
+    rules = Rules(("Bosch",), (), 10000, "approve", min_margin_pct=20)
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 100.0, rules) is None   # exactly 20 %
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 50.0, rules) is None    # 60 %
+
+
+def test_margin_line_zero_minimum_and_profit_is_none():
+    assert margin_line(_mbooking(("1", "100,00 SEK")), 50.0, MARGIN_RULES) is None
+
+
+def test_margin_line_price_is_a_row_total_not_multiplied_by_qty():
+    # Tändstift x4: the portal's row total is 575,60 (unit 143,90). Customer = 575.60.
+    line = margin_line(_mbooking(("4", "575,60 SEK")), 1000.0, MARGIN_RULES)
+    assert line == "OBS: inköp exkl. moms 800.00 SEK över bokningens delpris 575.60 SEK"
+
+
+def test_margin_line_thousands_separator_and_nbsp():
+    line = margin_line(_mbooking(("1", "1 056,00 SEK")), 1500.0, MARGIN_RULES)
+    assert line == "OBS: inköp exkl. moms 1200.00 SEK över bokningens delpris 1056.00 SEK"
+
+
+@pytest.mark.parametrize("rows", [
+    [("1", "")],                                  # missing price
+    [("1", None)],
+    [("1", "0,00 SEK")],                          # zero
+    [("1", "-5,00 SEK")],
+    [("1", "pris saknas")],                       # text
+    [("1", "100,00 EUR")],                        # other currency
+    [("1", "100,00 SEK"), ("1", "")],             # ANY row unknown
+    [("1", "100,00 SEK"), ("1", "10,00 EUR")],    # mixed currencies
+    [("abc", "100,00 SEK")],                      # unreadable quantity
+    [("0", "100,00 SEK")],
+    [("-1", "100,00 SEK")],
+    [],                                           # no part rows
+])
+def test_margin_line_unknown_prices_give_no_line(rows):
+    assert margin_line(_mbooking(*rows), 900.0, MARGIN_RULES) is None
+
+
+def test_margin_line_qty_forms_accepted():
+    for qty in ("2", "x2", "X2", "", None, 2):
+        line = margin_line(_mbooking((qty, "100,00 SEK")), 250.0, MARGIN_RULES)
+        assert line is not None, qty
+
+
+@pytest.mark.parametrize("total", [None, "250", True, float("nan"), float("inf"), -1.0])
+def test_margin_line_unusable_cart_total_gives_no_line(total):
+    assert margin_line(_mbooking(("1", "100,00 SEK")), total, MARGIN_RULES) is None
+
+
+@pytest.mark.parametrize("booking", [{}, {"parts": None}, {"parts": "x"}, {"parts": ["x"]},
+                                     {"parts": [{"name": "A", "qty": "1", "price": 100.0}]}])
+def test_margin_line_malformed_booking_gives_no_line(booking):
+    assert margin_line(booking, 900.0, MARGIN_RULES) is None
+
+
+def _priced_booking(*prices):
+    parts = [dict(p, price=pr) for p, pr in zip(BOOKING["parts"], prices)]
+    return {**BOOKING, "parts": parts}
+
+
+def test_stage_message_carries_the_margin_line_and_staging_is_unaffected(tg):
+    portal = FakePortal(cart=_cart(490.0))
+    booking = _priced_booking("200,00 SEK", "150,00 SEK")   # 350 ex VAT < 392 purchase
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, APPROVE, confident) == "pending"
+
+    text, buttons = tg["buttons"][0]
+    lines = text.splitlines()
+    line = "OBS: inköp exkl. moms 392.00 SEK över bokningens delpris 350.00 SEK"
+    assert line in lines
+    assert lines.index(line) == lines.index("Totalt: 490.00 SEK") + 1
+    assert text.endswith("Godkänn för att beställa.")
+    assert buttons == APPROVE_BUTTONS
+    assert orders_state.get("B1")["status"] == "pending"
+    assert portal.names().count("checkout") == 0
+
+
+def test_stage_message_has_no_line_for_a_profitable_or_unpriced_booking(tg):
+    portal = FakePortal(cart=_cart(490.0))
+    assert parts_order.plan_and_stage(CONFIG, _priced_booking("300,00 SEK", "300,00 SEK"),
+                                      portal, APPROVE, confident) == "pending"
+    assert "OBS: " not in tg["buttons"][0][0]
+
+
+def test_stage_message_min_margin_line_and_no_block(tg):
+    rules = Rules(("Bosch",), ("ProMeister",), 10000, "approve", min_margin_pct=50)
+    portal = FakePortal(cart=_cart(490.0))
+    booking = _priced_booking("300,00 SEK", "300,00 SEK")   # 600 vs 392: margin 35 %
+
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, rules, confident) == "pending"
+
+    assert "OBS: marginal 35 % (under 50 %)" in tg["buttons"][0][0].splitlines()
+
+
+def test_stage_without_booking_prices_has_no_margin_line(tg):
+    portal = FakePortal(cart=_cart(490.0))
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+    assert "OBS: " not in tg["buttons"][0][0]
+
+
+def test_auto_mode_with_a_loss_does_not_crash_and_still_orders(tg):
+    portal = FakePortal(cart=_cart(490.0))
+    booking = _priced_booking("200,00 SEK", "150,00 SEK")
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, AUTO, confident) == "ordered"
+    assert tg["buttons"] == []
+
+
+MARGIN = "OBS: inköp exkl. moms 392.00 SEK över bokningens delpris 350.00 SEK"
+
+
+def test_margin_line_survives_the_first_two_length_fallbacks(tg):
+    booking, catalogue, picks = _long_booking()          # over the limit with alternatives
+    booking["parts"] = [dict(p, price="10,00 SEK") for p in booking["parts"]]
+    portal = FakePortal(catalogue=catalogue)
+    assert parts_order.plan_and_stage(CONFIG, booking, portal, NO_SWITCH,
+                                      by_sku(*picks)) == "pending"
+    text, _ = tg["buttons"][0]
+    assert "Alternativ för" not in text and len(text) <= 4000
+    assert any(ln.startswith("OBS: inköp exkl. moms") for ln in text.splitlines())
+
+
+def test_margin_line_is_dropped_last_when_the_plain_summary_is_still_too_long():
+    suffix = "\n\nGodkänn för att beställa."
+    cart = {"total_sek": 13.0}
+    for n in range(100, 400):          # the plain summary fits, plain + margin line does not
+        parts = [{"title": "T" * n, "brand": "B", "qty": 1, "price_sek": 1.0}
+                 for _ in range(12)]
+        plain = build_summary(BOOKING, cart, [], parts, alternatives=False, notes=False)
+        if len(plain + suffix) <= 4000 < len(plain + "\n" + MARGIN + suffix):
+            break
+    else:
+        pytest.fail("no title length straddles the limit")
+    text, _ = parts_order._approval_message("B1", BOOKING, cart, [], parts, 0, APPROVE,
+                                            margin=MARGIN)
+    assert text == plain + suffix and MARGIN not in text
+
+
+def test_build_summary_puts_the_margin_after_the_total_before_fluids():
+    lines = build_summary(BOOKING, _cart(490.0), BOOKING["fluids"], PARTS,
+                          margin="OBS: test").splitlines()
+    assert lines[lines.index("Totalt: 490.00 SEK") + 1] == "OBS: test"
+    assert lines.index("OBS: test") < lines.index("Förbered (finns på lager):")
+    assert "OBS" not in build_summary(BOOKING, _cart(490.0), [], PARTS)

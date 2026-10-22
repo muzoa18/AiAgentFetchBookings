@@ -135,3 +135,19 @@ def test_duplicate_part_keys_rejected_by_name(tmp_path, mapping):
 def test_part_keys_and_brands_stored_stripped(tmp_path):
     path = write_rules(tmp_path, brand_prefer_by_part="{' Oljefilter ': [' Mann ', 'Bosch  ']}")
     assert load_rules(path).brand_prefer_by_part == (("Oljefilter", ("Mann", "Bosch")),)
+
+
+def test_min_margin_pct_defaults_to_zero():
+    assert load_rules(REPO_RULES).min_margin_pct == 0
+    assert Rules(("Bosch",), (), 10000, "approve").min_margin_pct == 0
+
+
+@pytest.mark.parametrize("value", ["0", "25", "90"])
+def test_min_margin_pct_accepted(tmp_path, value):
+    assert load_rules(write_rules(tmp_path, min_margin_pct=value)).min_margin_pct == int(value)
+
+
+@pytest.mark.parametrize("value", ["-1", "91", "true", "12.5", "'20'", "null"])
+def test_min_margin_pct_rejected_by_name(tmp_path, value):
+    with pytest.raises(ValueError, match="min_margin_pct"):
+        load_rules(write_rules(tmp_path, min_margin_pct=value))

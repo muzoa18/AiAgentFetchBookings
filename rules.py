@@ -19,6 +19,7 @@ class Rules:
     expensive_ratio: float = 1.5
     expensive_min_diff_sek: int = 100
     max_alternatives: int = 1
+    min_margin_pct: int = 0
 
 
 def _brands(data: dict, key: str) -> tuple[str, ...]:
@@ -79,5 +80,8 @@ def load_rules(path: Path = Path("parts_rules.yaml")) -> Rules:
     max_alt = data.get("max_alternatives", 1)
     if not _is_int(max_alt) or not 0 <= max_alt <= 3:
         raise ValueError(f"max_alternatives must be an integer 0-3, got {max_alt!r}")
+    min_margin = data.get("min_margin_pct", 0)
+    if not _is_int(min_margin) or not 0 <= min_margin <= 90:
+        raise ValueError(f"min_margin_pct must be an integer 0-90, got {min_margin!r}")
     return Rules(_brands(data, "brand_prefer"), _brands(data, "brand_forbid"), ceiling, mode,
-                 by_part, prefer_in_stock, ratio, min_diff, max_alt)
+                 by_part, prefer_in_stock, ratio, min_diff, max_alt, min_margin)

@@ -13,3 +13,6 @@ mode: approve                # approve = ask owner first | auto = order directly
 # expensive_ratio: 1.5         # flag a part when an alternative costs <= 1/ratio of it (number > 1)
 # expensive_min_diff_sek: 100  # ...and saves at least this much per unit (whole number >= 0)
 # max_alternatives: 1          # 0-3; 0 = no alternatives. At most ONE is ever offered, so 2-3 act as 1
+# min_margin_pct: 0         # 0-90; 0 = warn only when the purchase exceeds the booking's parts price.
+#                          # e.g. 20 also warns when the margin (purchase ex VAT vs booking price) is under 20 %
+#                          # (a warning line in the approval message only; it never blocks an order)

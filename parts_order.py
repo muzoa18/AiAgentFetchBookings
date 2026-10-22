@@ -61,6 +61,7 @@ from parts_matcher import (Choice, allowed_for_line, choose_with_alternatives, i
 from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (ALTERNATIVE_FIELDS, TECHNICAL, UNVERIFIED_PREFIX,
                                  alternative_entry, build_summary, cart_problem, clean_fluids,
+                                 margin_line,
                                  error_code, is_transient, norm_title, order_body,
                                  owner_reason, parse_qty, prepare_section, reference_line,
                                  replaced_entry, total_problem)
@@ -606,7 +607,8 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
             raise ValueError(f"unknown rules mode {rules.mode!r}")
 
     text, buttons = _approval_message(booking_id, booking, cart, fluids, parts,
-                                      record.get("swaps"), rules)
+                                      record.get("swaps"), rules,
+                                      margin=margin_line(booking, cart.get("total_sek"), rules))
     message_id = notifier.send_with_buttons(config, text, buttons)
     if message_id is None:
         if swap:
@@ -618,24 +620,31 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
 
 
 def _approval_message(booking_id: str, booking: dict, cart: dict, fluids: list[dict],
-                      parts: list[dict], swaps, rules: Rules | None = None) -> tuple[str, list]:
+                      parts: list[dict], swaps, rules: Rules | None = None,
+                      margin: str | None = None) -> tuple[str, list]:
     """(text, buttons) of the approval message, at most APPROVAL_TEXT_MAX characters when
     possible: the full text with swap rows; else without the alternative block and swap rows;
     else also without the "Bytt från" notes (the pre-package-2 summary). Godkänn/Avbryt
-    always stay. A plain summary that is still too long is sent as before."""
+    always stay. A plain summary that is still too long is sent as before, but without the
+    informational `margin` line, which is dropped last (it is kept in every earlier text)."""
     buttons = [("Godkänn", f"approve:{booking_id}"), ("Avbryt", f"cancel:{booking_id}")]
     swap_rows = _swap_buttons(booking_id, parts, swaps, rules)
-    text = build_summary(booking, cart, fluids, parts) + APPROVAL_SUFFIX
+    text = build_summary(booking, cart, fluids, parts, margin=margin) + APPROVAL_SUFFIX
     if len(text) <= APPROVAL_TEXT_MAX:
         return text, ([buttons] + swap_rows if swap_rows else buttons)
     log.warning("Approval text for %s is %d characters: alternatives and swap buttons left "
                 "out.", booking_id, len(text))
-    text = build_summary(booking, cart, fluids, parts, alternatives=False) + APPROVAL_SUFFIX
+    text = build_summary(booking, cart, fluids, parts, alternatives=False,
+                         margin=margin) + APPROVAL_SUFFIX
     if len(text) <= APPROVAL_TEXT_MAX:
         return text, buttons
     log.warning("Approval text for %s still too long: replacement notes left out.", booking_id)
-    return (build_summary(booking, cart, fluids, parts, alternatives=False, notes=False)
-            + APPROVAL_SUFFIX), buttons
+    text = build_summary(booking, cart, fluids, parts, alternatives=False, notes=False,
+                         margin=margin) + APPROVAL_SUFFIX
+    if margin and len(text) > APPROVAL_TEXT_MAX:
+        text = build_summary(booking, cart, fluids, parts, alternatives=False,
+                             notes=False) + APPROVAL_SUFFIX
+    return text, buttons
 
 
 def _swap_buttons(booking_id: str, parts: list[dict], swaps,
