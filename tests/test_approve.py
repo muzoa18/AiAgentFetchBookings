@@ -2330,15 +2330,79 @@ def test_tracking_with_a_portal_that_cannot_open_changes_nothing(tg, run_main):
     assert tg["sent"] == [] and "portal_status" not in orders_state.get("B1")
 
 
-def test_tracking_crash_never_breaks_the_run(tg, run_main, monkeypatch):
+def test_tracking_crash_exits_1_but_never_breaks_the_run(tg, run_main, monkeypatch):
     tracked()
 
     def broken(*a, **k):
         raise RuntimeError("tracking broke")
 
     monkeypatch.setattr(approve, "track_statuses", broken)
-    assert run_main(PortalFactory(SentPortal())) == 0
+    placed("B2", booking_nr="OLRD-0002", model="KIANIRO (I)", age=timedelta(days=4))
+    assert run_main(PortalFactory(SentPortal())) == 1          # shows red, but never raises
     assert tg["offsets"] == [None]
+    assert orders_state.get("B2")["verify_warned"] is True     # the checker still did its work
+
+
+def test_a_state_write_failure_after_a_sent_status_exits_1(tg, run_main, monkeypatch):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    real = orders_state.update_fields
+
+    def failing(booking_id, **fields):
+        if "portal_status" in fields:
+            raise OSError("disk full")
+        return real(booking_id, **fields)
+
+    monkeypatch.setattr(orders_state, "update_fields", failing)
+    assert run_main(PortalFactory(SentPortal(rio_rows("Levererad")))) == 1
+    assert tg["sent"] == ["Orderstatus OLRD-0001: Bekräftad → Levererad"]
+
+
+def test_the_new_status_is_stored_only_after_the_send(tg, run_main, monkeypatch):
+    tracked(portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    seen = []
+
+    def strict_send(config, text):
+        record = orders_state.get("B1")
+        assert record["portal_status"] == "Bekräftad", "stored before the send"
+        assert record["status_changed_at"] == "2026-10-20T06:00:00+00:00"
+        seen.append(text)
+        return True
+
+    monkeypatch.setattr(notifier, "send_message", strict_send)
+    assert run_main(PortalFactory(SentPortal(rio_rows("Levererad")))) == 0
+    assert seen == ["Orderstatus OLRD-0001: Bekräftad → Levererad"]
+    assert orders_state.get("B1")["portal_status"] == "Levererad"
+
+
+@pytest.mark.parametrize("placeholder", ["-", "–", "—", " - "])
+def test_a_placeholder_status_counts_as_empty(tg, run_main, placeholder):
+    assert approve._clean_status(placeholder) == ""
+    tracked()
+    assert run_main(PortalFactory(SentPortal(rio_rows(placeholder)))) == 0
+    assert "portal_status" not in orders_state.get("B1") and tg["sent"] == []
+    # the first real status afterwards is the silent first sighting
+    assert run_main(PortalFactory(SentPortal(rio_rows("Bekräftad")))) == 0
+    assert orders_state.get("B1")["portal_status"] == "Bekräftad" and tg["sent"] == []
+    # back to the placeholder: the last real status is kept, nothing is sent
+    stamp = orders_state.get("B1")["status_changed_at"]
+    assert run_main(PortalFactory(SentPortal(rio_rows(placeholder)))) == 0
+    assert orders_state.get("B1")["portal_status"] == "Bekräftad"
+    assert orders_state.get("B1")["status_changed_at"] == stamp and tg["sent"] == []
+    # a real change is told once
+    assert run_main(PortalFactory(SentPortal(rio_rows("Levererad")))) == 0
+    assert tg["sent"] == ["Orderstatus OLRD-0001: Bekräftad → Levererad"]
+
+
+def test_a_portal_read_error_serves_neither_and_is_read_once(tg, run_main):
+    tracked("B1", portal_status="Bekräftad", status_changed_at="2026-10-20T06:00:00+00:00")
+    placed("B2", booking_nr="OLRD-0002", model="KIANIRO (I)", age=timedelta(days=3, hours=1))
+    before = orders_state.get("B1")
+    factory = PortalFactory(SentPortal(error=RuntimeError("SECRET down")))
+    assert run_main(factory) == 0
+    assert factory.portal.calls == ["list_sent_orders"]             # no second read
+    assert tg["sent"] == ["Kunde inte verifiera beställningen för OLRD-0002 i Skickade "
+                          "Beställningar efter 3 dagar – kontrollera i portalen."]
+    assert orders_state.get("B1") == before                          # no status work
 
 
 def test_track_statuses_alone(tg):

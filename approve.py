@@ -82,6 +82,7 @@ AMBIGUOUS_TEXT = ("Flera ordrar för {model} i Skickade Beställningar – kontr
 NOT_VERIFIED_TEXT = ("Kunde inte verifiera beställningen för {label} i Skickade Beställningar "
                      "efter 3 dagar – kontrollera i portalen.")
 STATUS_TEXT = "Orderstatus {label}: {old} → {new}"
+STATUS_PLACEHOLDERS = ("-", "–", "—")   # the portal's "no status yet": counts as empty
 CART_CLEARED = "Varukorgen är tömd."
 CART_MANUAL = "Varukorgen kunde inte tömmas – töm varukorgen på pro.meca.se för hand."
 CART_LEFT = "Varukorgen på pro.meca.se innehåller fortfarande delarna – töm varukorgen för hand."
@@ -639,7 +640,9 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime,
 def _clean_status(text) -> str:
     """A row's "Beställningsstatus" made safe to store and send: page markup and format
     characters dropped, control characters as spaces, single spaces, at most
-    orders_state.STATUS_MAX characters; "" for anything that is not a string."""
+    orders_state.STATUS_MAX characters; "" for anything that is not a string and for the
+    portal's placeholder (STATUS_PLACEHOLDERS), so a placeholder is never stored or told
+    and the last real status is kept."""
     import re
     import unicodedata
     if not isinstance(text, str):
@@ -647,7 +650,8 @@ def _clean_status(text) -> str:
     text = re.sub(r"<[^>]*>", " ", text)
     kept = "".join(" " if unicodedata.category(c) == "Cc" else c for c in text
                    if unicodedata.category(c) != "Cf" and c not in "<>")
-    return " ".join(kept.split())[:orders_state.STATUS_MAX].strip()
+    clean = " ".join(kept.split())[:orders_state.STATUS_MAX].strip()
+    return "" if clean in STATUS_PLACEHOLDERS else clean
 
 
 def track_statuses(config: dict, rows: list[dict], now: datetime) -> bool:
@@ -786,8 +790,9 @@ def main(argv=None) -> int:
                 rows = sent.get()
                 if rows is not None:
                     track_problem = not track_statuses(config, rows, now)
-        except Exception:
+        except Exception:  # e.g. the state write after a sent message: show the run red
             log.exception("Status tracking failed; it runs again next time.")
+            track_problem = True
     return 1 if expire_problem or problem or verify_problem or track_problem else 0
 
 
