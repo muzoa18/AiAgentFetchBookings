@@ -14,9 +14,12 @@ ProMeister portal (meca.promeisterportal.com). The system, end to end:
 3. A `Bokning` **with spare parts** gets a parts order **staged** on pro.meca.se (the MECA parts
    shop): each part is matched in the vehicle's linked parts and put in the cart, and the owner
    gets a Telegram message with the parts, prices, cart total and fluids to prepare, plus
-   **Approve** / **Cancel** buttons.
+   **Godkänn** / **Avbryt** buttons (Approve / Cancel). A part that is out of stock or clearly
+   too expensive can come with an alternative and a **Byt <part>** button (see "Alternatives
+   and the swap").
 4. **Daily approval run** (`approve.py`): reads the owner's taps. Approve → re-check the cart and
-   check out; Cancel → clear the cart. Every resolution message carries a **Klar** button; a Klar
+   check out, then look the order up right away in "Skickade Beställningar"; Cancel → clear the
+   cart; Byt → swap one line to its alternative and send a new approval message. Every resolution message carries a **Klar** button; a Klar
    tap marks the booking Hanterad in the MECA portal.
 5. **Weekly self-improve** (`improve.py`): Claude reviews code + logs and opens a Pull Request.
 
@@ -26,19 +29,23 @@ parts ends in a message saying ordered, blocked or failed: nothing fails silentl
 ## File map
 ```
 agent.py                 Daily booking run: scrape → notify once → Hanterad (no parts) or stage order
-approve.py               Daily poller: Approve / Cancel / Klar taps, 48 h expiry, Klar withdrawal,
-                         order checker (verifies placed orders in "Skickade Beställningar")
+approve.py               Daily poller: Approve / Cancel / Byt / Klar taps, 48 h expiry, Klar
+                         withdrawal, order checker (verifies placed orders in "Skickade Beställningar")
 order_match.py           Order checker matching (pure): car model / date / registration → one row
-notifier.py              Telegram Bot API client (stdlib): messages, inline buttons, getUpdates
+notifier.py              Telegram Bot API client (stdlib): messages, inline buttons (one row or rows),
+                         getUpdates
 portal_scraper.py        MECA portal (Playwright): login, Nya tab, detail page, Hanterad → Bekräfta
-parts_order.py           Plan, stage (cart), approval message, execute_order (checkout)
-parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text
-parts_matcher.py         Pure matching: brand rank, ProMeister/fluid/placement filters, Claude picker
+parts_order.py           Plan, stage (cart), approval message, swap restage, execute_order (checkout),
+                         verify_now (immediate order lookup)
+parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text, alternatives
+parts_matcher.py         Pure matching: brand rank, ProMeister/fluid/placement filters, Claude picker,
+                         stock-aware choice and alternatives (choose_with_alternatives)
 parts_portal.py          pro.meca.se (Playwright): login, load vehicle, search, cart, checkout
 parts_portal_parse.py    Pure HTML parsers for pro.meca.se pages (fixture-tested)
 orders_state.py          config/orders.json: one status per booking, never order twice
 rules.py                 Loads + validates parts_rules.yaml (fails closed)
-parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling_sek, mode
+parts_rules.yaml         Owner-edited rules: brand_prefer, brand_forbid, ceiling_sek, mode, plus optional
+                         brand_prefer_by_part, prefer_in_stock, expensive_*, max_alternatives
 config_loader.py         Env-first config (GitHub Secrets) with config/config.yaml fallback
 alerts.py                Alert store config/alerts.json: Telegram + dashboard, 24 h de-dup, never raises
 preflight.py             Fail-closed guards: state_problems / check_state_or_alert, guarded(name, fn)
@@ -105,12 +112,17 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   never a group), on that booking's own approval message (stored message id), the booking is
   still `pending`, and the approval is not older than **48 h** (checked at poll time).
 - `execute_order` re-checks the live cart against the stored plan and the ceiling, records
-  `attempted` before checkout, then places the order and reports the result.
+  `attempted` before checkout, then places the order and reports the result (see "Immediate
+  verification" for what follows the Beställd message).
 - Cancel clears the vehicle's cart (best effort). An expired approval leaves the cart for the
   owner to clear.
 - **Klar** is accepted with the same owner checks, only once the order is resolved (never while
   `pending` or `attempted`). A failed Hanterad keeps the button; a missing Hanterad button counts
   as already handled by hand. Klar buttons older than 14 days are withdrawn once with a notice.
+- **Byt <part>** (`swap:<booking_id>:<index>`, index = position in the plan's parts) is accepted
+  with the same owner, message-id, `pending` and 48 h checks, at most **2 swaps per booking**
+  and only for a line with a stored alternative that the matcher's filters still allow (and
+  whose swapped total stays under the ceiling). See "Alternatives and the swap".
 - `python approve.py --check` (stdlib only) prints `has_pending=true|false`; the workflow skips
   installing Playwright when nothing is pending.
 
@@ -165,6 +177,72 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   `LAST_SUCCESS_STALE_HOURS` = 52 h (Saturday 15:00 to Monday 15:00 is 48 h with no Sunday run).
   The commit-age warning keeps `STALE_HOURS` = 36. Both reach the page in the view model.
 
+## Alternatives and the swap (parts_matcher.py, parts_order.py, approve.py)
+- **Optional rules** in `parts_rules.yaml` (defaults apply when absent; strict validation, a bad
+  value makes the whole file invalid and fails closed): `brand_prefer_by_part` (part word → brand
+  list, tried before `brand_prefer`; a key matches on whole normalised words of the booking line,
+  Pollenfilter = Kupéfilter, first key in file order wins; duplicate keys rejected),
+  `prefer_in_stock` (true), `expensive_ratio` (1.5, a finite number > 1), `expensive_min_diff_sek`
+  (100, integer ≥ 0), `max_alternatives` (1, integer 0-3). **At most ONE alternative is ever
+  offered** whatever `max_alternatives` says (one picker call confirms one candidate); 0 turns
+  alternatives off.
+- **Stock-aware choice** (`choose_with_alternatives`, only in `approve` mode): when the pick is
+  out of stock (`in_stock` is False; unknown stock is never "slut") and `prefer_in_stock` is on,
+  it is replaced by an in-stock candidate that passes the same filters and the picker's
+  confidence gate, in two stages (preferred brands first, then every in-stock candidate). The
+  message line then ends `Bytt från <title> (slut)`. The owner still approves; the replacement
+  goes through the ceiling and cart checks like any part. `auto` mode never replaces and never
+  offers alternatives.
+- **Alternatives:** a part is flagged **slut** (out of stock and no replacement) or **dyr** (a
+  confirmed in-stock candidate costs ≤ price / `expensive_ratio` and saves at least
+  `expensive_min_diff_sek` and more than 0). The alternative has to pass the usual filters (never
+  ProMeister, fluids, forbidden brands, non-Latin titles, wrong placement) and the picker's
+  confidence (≥ 0.8). Message: `Alternativ för <del>: <titel> (<märke>) à <sek>[ – i lager]
+  (slut | dyr: sparar N SEK/st)`. It is stored in the plan (`alternative`, `replaced_from`) and is
+  never added to the cart.
+- **Buttons:** `[Godkänn, Avbryt]`, plus one row `Byt <part, 20 tecken>` per flagged line. With no
+  flagged line the message and its single button row are exactly as before. No swap rows once the
+  booking has been swapped twice, when a button's callback data would exceed 64 bytes, or when
+  the alternative could not be pinned. A message over 4000 characters drops the alternative block
+  and swap rows (then the `Bytt från` notes); Godkänn/Avbryt always stay.
+- **Swap flow** (`approve._swap` → `parts_order.restage_with_pins`): checks (owner, record
+  `pending`, message id, `swaps` < 2, line + alternative, ceiling estimate) happen BEFORE
+  anything is touched; a refusal only answers the tap ("Bytet är inte längre möjligt."). Then:
+  clear the vehicle's cart (a failure stops the swap and leaves the old approval valid), clear the
+  old message's buttons, record `attempted` + `swaps + 1` + `cart_touched`, restage with the
+  alternative pinned for that line and every other line as staged (no new picking), verify the
+  cart and ceiling as in normal staging, and send a NEW approval message (new `message_id`; the
+  record is `pending` again). A swap **never orders**. Its own budget is **240 s** from the tap
+  (`SWAP_BUDGET_S`, cart clear included). Each swap refreshes the approval's 48 h window (two
+  swaps can keep one approval open for up to about 3 × 48 h). The new message shows the unit
+  price from the live cart and `Kund: se bokning <nr>` (no customer data is stored).
+- **A failed swap** ends in a truthful Swedish message and the booking is no longer `pending`
+  (never retried automatically): `Bytet misslyckades – varukorgen är tömd eller delvis fylld,
+  kontrollera pro.meca.se` (emptied or unknown), `… varukorgen innehåller delarna, kontrollera
+  pro.meca.se` (every add worked but the ceiling, cart check or the message failed), or `Bytet
+  misslyckades – kontrollera pro.meca.se` followed by the lines for what is in the cart and what
+  was not added. The owner then orders by hand.
+
+## Immediate verification (parts_order.verify_now, after checkout)
+- After `checkout()` and the **Beställd** message (sent first and unchanged, "bekräftas senare"
+  when only an `UNVERIFIED-…` reference was read), `execute_order` looks the order up in
+  "Skickade Beställningar" in the same session: 3 reads 10 s apart, within 90 s. It is a
+  separate step: a match gives a SECOND message, `Beställning verifierad: …` (the checker's
+  text), and stores `verified_at` + `verified_numbers`.
+- **Only by plate:** the plan needs `reg_nr`, the table needs the registration column, the row
+  must have the same plate, be dated on or after the order and not be claimed by another
+  record. When the real order reference was read, it must also appear in the row (as order
+  number or supplier number). Without plate or column nothing is verified now (the daily
+  checker still can, by model).
+- Never fails the order (it is already placed): errors are logged without page text, an
+  undelivered verified message is only logged and not resent, and the run does not exit 1 for it
+  (the daily checker sets the problem flag). Not started after `approve` run start + 270 s
+  (`VERIFY_START_S`) or, in `auto` mode, past the staging deadline.
+- **Residual risk:** a same-plate row dated on or after the order can be taken as this order when
+  the reference is UNVERIFIED and the earlier row is not claimed by an unverified `ordered`
+  record. The duplicate guard makes a second order for the same plate within 7 days rare.
+- The daily order checker (below) remains the fallback.
+
 ## Duplicate-order guard (parts_order._stage, before any cart action)
 - Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"
   once (`PartsPortal.list_sent_orders()`), before login/vehicle/cart steps. A row for the same
@@ -183,6 +261,8 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   empty list lets staging proceed without a match.
 
 ## Order checker (approve.py, after the taps)
+(The immediate check in `verify_now` uses the same matching rules for a plate; this daily
+checker is the fallback for everything it did not verify.)
 - A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the
   final click); the Beställd message then says "Ordernummer: bekräftas senare (kolla Skickade
   Beställningar i pro.meca.se)". The real order shows up later in Orderöversikt → tab
@@ -212,8 +292,9 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
 ## Parts rules
 - Only parts under **"Kopplade reservdelar"** (linked to the loaded vehicle) are candidates.
   Discontinued ("Produkten har utgått") and replaced ("Ersätts av") items are excluded.
-- **Bosch preferred**, then another linked brand. **Never ProMeister** (hard-coded in
-  `parts_matcher.py`, also in `brand_forbid`).
+- **Bosch preferred** (`brand_prefer`; per part word `brand_prefer_by_part` goes first), then
+  another linked brand. **Never ProMeister** (hard-coded in `parts_matcher.py`, also in
+  `brand_forbid`).
 - **Never fluids or oils** (any kind). Fluid-looking lines are listed under "Förbered", never
   searched. Some real parts are over-blocked (e.g. "Fettnippel", "Oil pump"): order those by hand.
 - **Placement:** when the booking line names an axle (fram/bak) or side (vä/hö), the candidate
@@ -225,9 +306,11 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   checkout-page total, at staging, at approval and inside `checkout()` before the final click.
   A missing or unreadable total means no order.
 - The pro.meca.se cart is **per vehicle**; staging requires that vehicle's cart to be empty.
+- Stock and price: see "Alternatives and the swap" (in-stock replacement, `slut`/`dyr`
+  alternatives, one-tap swap). A part with unknown stock is never treated as out of stock.
 - `parts_rules.yaml` `mode: approve` (ask the owner first) is the current setting; `auto` would
-  order directly under the same limits and is not to be switched on before the checks listed in
-  the handoff doc are done.
+  order directly under the same limits (no replacement, no alternatives, no swap) and is not to be
+  switched on before the checks listed in the handoff doc are done.
 
 ## Parts vocabulary and lookup rules (owner-confirmed 2026-10-21)
 - **Pollenfilter = Kupéfilter.** Searching "pollenfilter" on pro.meca.se returns NOTHING; "kupéfilter" returns the linked parts. Treat both words (and "kupefilter") as the same part and search "kupéfilter".
@@ -303,7 +386,9 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
   crashed attempt is never re-ordered automatically).
 - Nothing is ordered above the ceiling, from ProMeister, for fluids/oils, or outside "Kopplade
   reservdelar"; ambiguity means no order.
-- Only the owner's private chat can approve, cancel or Klar, on the booking's own message.
+- Only the owner's private chat can approve, cancel, swap or Klar, on the booking's own message.
+  A swap and an in-stock replacement never order anything: they only change what the owner is
+  asked to approve, under the same ceiling, brand, fluid and cart checks.
 - Every booking with parts ends in a message (ordered, blocked or failed); a message that cannot
   be delivered turns the run red.
 - A missing or unreadable `config/orders.json` stops all ordering before any portal contact
@@ -320,6 +405,9 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
 - The order confirmation page, quantity semantics ("x4" pieces vs sets), the real format of
   `data-placements`, and the 0-stock policy are unverified until the first supervised live order
   (see `docs/superpowers/plans/2026-10-21-parts-ordering-handoff.md`).
+- `max_alternatives` 2-3 behave like 1. Immediate verification is by plate only and has the
+  residual risk described above. A failed swap leaves an empty or partly filled cart that the
+  owner fixes by hand. Exact duplicate keys in `parts_rules.yaml` are not detected.
 - The axle-specific part list is incomplete (bromsbackar, bromsslang, English lines); title-only
   matching is used when the portal gives no ids; brand preference is enforced within one search
   term only.

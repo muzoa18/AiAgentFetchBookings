@@ -5,6 +5,15 @@ the Telegram message proposes an alternative you can accept or reject", "read th
 right at checkout", "rules in parts_rules.yaml as data". The owner also said: out-of-stock and
 expensive parts "must be handled" (answer to question 6 of the improvement list).
 
+## Status (2026-10-22): built, with these deviations from the text below
+The code is the truth. What changed during review:
+- **Verification is a separate message and plate-only.** The Beställd message is sent first and is not changed (it does not carry the order numbers); a match sends a second `Beställning verifierad` message. It needs the plan's plate and the registration column, and a real reference must appear in the row. Skipped after approve run start + 270 s (in auto: past the staging deadline); 3 reads 10 s apart, 90 s budget. Residual risk: a same-plate earlier row when the reference is UNVERIFIED.
+- **At most one alternative** is ever offered; `max_alternatives` 2-3 behave as 1.
+- **In-stock replacement in two stages** (preferred brands first, then all in-stock), and the line says `Bytt från <titel> (slut)`. Only in `approve` mode: **auto mode never replaces or offers alternatives.**
+- **Swap budget:** 240 s from the tap, cart clear included. A swap restages the other lines as staged (no new picking), shows live unit prices and `Kund: se bokning <nr>`, and refreshes the approval's 48 h window. Failure texts distinguish an empty/unknown, a partly filled and a full cart.
+- **Rules validation** also rejects a non-finite `expensive_ratio` and duplicate part keys.
+- **Text guard:** over 4000 characters the alternative block and swap rows are dropped (then the `Bytt från` notes); a swap row is also left out when the alternative could not be pinned or the callback data is over 64 bytes.
+
 ## Why
 
 Today a part that is out of stock only gets a note ("OBS: 0 i lager") and is still put in the

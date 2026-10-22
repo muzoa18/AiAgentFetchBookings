@@ -16,9 +16,13 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
 - `agent.py` (daily 15:00 UTC Mon–Sat): `portal_scraper.fetch_bookings` → `build_message` →
   `notifier.send_message` (once per booking, `state.save_seen_ids`) → no parts:
   `portal_scraper.mark_booking_handled`; with parts: `parts_order.plan_and_stage` (cart +
-  Approve/Cancel message) → `run_logger.log_run`.
-- `approve.py` (daily 06:00 UTC): `notifier.get_updates` → Approve: `parts_order.execute_order`;
-  Cancel: clear cart; Klar: `mark_booking_handled`; expire approvals older than 48 h.
+  Godkänn/Avbryt message, plus a `Byt <part>` row per part with an alternative) →
+  `run_logger.log_run`.
+- `approve.py` (daily 06:00 UTC): `notifier.get_updates` → Approve: `parts_order.execute_order`
+  (then `verify_now`: the placed order is looked up at once, by plate only);
+  Cancel: clear cart; Byt (`swap:<id>:<index>`): `approve._swap` → `parts_order.restage_with_pins`
+  (new approval message, never orders); Klar: `mark_booking_handled`; expire approvals older
+  than 48 h.
 - Both entry points run inside `preflight.guarded` and first call the state guard
   (`check_state_or_alert`): a missing/unreadable `config/orders.json` stops all ordering before
   portal contact (exit 1, alert `state_unreadable`). Exception: `approve.py --check` runs
@@ -39,6 +43,10 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
 - **Never order twice** (`config/orders.json`, `attempted` before checkout), never above the
   10,000 SEK ceiling, never ProMeister, never fluids/oils, only "Kopplade reservdelar", ambiguity
   means no order. Rules live in `parts_rules.yaml` (`mode: approve`).
+- **A swap or an in-stock replacement never orders.** They only change what the owner is asked to
+  approve (same ceiling, brand, fluid and cart checks). Swap: owner only, record `pending`, own
+  message id, at most 2 per booking, 240 s budget, each swap refreshes the 48 h window. `auto`
+  mode never replaces or offers alternatives.
 - **Only the owner's private chat can approve** (`TELEGRAM_CHAT_ID`, never a group).
 - **Alerts, never silence.** A crash (`crash_<name>`), a non-zero exit (`run_failed_<name>`), a
   failed workflow (`workflow_failed_<workflow name>`, `alerts_cli.py`), an unreadable order state
@@ -80,6 +88,10 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   system, and stale text there produces bad weekly PRs.
 - Verify a Python change with `python -m py_compile <file>`; the improve job applies the same check.
 - `agent.py` and `portal_scraper.py` are committed with CRLF line endings; keep them that way.
+- Optional rules keys (defaults): `brand_prefer_by_part` (none), `prefer_in_stock` (true),
+  `expensive_ratio` (1.5), `expensive_min_diff_sek` (100), `max_alternatives` (1, allowed 0-3 but
+  at most one alternative is ever offered). Invalid values make the whole rules file invalid
+  (fail closed). Details in `SKILL.md` ("Alternatives and the swap").
 
 ## Duplicate-order guard (parts_order._stage, before any cart action)
 - Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"
@@ -97,6 +109,14 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   row date readable) blocks with "kan inte kontrollera tidigare order" (cart untouched, owner
   asked to check Skickade Beställningar by hand; re-staged like a transient problem). Only an
   empty list lets staging proceed without a match.
+
+## Immediate verification (parts_order.verify_now)
+- After checkout the Beställd message goes first and unchanged; then the order is looked up in
+  "Skickade Beställningar" (3 reads, 10 s apart, 90 s budget; not after approve run start + 270 s,
+  nor past the staging deadline in auto mode). Only by plate with the registration column; a real
+  reference must appear in the row. A match stores `verified_at`/`verified_numbers` and sends a
+  separate `Beställning verifierad: …` message. It never fails the order. Residual risk: a
+  same-plate earlier row when the reference is UNVERIFIED. The daily checker below is the fallback.
 
 ## Order checker (approve.py, after the taps)
 - A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the

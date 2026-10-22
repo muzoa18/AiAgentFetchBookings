@@ -1,13 +1,15 @@
-# Parts-ordering rules. Edit here; no code changes needed.
+# Parts-ordering rules. Edit here; no code change needed.
+# A wrong value makes the whole file invalid: the agent then refuses to order (it never guesses).
 brand_prefer: [Bosch]        # tried first when matching parts
 brand_forbid: [ProMeister]   # never ordered
 ceiling_sek: 10000           # orders above this total are never placed
 mode: approve                # approve = ask owner first | auto = order directly
+                             # (auto never replaces a part or offers alternatives)
 
 # Optional (defaults shown; uncomment to change):
-# brand_prefer_by_part:        # per part word, tried before brand_prefer
-#   Oljefilter: [Mann, Bosch]
-# prefer_in_stock: true        # swap an out-of-stock choice for an in-stock one
-# expensive_ratio: 1.5         # flag a part when an alternative costs <= 1/ratio of it
-# expensive_min_diff_sek: 100  # ...and saves at least this much
-# max_alternatives: 1          # 0-3
+# brand_prefer_by_part:        # per part word, tried before brand_prefer; each word once
+#   Oljefilter: [Mann, Bosch]  # whole-word match on the booking line (Pollenfilter = Kupefilter)
+# prefer_in_stock: true        # swap an out-of-stock choice for an in-stock one (approve mode only)
+# expensive_ratio: 1.5         # flag a part when an alternative costs <= 1/ratio of it (number > 1)
+# expensive_min_diff_sek: 100  # ...and saves at least this much per unit (whole number >= 0)
+# max_alternatives: 1          # 0-3; 0 = no alternatives. At most ONE is ever offered, so 2-3 act as 1

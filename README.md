@@ -42,6 +42,8 @@ approve.yml — daily 06:00 UTC, every day                      (python approve.
         ▼
   Read the owner's Telegram taps (owner's private chat, booking's own message only)
         ├─ Approve → re-check cart vs plan and ceiling → place order → result message + Klar
+        │            → look the order up at once (verified message if found)
+        ├─ Byt     → swap one part to its alternative → new approval message (never orders)
         ├─ Cancel  → clear the vehicle's cart → message + Klar
         ├─ Klar    → Hanterad → Bekräfta in the MECA portal
         └─ approvals older than 48 h expire
@@ -79,7 +81,78 @@ so the checker is meant for recent orders.
 Parts rules (owner-editable in [`parts_rules.yaml`](parts_rules.yaml), no code change needed):
 Bosch preferred, then another brand; never ProMeister; never fluids or oils; only parts linked to
 the vehicle ("Kopplade reservdelar"); ceiling **10,000 SEK** per booking; `mode: approve` (ask the
-owner first).
+owner first). Optional keys are described under "Parts: what you see and tap" below.
+
+---
+
+## Parts: what you see and tap
+
+**The approval message.** For every booking with parts the owner gets one Telegram message with
+the parts, prices, cart total and the fluids to prepare, and the buttons **Godkänn** and **Avbryt**.
+Nothing is ordered until Godkänn is tapped (on that booking's own message, from the owner's
+private chat, within 48 h).
+
+**Out of stock or expensive parts.** Two things can show up on a line:
+
+- `Bytt från <titel> (slut)`: the first choice was out of stock, so an in-stock part that passes
+  the same rules was put in the cart instead. You still approve it as usual.
+- `Alternativ för <del>: <titel> (<märke>) à <pris> – i lager (slut)` or `(dyr: sparar N SEK/st)`:
+  a better option exists. It is not in the cart. Under the Godkänn / Avbryt row there is one
+  button per such line, **Byt <del>**.
+
+**Byt.** One tap swaps that line to the alternative: the vehicle's cart is emptied, filled again
+with the alternative and everything else as before, the old message loses its buttons, and a
+NEW approval message arrives (with the real unit prices from the cart and `Kund: se bokning
+<nr>`). A swap never orders; you approve the new message. Limits: only you, only while the
+booking is waiting for approval, at most **2 swaps per booking**, about 4 minutes per swap. Each
+swap restarts the 48 h approval window. Process a tap right away by running approve.yml by hand.
+
+**A failed swap** (portal slow or down, ceiling would be exceeded, cart did not match) never
+leaves you guessing. You get a message such as `Bytet misslyckades – varukorgen är tömd eller
+delvis fylld, kontrollera pro.meca.se`, or `… varukorgen innehåller delarna, kontrollera
+pro.meca.se`, or (after a partly filled cart) `Bytet misslyckades – kontrollera pro.meca.se`
+with lines saying what is in the cart and what was not added. The booking is then no longer
+waiting for approval and is not retried: check the cart on pro.meca.se and order by hand. A tap
+that is no longer valid (swap limit, old message, already handled) only gets "Bytet är inte
+längre möjligt." and nothing changes.
+
+**After you approve.** The **Beställd** message arrives first, as before. Then the agent looks
+for the order in "Skickade Beställningar" for up to ~90 seconds (3 tries, 10 s apart). If it finds
+exactly one order for the car's registration number (and the real order number, if it was read,
+is in that row) you get a second message, `Beställning verifierad: …`. Otherwise nothing more
+is sent now; the daily order checker above takes over. Known gap: for an order whose number
+could not be read, an earlier order for the same plate could be mistaken for it; the 7-day
+duplicate guard makes that unlikely.
+
+**Rules keys** (all optional; no key means the default; a wrong value makes the whole file
+invalid and the agent refuses to order rather than guess):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `brand_prefer_by_part` | none | Per part word, brands tried before `brand_prefer`. Matches whole words of the booking line (`Pollenfilter` = `Kupéfilter`, plurals like Bromsskivor work). Each part word only once. |
+| `prefer_in_stock` | `true` | Replace an out-of-stock choice by an in-stock part (preferred brands first). Only in `mode: approve`. |
+| `expensive_ratio` | `1.5` | A part is "dyr" when an alternative costs at most 1/ratio of it. A number above 1. |
+| `expensive_min_diff_sek` | `100` | ...and saves at least this much per unit. Whole number, 0 or more. |
+| `max_alternatives` | `1` | 0-3. 0 turns alternatives off. At most ONE alternative is ever offered, so 2 and 3 behave like 1. |
+
+Worked example:
+
+```yaml
+brand_prefer: [Bosch]
+brand_forbid: [ProMeister]
+ceiling_sek: 10000
+mode: approve
+brand_prefer_by_part:
+  Oljefilter: [Mann, Bosch]   # oil filters: Mann first, then Bosch, then the rest
+expensive_ratio: 2            # flag a part only if an alternative costs half or less
+expensive_min_diff_sek: 150   # ...and saves at least 150 SEK per unit
+```
+
+With this, an Oljefilter that was chosen at 420 SEK gets an alternative only if an in-stock part
+costs at most 210 SEK (420 / 2) and saves at least 150 SEK. At 190 SEK it qualifies (190 x 2 =
+380 <= 420, saving 230): the line shows `dyr: sparar 230.00 SEK/st` and a Byt button. At 250 SEK
+it does not. The alternative must still be a non-ProMeister, non-fluid, correctly placed part
+from "Kopplade reservdelar" that the part picker is confident about.
 
 ---
 
@@ -224,18 +297,19 @@ alerts.py              # Alert store (config/alerts.json): Telegram + dashboard,
 preflight.py           # State guard (orders.json must exist) and guarded() run wrapper
 alerts_cli.py          # Workflow-level failure alert (used by bookings.yml / approve.yml)
 watchdog.py            # Dead-man switch (watchdog.yml): alerts when a scheduled run is missed
-approve.py             # Daily poller: Approve / Cancel / Klar taps, expiry, order checker
+approve.py             # Daily poller: Approve / Cancel / Byt / Klar taps, expiry, order checker
 order_match.py         # Order checker: match a placed order to a "Skickade Beställningar" row
 notifier.py            # Telegram Bot API client
 portal_scraper.py      # MECA portal: login, Nya tab, detail extraction, Hanterad
-parts_order.py         # Plan, stage and execute a pro.meca.se order
+parts_order.py         # Plan, stage, swap and execute a pro.meca.se order, verify it at once
 parts_order_helpers.py # Quantities, cart/total checks, message text
-parts_matcher.py       # Part matching: brand, ProMeister/fluid/placement rules, Claude picker
+parts_matcher.py       # Part matching: brand, ProMeister/fluid/placement rules, Claude picker,
+                       # stock-aware choice and alternatives
 parts_portal.py        # pro.meca.se: login, vehicle, search, cart, checkout
 parts_portal_parse.py  # pro.meca.se HTML parsers
 orders_state.py        # config/orders.json — one status per booking, never order twice
 rules.py               # Loads parts_rules.yaml
-parts_rules.yaml       # Owner-editable parts rules (brands, ceiling, mode)
+parts_rules.yaml       # Owner-editable parts rules (brands, ceiling, mode, stock/price options)
 state.py               # config/seen_ids.txt — notified once
 run_logger.py          # logs/run_history.jsonl — structured run history
 config_loader.py       # env-first config (GitHub Secrets) + config.yaml fallback
