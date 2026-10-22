@@ -24,7 +24,7 @@ record with ONE row is verified. Never guesses: otherwise "ambiguous" or "waitin
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 
 MODEL_MAX = 80
 NUMBERS_MAX = 120   # same limit as orders_state.NUMBERS_MAX (verified_numbers)
@@ -166,6 +166,40 @@ def match_sent_order(rows: list[dict], vehicle_model, order_date: date, claimed:
                      reg_nr=None) -> MatchResult:
     """One record on its own: exactly one candidate -> verified, more -> ambiguous."""
     return resolve_orders({"_": (vehicle_model, order_date, reg_nr)}, rows, claimed)["_"]
+
+
+def local_date(when: datetime) -> date:
+    """The Swedish calendar date of `when` (the "Datum" of Skickade Beställningar). Without
+    time zone data the UTC date is used: never later than the Swedish one, so no row of
+    the order's own day is ever skipped."""
+    try:
+        from zoneinfo import ZoneInfo
+        return when.astimezone(ZoneInfo("Europe/Stockholm")).date()
+    except Exception:
+        return when.astimezone(timezone.utc).date()
+
+
+def order_facts(record: dict) -> tuple[str, str | None, datetime | None]:
+    """(vehicle_model, reg_nr, placed_at) of an 'ordered' record, as the order checker reads
+    them: the stored car model ("" if none), the plan's plate (None if not a string) and
+    updated_at (None if missing, unreadable or without time zone)."""
+    plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
+    reg = plan.get("reg_nr") if isinstance(plan.get("reg_nr"), str) else None
+    try:
+        since = datetime.fromisoformat(record["updated_at"])
+        since = since if since.tzinfo is not None else None
+    except Exception:
+        since = None
+    return record.get("vehicle_model") or "", reg, since
+
+
+def match_key(record: dict) -> tuple | None:
+    """The (vehicle_model, order_date, reg_nr) resolve_orders takes for a record, or None
+    when it cannot be checked (no time, or neither a model nor a plate)."""
+    model, reg, since = order_facts(record)
+    if since is None or not (model or reg):
+        return None
+    return model, local_date(since), reg
 
 
 def resolve_orders(orders: dict, rows: list[dict], claimed: set) -> dict:

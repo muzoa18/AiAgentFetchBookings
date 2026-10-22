@@ -478,14 +478,10 @@ def _to_verify() -> list[tuple[str, dict]]:
 
 
 def _local_date(when: datetime):
-    """The Swedish calendar date of `when` (the "Datum" of Skickade Beställningar). Without
-    time zone data the UTC date is used: never later than the Swedish one, so no row of
-    the order's own day is ever skipped."""
-    try:
-        from zoneinfo import ZoneInfo
-        return when.astimezone(ZoneInfo("Europe/Stockholm")).date()
-    except Exception:
-        return when.astimezone(timezone.utc).date()
+    """The Swedish calendar date of `when` (order_match.local_date, shared with
+    parts_order.verify_now)."""
+    from order_match import local_date
+    return local_date(when)
 
 
 def _numbers_text(row: dict) -> str:
@@ -524,26 +520,17 @@ def _verify_orders(config: dict, session: "_Portal", now: datetime) -> bool:
     NOT sent again: the stored state is correct and the run exits 1 so it shows.
     """
     import notifier
-    from order_match import numbers_text, resolve_orders
+    from order_match import match_key, numbers_text, order_facts, resolve_orders
     from parts_order_helpers import error_code
 
     todo = _to_verify()
     if not todo:
         return False
-    facts = {}  # booking_id -> (label, model, reg, since or None)
-    for booking_id, record in todo:
-        plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
-        reg = plan.get("reg_nr") if isinstance(plan.get("reg_nr"), str) else None
-        try:
-            since = datetime.fromisoformat(record["updated_at"])
-            since = since if since.tzinfo is not None else None
-        except Exception:
-            since = None
-        facts[booking_id] = (_label(booking_id, record), record.get("vehicle_model") or "",
-                             reg, since)
-    checkable = {bid: (model, _local_date(since), reg)
-                 for bid, (_, model, reg, since) in facts.items()
-                 if since is not None and (model or reg)}
+    # booking_id -> (label, model, reg, since or None); the same inputs as verify_now
+    facts = {booking_id: (_label(booking_id, record), *order_facts(record))
+             for booking_id, record in todo}
+    checkable = {bid: key for bid, key in ((bid, match_key(rec)) for bid, rec in todo)
+                 if key is not None}
     results = {}
     if checkable:
         try:

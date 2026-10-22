@@ -24,6 +24,11 @@ mixed into the same cart.
 Customer data (name, phone, email, booking message) is never persisted: the plan
 only holds what approval needs (orders.json is committed to git).
 
+Right after a checkout, verify_now looks for the placed order in "Skickade Beställningar"
+with the order checker's matching (approve.py); a unique match is stored as verified and
+shown in the Beställd message, anything else leaves the order to the daily checker. It
+never fails, delays beyond VERIFY_BUDGET_S or changes an order that is already placed.
+
 Before the first portal step, pro.meca.se "Skickade Beställningar" is read once per
 staging attempt: a sent order for the same vehicle dated within DUPLICATE_WINDOW_DAYS and
 not claimed by another record blocks staging (never re-staged; the owner orders by hand).
@@ -45,7 +50,8 @@ from datetime import datetime, timedelta, timezone
 import notifier
 import orders_state
 from logsafe import describe
-from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text, row_date
+from order_match import (candidates, claim_tokens, clean_vehicle_model, match_key, numbers_text,
+                         resolve_orders, row_date)
 from parts_matcher import (Choice, allowed_for_line, choose_with_alternatives, is_fluid,
                            search_terms)
 from parts_portal_parse import PartsPortalError
@@ -120,6 +126,16 @@ UNCHECKED_REASON = "kan inte kontrollera tidigare order"
 UNCHECKED_TEXT = ("Bokning {label}: jag kunde inte kontrollera om en order för fordonet redan "
                   "finns i pro.meca.se. Jag har inte förberett någon order – kontrollera "
                   "Skickade Beställningar för hand. Jag försöker igen vid nästa körning.")
+
+
+# Immediate verification after checkout (verify_now): VERIFY_TRIES reads of "Skickade
+# Beställningar", VERIFY_WAIT_S apart (injectable _sleep), all within VERIFY_BUDGET_S of
+# wall clock (_clock): the order is already placed, so this only ever adds information.
+VERIFY_TRIES = 3
+VERIFY_WAIT_S = 10
+VERIFY_BUDGET_S = 90
+VERIFIED_LINE = "Ordernummer: {numbers} (verifierad)"
+_sleep = time.sleep
 
 
 class SentOrdersUnchecked(Exception):
@@ -809,6 +825,74 @@ def _partial_text(label: str, added: list, not_added: list, partly: list, untrie
     return "\n".join(lines + prepare_section(fluids))
 
 
+# ── Immediate verification (after checkout) ──────────────────────────────────
+
+def verify_now(portal, booking_id: str, record: dict, others, sleep=time.sleep,
+               tries: int = VERIFY_TRIES, wait_s: int = VERIFY_WAIT_S) -> str | None:
+    """The placed order's numbers text (order_match.numbers_text, as the checker stores it
+    in verified_numbers) when "Skickade Beställningar" shows exactly one row for it, else None.
+
+    The order checker's matching (approve._verify_orders): order_match.match_key of the
+    record (plate when the table has the registration column, else model words; rows on or
+    after the order's Swedish date), resolved together with the other unverified, unwarned
+    'ordered' records of `others` ([(booking_id, record)]), with every other record's
+    verified_numbers claimed. Up to `tries` reads, `sleep(wait_s)` between them (none after
+    the last), stopped once VERIFY_BUDGET_S of _clock() has passed (no sleep that would end
+    past it). Read-only; never raises (any error: logged by exception class only, None)."""
+    try:
+        deadline = _clock() + VERIFY_BUDGET_S
+        key = match_key(record)
+        if key is None:
+            log.info("Immediate verification of %s: nothing to match by.", booking_id)
+            return None
+        orders, claimed = {booking_id: key}, set()
+        for bid, rec in others:
+            if bid == booking_id or not isinstance(rec, dict):
+                continue
+            claimed |= claim_tokens(rec.get("verified_numbers"))
+            if (rec.get("status") == "ordered" and "verified_at" not in rec
+                    and rec.get("verify_warned") is not True):
+                other = match_key(rec)
+                if other is not None:
+                    orders[bid] = other
+        for attempt in range(tries):
+            if attempt:
+                if _clock() + wait_s > deadline:
+                    break
+                sleep(wait_s)
+            if _clock() > deadline:
+                break
+            result = resolve_orders(orders, portal.list_sent_orders(), claimed)[booking_id]
+            log.info("Immediate verification of %s (try %d): %s.", booking_id, attempt + 1,
+                     result.status)
+            if result.status == "verified":
+                return numbers_text(result.row)
+        return None
+    except Exception as e:  # the order is placed: never let this change anything
+        log.warning("Immediate verification of %s failed (%s); left to the order checker.",
+                    booking_id, type(e).__name__)
+        return None
+
+
+def _verify_placed(portal, booking_id: str) -> str | None:
+    """verify_now on the stored 'ordered' record; a unique match is stored as the checker
+    stores it (verified_at + verified_numbers). The stored numbers, or None. Never raises."""
+    try:
+        record = orders_state.get(booking_id) or {}
+        others = [(bid, rec) for status in orders_state.STATUSES
+                  for bid, rec in orders_state.by_status(status) if bid != booking_id]
+        numbers = verify_now(portal, booking_id, record, others, sleep=_sleep)
+        if numbers:
+            orders_state.update_fields(booking_id,
+                                       verified_at=datetime.now(timezone.utc).isoformat(),
+                                       verified_numbers=numbers)
+        return numbers
+    except Exception as e:
+        log.warning("Could not store the immediate verification of %s (%s).",
+                    booking_id, type(e).__name__)
+        return None
+
+
 # ── Execution (auto mode here, approve mode from the poller) ─────────────────
 
 def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rules) -> str:
@@ -816,6 +900,8 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
 
     Returns "ordered" or "failed". An "ordered" whose message was not delivered is
     flagged with plan["notify_failed"] (see order_notify_failed); it is never downgraded.
+    Once 'ordered' is stored, verify_now looks for the order in "Skickade Beställningar"
+    (bounded, never raises); a unique match is shown as the Beställd message's number.
     """
     label = str(plan.get("booking_nr") or booking_id)
     checkout_started, ref = False, None
@@ -866,7 +952,9 @@ def execute_order(config: dict, portal, booking_id: str, plan: dict, rules: Rule
             log.error("Failure message for %s was not delivered.", booking_id)
         return "failed"
 
-    text = "\n".join([f"Beställd: {label} ({plan.get('reg_nr')})", reference_line(ref), ""]
+    verified = _verify_placed(portal, booking_id)
+    number_line = VERIFIED_LINE.format(numbers=verified) if verified else reference_line(ref)
+    text = "\n".join([f"Beställd: {label} ({plan.get('reg_nr')})", number_line, ""]
                      + order_body(plan.get("parts") or [], plan.get("total_sek"),
                                   plan.get("fluids") or []))
     try:

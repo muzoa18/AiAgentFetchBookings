@@ -3008,3 +3008,256 @@ def test_alternative_placement_is_stored_clean_and_only_when_present():
     assert "placement" not in alternative_entry({**base, "placement": "  "})
     assert alternative_entry({**base, "placement": " Fram\naxel​ "})["placement"] == "Fram axel"
     assert len(alternative_entry({**base, "placement": "F" * 500})["placement"]) == 80
+
+
+# ── Task 5: immediate verification of the placed order ───────────────────────
+
+def _today_se():
+    from zoneinfo import ZoneInfo
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Stockholm")).date().isoformat()
+
+
+def _today_row(supplier_no="S-91001", order_numbers="71001/71002", reg_nr="TST001", **kw):
+    return {**_sent_row(supplier_no=supplier_no, order_numbers=order_numbers, reg_nr=reg_nr,
+                        **kw), "date": _today_se()}
+
+
+class Polled(FakePortal):
+    """list_sent_orders returns the next entry of `polls` (rows, or an exception to raise);
+    the duplicate-order guard during staging sees no rows."""
+
+    def __init__(self, polls=(), **kw):
+        super().__init__(**kw)
+        self.polls = list(polls)
+        self.staged = False
+
+    def list_sent_orders(self):
+        self.sent_calls += 1
+        if not self.staged:
+            return []
+        item = self.polls.pop(0) if self.polls else []
+        if isinstance(item, BaseException):
+            raise item
+        return [dict(r) for r in item]
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(parts_order, "_sleep", lambda s: calls.append(s))
+    return calls
+
+
+def _place(tg, portal, rules=APPROVE):
+    plan = _staged_plan(tg, portal)
+    portal.staged = True
+    portal.sent_calls = 0
+    return parts_order.execute_order(CONFIG, portal, "B1", plan, rules)
+
+
+def _ordered_record(**kw):
+    return {"status": "ordered", "plan": {"reg_nr": "TST001"},
+            "vehicle_model": "VOLKSWAGEN PASSAT",
+            "updated_at": datetime.now(timezone.utc).isoformat(), **kw}
+
+
+def test_unique_match_on_the_second_poll_is_stored_and_shown(tg, sleeps):
+    row = _today_row()
+    portal = Polled(polls=[[], [row]], ref="ORD-9")
+
+    assert _place(tg, portal) == "ordered"
+
+    assert portal.sent_calls == 2
+    assert sleeps == [10]
+    rec = orders_state.get("B1")
+    assert rec["status"] == "ordered"
+    assert rec["verified_numbers"] == numbers_text(row) == "S-91001 · 71001/71002"
+    assert datetime.fromisoformat(rec["verified_at"]).tzinfo is not None
+    lines = tg["sent"][0].splitlines()
+    assert lines[:2] == ["Beställd: OLRD-0001 (TST001)",
+                         "Ordernummer: S-91001 · 71001/71002 (verifierad)"]
+    assert parts_order.order_notify_failed("B1") is False
+
+
+def test_no_match_after_three_polls_keeps_the_text(tg, sleeps):
+    portal = Polled(polls=[[], [], []], ref="UNVERIFIED-20261022T101010Z")
+
+    assert _place(tg, portal) == "ordered"
+
+    assert portal.sent_calls == 3
+    assert sleeps == [10, 10]                       # no sleep after the last try
+    rec = orders_state.get("B1")
+    assert "verified_at" not in rec and "verified_numbers" not in rec
+    assert ("Ordernummer: bekräftas senare (kolla Skickade Beställningar i pro.meca.se)"
+            in tg["sent"][0].splitlines())
+
+
+def test_verify_now_returns_none_after_all_tries():
+    calls = []
+    portal = Polled(polls=[[], [], []])
+    portal.staged = True
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
+                                  sleep=calls.append) is None
+    assert portal.sent_calls == 3 and calls == [10, 10]
+
+
+def test_two_candidate_rows_are_ambiguous(tg, sleeps):
+    rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
+    portal = Polled(polls=[rows, rows, rows], ref="ORD-9")
+
+    assert _place(tg, portal) == "ordered"
+
+    rec = orders_state.get("B1")
+    assert "verified_at" not in rec
+    assert tg["sent"][0].splitlines()[1] == "Ordernummer: ORD-9"
+
+
+def test_another_records_claimed_numbers_are_excluded(tg, sleeps):
+    orders_state.put("B2", "ordered", plan={"reg_nr": "TST001"})
+    orders_state.update_fields("B2", verified_at=datetime.now(timezone.utc).isoformat(),
+                               verified_numbers="S-91001 · 71001/71002")
+    rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
+    portal = Polled(polls=[rows], ref="ORD-9")
+
+    assert _place(tg, portal) == "ordered"
+
+    assert orders_state.get("B1")["verified_numbers"] == "S-91002 · 71003"
+    assert sleeps == []
+
+
+def test_verify_now_excludes_claimed_numbers_directly():
+    rows = [_today_row(), _today_row(supplier_no="S-91002", order_numbers="71003")]
+    portal = Polled(polls=[rows])
+    portal.staged = True
+    others = [("B2", _ordered_record(verified_at=datetime.now(timezone.utc).isoformat(),
+                                     verified_numbers="S-91001 · 71001/71002"))]
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), others,
+                                  sleep=lambda s: None) == "S-91002 · 71003"
+
+
+def test_verify_now_older_row_does_not_count():
+    portal = Polled(polls=[[_sent_row(days_ago=1)]] * 3)
+    portal.staged = True
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
+                                  sleep=lambda s: None) is None
+
+
+def test_verify_now_matches_by_model_without_the_registration_column():
+    row = _today_row(reg_nr=None)
+    portal = Polled(polls=[[row]])
+    portal.staged = True
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
+                                  sleep=lambda s: None) == numbers_text(row)
+
+
+def test_verify_now_another_unverified_order_for_the_car_is_not_guessed():
+    # The checker resolves all unverified orders together: one row, two orders -> waiting.
+    portal = Polled(polls=[[_today_row()]] * 3)
+    portal.staged = True
+    others = [("B2", _ordered_record())]
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), others,
+                                  sleep=lambda s: None) is None
+
+
+@pytest.mark.parametrize("error", [PartsPortalError("SECRET-PAGE-TEXT", "parse"),
+                                   AttributeError("no list_sent_orders")])
+def test_list_sent_orders_raising_keeps_the_order_and_message(tg, sleeps, error, caplog):
+    portal = Polled(polls=[error], ref="ORD-9")
+
+    assert _place(tg, portal) == "ordered"
+
+    rec = orders_state.get("B1")
+    assert rec["status"] == "ordered" and "verified_at" not in rec
+    assert rec["plan"]["confirmation"] == "ORD-9"
+    assert tg["sent"][0].splitlines()[:2] == ["Beställd: OLRD-0001 (TST001)",
+                                              "Ordernummer: ORD-9"]
+    assert parts_order.order_notify_failed("B1") is False
+    assert "SECRET-PAGE-TEXT" not in caplog.text
+
+
+def test_portal_without_list_sent_orders_is_swallowed():
+    class Bare:
+        pass
+    assert parts_order.verify_now(Bare(), "B1", _ordered_record(), [],
+                                  sleep=lambda s: None) is None
+
+
+def test_verify_budget_exceeded_stops_polling(stage_clock):
+    class Slow(Polled):
+        def list_sent_orders(self):
+            stage_clock["t"] += 50
+            return super().list_sent_orders()
+    portal = Slow(polls=[[], [], []])
+    portal.staged = True
+    calls = []
+    assert parts_order.verify_now(portal, "B1", _ordered_record(), [],
+                                  sleep=calls.append) is None
+    # polls at 0 (-> 50) and 60 (-> 110): past the 90 s budget, no third poll
+    assert portal.sent_calls == 2 and calls == [10]
+    assert parts_order.VERIFY_BUDGET_S == 90
+
+
+def test_the_checker_skips_a_record_verified_right_after_checkout(tg, sleeps):
+    import approve
+    portal = Polled(polls=[[_today_row()]], ref="ORD-9")
+    assert _place(tg, portal) == "ordered"
+    sent = len(tg["sent"])
+
+    class Untouchable:
+        def get(self):
+            raise AssertionError("the checker must not open the portal")
+
+    assert approve._to_verify() == []
+    assert approve._verify_orders(CONFIG, Untouchable(), datetime.now(timezone.utc)) is False
+    assert len(tg["sent"]) == sent
+
+
+def test_verified_but_message_not_delivered_is_notify_failed(tg, sleeps):
+    portal = Polled(polls=[[_today_row()]], ref="ORD-9")
+    plan = _staged_plan(tg, portal)
+    portal.staged = True
+    tg["send_ok"] = False
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+
+    rec = orders_state.get("B1")
+    assert rec["plan"]["notify_failed"] is True
+    assert rec["verified_numbers"] == "S-91001 · 71001/71002"   # kept by the re-put
+    assert parts_order.order_notify_failed("B1") is True
+
+
+def test_ordered_state_is_persisted_before_verification(tg, sleeps, monkeypatch):
+    events = []
+    real_put = orders_state.put
+
+    def put(booking_id, status, *a, **kw):
+        events.append(("put", status))
+        return real_put(booking_id, status, *a, **kw)
+
+    class Recording(Polled):
+        def list_sent_orders(self):
+            if self.staged:
+                events.append(("list_sent_orders", orders_state.get("B1")["status"]))
+            return super().list_sent_orders()
+
+    portal = Recording(polls=[[_today_row()]], ref="ORD-9")
+    plan = _staged_plan(tg, portal)
+    portal.staged = True
+    monkeypatch.setattr(orders_state, "put", put)
+
+    assert parts_order.execute_order(CONFIG, portal, "B1", plan, APPROVE) == "ordered"
+
+    assert events == [("put", "attempted"), ("put", "ordered"),
+                      ("list_sent_orders", "ordered")]
+
+
+def test_auto_mode_verifies_too(tg, sleeps):
+    class AutoPolled(Polled):
+        def checkout(self, *, max_total_sek):
+            self.staged = True
+            return super().checkout(max_total_sek=max_total_sek)
+
+    portal = AutoPolled(polls=[[_today_row()]], ref="ORD-9")
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, AUTO, confident) == "ordered"
+    assert orders_state.get("B1")["verified_numbers"] == "S-91001 · 71001/71002"
+    assert "(verifierad)" in tg["sent"][0]
