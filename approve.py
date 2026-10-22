@@ -32,8 +32,9 @@ registration (order_match). Exactly one row: its order numbers are stored and th
 is told. Several rows: the owner is asked once to check which one. Nothing found for
 3 days: one warning. Portal errors are retried silently on the next run.
 
-Status tracking (track_statuses) follows every verified order for 21 days or until its
-Klar is done (orders_state.tracked_orders): its row is found again in the same Skickade
+Status tracking (track_statuses) follows every verified order until its Klar is done or the Klar
+button expires (14 days, closed before tracking runs; the 21-day cap is only a safety bound)
+(orders_state.tracked_orders): its row is found again in the same Skickade
 Beställningar read (by the stored order numbers, order_match.find_row) and a changed
 "Beställningsstatus" is told to the owner once ("Orderstatus <label>: <old> → <new>"); the
 first status seen is only stored. Read-only, like the checker.

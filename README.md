@@ -187,15 +187,15 @@ Telegram message arrives from `daily-summary.yml`. It lists, with booking number
 (never customer data), at most 10 per section and at most 3000 characters in all:
 
 - `Väntar på ditt godkännande`: parts orders waiting for Godkänn / Avbryt;
-- `Väntar på Klar`: placed (or blocked) orders whose Klar button is still open (sent within 14 days;
-  marked `(blockerad)` or `(ej verifierad)` where that applies);
-- `Beställt, ej verifierat`: placed orders not yet found in "Skickade Beställningar";
-- `Kräver åtgärd`: blocked, failed or expired orders from the last 7 days;
+- `Väntar på Klar`: any order (except awaiting approval) whose Klar button is still open (sent within
+  14 days; marked `(blockerad)`, `(avbruten)`, `(misslyckad)`, `(utgången)` or `(ej verifierad)`);
+- `Beställt, ej verifierat`: placed orders the order checker still works on (not yet found, not yet warned about);
+- `Kräver åtgärd`: `blockerad`, `misslyckad` or `utgången` orders from the last 7 days;
 - `Larm`: active alerts;
 - a last line `Senaste lyckade körning: <datum> UTC`.
 
 Each booking appears once. A quiet day gives one line, `Inget väntar. Senaste lyckade körning: …`.
-If a state file cannot be read the message starts with `OBS: <fil> kunde inte läsas`. The summary
+If a state file cannot be read the message starts with `OBS: <fil> kunde inte läsas` (and says `Läget är okänt` instead of `Inget väntar` when orders.json is the one). If sending fails the run turns red. The summary
 only reads the saved state: it opens no browser, writes nothing and never touches an order. If it
 stops arriving, the watchdog raises `stale_summary`.
 
@@ -203,12 +203,13 @@ stops arriving, the watchdog raises `stale_summary`.
 the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` secrets.
 
 **Status messages.** After an order is verified, the daily approve run follows the portal's
-"Beställningsstatus" (in "Skickade Beställningar") for up to 21 days, or until you tap Klar. The
-first status it sees is only stored. When it changes you get `Orderstatus <bokning · reg>: <gammal>
+"Beställningsstatus" (in "Skickade Beställningar") until Klar is done or the Klar button expires
+(14 days; 21 days is only a safety bound). The
+first status it sees is only stored. When it changes you get `Orderstatus <bokning>: <gammal>
 → <ny>`. The wording is the portal's own. A `-` in the portal means "no status yet" and is
 ignored. If a message cannot be delivered it is sent again at the next run, and the run shows as
 failed. The cost: while an order is followed, the daily approve run opens the portal (about one
-browser run a day, up to 21 days per order, shared with the other approve work).
+browser run a day, about 14 days per order, shared with the other approve work).
 
 **Margin warning.** The approval message gets an extra line, right after `Totalt:`, when the parts
 cost you more than you charge for them. It never blocks an order. The booking's prices are ex VAT
@@ -333,6 +334,13 @@ that is normal): `config/seen_ids.txt`, `config/orders.json`, `config/no_button_
 `config/no_button_seen_once.txt`, `logs/run_history.jsonl`, `config/alerts.json` (bookings and
 approve) and `config/watchdog_alerts.json` (watchdog only). The two alert files are created by
 the workflows the first time an alert is raised, so they may not exist yet.
+
+### First run after pushing
+
+Run these three once from the GitHub Actions tab (*Run workflow*, `workflow_dispatch`) and check
+that each turns green: **MECA Booking Agent**, **MECA Approval Poller** and **MECA Daily Summary**.
+Until each has one successful run the watchdog stays quiet about it (a workflow that never ran is
+not treated as overdue); after that it alerts if a scheduled run is missed.
 
 ### 4. First live order
 

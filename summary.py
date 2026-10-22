@@ -3,8 +3,8 @@ summary.py
 ----------
 Daily Telegram overview (stdlib only, plus notifier: runs without pip install).
 Reads config/orders.json, config/alerts.json, config/watchdog_alerts.json and
-logs/run_history.jsonl from the checkout as plain JSON, sends ONE message and always
-exits 0. It writes no state and never opens a browser; the watchdog checks that the
+logs/run_history.jsonl from the checkout as plain JSON, sends ONE message; exits 1
+when it could not be sent (else 0). It writes no state and never opens a browser; the watchdog checks that the
 workflow keeps succeeding.
 
 Only booking numbers and plates are shown (no customer data).
@@ -48,7 +48,8 @@ def _label(booking_id, rec) -> str:
 def _last_success(history):
     best = None
     for row in history:
-        if not isinstance(row, dict) or row.get("login_failed"):
+        if (not isinstance(row, dict) or row.get("login_failed")
+                or row.get("state_unreadable")):
             continue
         ts = _parse(row.get("timestamp"))
         if ts and (best is None or ts > best):
@@ -74,6 +75,17 @@ def klar_outstanding(rec: dict, now: datetime) -> bool:
     return True
 
 
+STATUS_WORDS = {"blocked": "blockerad", "cancelled": "avbruten", "failed": "misslyckad",
+                "expired": "utgången"}
+
+
+def _unverified(rec: dict) -> bool:
+    """Mirror of approve._to_verify (orders_state.unverified_orders + not verify_warned):
+    placed orders the order checker still works on. Pinned to it by a test."""
+    return (rec.get("status") == "ordered" and "verified_at" not in rec
+            and rec.get("verify_warned") is not True)
+
+
 def _sections(orders, alerts, now):
     pending, klar, unverified, action = [], [], [], []
     bookings = orders.get("bookings") if isinstance(orders, dict) else None
@@ -84,21 +96,20 @@ def _sections(orders, alerts, now):
         line = _label(bid, rec)
         if status == "pending":
             pending.append(line)
-        elif status in ("ordered", "blocked") and klar_outstanding(rec, now):
-            # Each booking once: a Klar-waiting one is listed only here, annotated.
-            notes = []
-            if status == "blocked":
-                notes.append("blockerad")
-            if status == "ordered" and not rec.get("verified_at"):
-                notes.append("ej verifierad")
-            klar.append(line + (f" ({', '.join(notes)})" if notes else ""))
-        elif status == "ordered" and not rec.get("verified_at"):
+        elif status != "attempted" and klar_outstanding(rec, now):
+            # Each booking once: any record with an open Klar button is listed only here
+            # (orders_state._open_klar has no status filter), annotated with its status.
+            word = STATUS_WORDS.get(status)
+            if status == "ordered" and "verified_at" not in rec:
+                word = "ej verifierad"
+            klar.append(line + (f" ({word})" if word else ""))
+        elif _unverified(rec):
             unverified.append(line)
         elif status in ("blocked", "failed", "expired"):
             when = _parse(rec.get("updated_at"))
             # A missing or unparseable updated_at is shown (fail-open), never dropped.
             if when is None or now - when <= ACTION_WINDOW:
-                action.append(f"{line} ({status})")
+                action.append(f"{line} ({STATUS_WORDS[status]})")
     alert_lines = []
     for a in alerts:
         text = " ".join(str(a.get("text") or "").split())[:ALERT_MAX]
@@ -130,6 +141,9 @@ def build_summary(orders: dict, alerts: list, history: list, now: datetime) -> s
     note_text = "\n".join(str(n) for n in notes or ())
     sections = _sections(orders, alerts, now)
     if not any(items for _, items in sections):
+        if isinstance(orders, dict) and orders.get("_unreadable"):
+            # Never claim "nothing waits" when the order state could not be read.
+            return f"{note_text}\nLäget är okänt. {footer}"[:MAX_CHARS]
         return (f"Inget väntar. {footer}" + (f"\n{note_text}" if note_text else ""))[:MAX_CHARS]
     shown = [min(len(items), SECTION_MAX) for _, items in sections]
     while True:
@@ -163,6 +177,7 @@ def load_state(root: Path = Path(".")):
         orders = data
     except Exception:
         notes.append("OBS: orders.json kunde inte läsas")
+        orders["_unreadable"] = True
 
     active = []
     for name in ("alerts.json", "watchdog_alerts.json"):
@@ -202,18 +217,26 @@ def load_state(root: Path = Path(".")):
 
 
 def main(env=None, now=None, root=Path(".")) -> int:
+    """Send the summary. 0 when it was sent; 1 when sending failed or building it crashed
+    (after trying a short fallback message), so the workflow shows red."""
     env = os.environ if env is None else env
     now = now or datetime.now(timezone.utc)
+    config = {"telegram": {"bot_token": env.get("TELEGRAM_BOT_TOKEN", ""),
+                           "chat_id": env.get("TELEGRAM_CHAT_ID", "")}}
     try:
         orders, active, history = load_state(root)
         text = build_summary(orders, active, history, now)
-        config = {"telegram": {"bot_token": env.get("TELEGRAM_BOT_TOKEN", ""),
-                               "chat_id": env.get("TELEGRAM_CHAT_ID", "")}}
-        if not notifier.send_message(config, text):
-            log.error("Daily summary could not be sent.")
+        if notifier.send_message(config, text):
+            return 0
+        log.error("Daily summary could not be sent.")
+        return 1
     except Exception as e:
         log.error("Daily summary failed (%s).", type(e).__name__)
-    return 0
+    try:
+        notifier.send_message(config, "Dagssammanfattningen kunde inte skapas")
+    except Exception as e:
+        log.error("Fallback message failed (%s).", type(e).__name__)
+    return 1
 
 
 if __name__ == "__main__":

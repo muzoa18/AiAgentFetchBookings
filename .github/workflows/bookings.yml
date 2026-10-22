@@ -35,7 +35,7 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # Step timeout below the job's 15 min: a step timeout fails the step, so the
+      # Step timeout below the job's 20 min: a step timeout fails the step, so the
       # alert step's failure() fires (a job timeout is a cancel instead).
       - name: Run booking agent
         timeout-minutes: 13

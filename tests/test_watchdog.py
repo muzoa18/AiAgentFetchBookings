@@ -51,7 +51,8 @@ def test_is_overdue_cases():
     now = utc(2026, 10, 21, 18, 30)
     assert not is_overdue(now, utc(2026, 10, 21, 14, 40), B)   # 20 min before slot
     assert is_overdue(now, utc(2026, 10, 21, 14, 20), B)       # 40 min before slot
-    assert is_overdue(now, None, B)
+    # No run at all (a workflow never run yet) is not overdue: only a known-old success is.
+    assert not is_overdue(now, None, B)
     assert not is_overdue(utc(2026, 10, 21, 15, 20), None, B)  # inside grace
 
 
@@ -154,10 +155,29 @@ def test_main_stale_alerts_once(env, sent):
     assert len(sent) == 1  # de-duplicated
 
 
-def test_main_stale_with_no_success_at_all(env, sent):
-    data = dict(FRESH, **{"approve.yml": runs(None)})
+def test_main_workflow_without_any_success_is_not_an_alarm(env, sent, caplog):
+    # Ruling (final review I-1): a workflow with no runs yet (e.g. daily-summary.yml right
+    # after it is first pushed) must not raise; it is logged and nothing is resolved.
+    data = dict(FRESH, **{"approve.yml": runs(None), "daily-summary.yml": runs(None)})
+    alerts.raise_alert({}, "stale_approve", "old", now=NOW - timedelta(days=1))
+    sent.clear()
+    with caplog.at_level("INFO", logger="watchdog"):
+        assert watchdog.main(env, NOW, fake_urlopen(data)) == 0
+    assert sent == []
+    assert [a["key"] for a in alerts.active()] == ["stale_approve"]   # not resolved either
+    assert "approve.yml" in caplog.text and "daily-summary.yml" in caplog.text
+
+
+def test_main_first_run_with_empty_summary_history_is_quiet(env, sent):
+    data = dict(FRESH, **{"daily-summary.yml": runs(None)})
     assert watchdog.main(env, NOW, fake_urlopen(data)) == 0
-    assert len(sent) == 1 and "godkännandekontrollen" in sent[0]
+    assert sent == [] and alerts.active() == []
+
+
+def test_main_summary_known_old_success_alerts(env, sent):
+    data = dict(FRESH, **{"daily-summary.yml": runs("2026-10-19T05:46:00Z")})
+    assert watchdog.main(env, NOW, fake_urlopen(data)) == 0
+    assert [a["key"] for a in alerts.active()] == ["stale_summary"]
 
 
 def test_main_fresh_resolves_stale_alert(env, sent):
@@ -254,6 +274,6 @@ def test_summary_overdue_boundary():
     S = SPECS["summary"]
     ok = utc(2026, 10, 21, 5, 47)
     assert not is_overdue(utc(2026, 10, 21, 8, 45), None, S)       # exactly at grace end
-    assert is_overdue(utc(2026, 10, 21, 8, 46), None, S)
+    assert not is_overdue(utc(2026, 10, 21, 8, 46), None, S)   # never ran: no false alarm
     assert not is_overdue(utc(2026, 10, 21, 8, 46), ok, S)
     assert is_overdue(utc(2026, 10, 21, 8, 46), utc(2026, 10, 20, 5, 47), S)

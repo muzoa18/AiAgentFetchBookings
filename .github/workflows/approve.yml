@@ -37,10 +37,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Stdlib only: nothing installed yet. Most runs stop here. has_pending is
-      # true for an order awaiting approval, an outstanding Klar button, or a
+      # Stdlib only: nothing installed yet. Runs with nothing to do stop here, but for
+      # about 14 days after each order (status tracking) they do not. has_pending is
+      # true for an order awaiting approval, an outstanding Klar button, a
       # placed order the order checker has not yet found in pro.meca.se
-      # "Skickade Beställningar" (and not yet warned about).
+      # "Skickade Beställningar" (and not yet warned about), or a verified order whose
+      # portal status is still tracked.
       - name: Anything pending?
         id: check
         run: python approve.py --check
@@ -53,7 +55,7 @@ jobs:
         if: ${{ steps.check.outputs.has_pending == 'true' }}
         run: python -m playwright install --with-deps chromium
 
-      # Step timeout below the job's 10 min: a step timeout fails the step, so the
+      # Step timeout below the job's 15 min: a step timeout fails the step, so the
       # alert step's failure() fires (a job timeout is a cancel instead).
       - name: Handle approvals
         if: ${{ steps.check.outputs.has_pending == 'true' }}

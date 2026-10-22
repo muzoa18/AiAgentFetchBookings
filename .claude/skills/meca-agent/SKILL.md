@@ -35,14 +35,17 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   `stale_summary` when a scheduled run has not succeeded; writes only `config/watchdog_alerts.json`.
 - `summary.py` (daily 05:45 UTC, `daily-summary.yml`, stdlib only): one Telegram overview from the
   state files (pending, Klar-waiting, ordered but unverified, needs action, alerts, last successful
-  run). No state written, no browser, always exits 0, no failure-alert step (the watchdog covers it).
+  run). No state written, no browser, exit 1 if the send failed, no failure-alert step (the watchdog covers it).
   Run by hand from the Actions tab.
 - `approve.py` also runs `track_statuses` after the order checker: the portal's "Beställningsstatus"
-  of verified, not-Klar orders younger than 21 days is stored, and a change is sent as
+  of verified, not-Klar orders (effectively until the Klar button expires, 14 days; 21 is a safety bound) is stored, and a change is sent as
   `Orderstatus <label>: <old> → <new>` (first sighting silent, `-` counts as empty, stored only after
   a successful send, an undelivered message or a crash exits 1). One `list_sent_orders` read per run
   (`_SentOrders`) is shared with the checker. `--check` says `has_pending=true` while anything is
-  tracked, so there is about one browser run a day per order for up to 21 days.
+  tracked, so there is about one browser run a day per order for about 14 days.
+- First run after pushing: run MECA Booking Agent, MECA Approval Poller and MECA Daily Summary once
+  each from the Actions tab and check they are green. The watchdog does not alert for a workflow
+  that has no runs yet (only for a known-old last success).
 - `improve.py --apply-all` (Mondays 06:00 UTC): proposals → PR; only `state.py`, `run_logger.py`
   and new `tests/test_*.py` files are ever written; everything else becomes a suggestion.
 

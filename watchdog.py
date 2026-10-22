@@ -84,11 +84,15 @@ def is_overdue(now, last_success, spec, grace=timedelta(hours=3)) -> bool:
     now = _utc(now)
     if last_success is not None:
         last_success = _utc(last_success)
+    if last_success is None:
+        # No successful run at all (a workflow never run yet, e.g. right after it is first
+        # pushed) is not evidence of a miss: only a known-old success is overdue.
+        return False
     slot = last_slot(now, spec)
     if now <= slot + grace:
         return False
     # A cron run may start late; one that started up to 30 min before the slot is no miss.
-    return last_success is None or last_success < slot - timedelta(minutes=30)
+    return last_success < slot - timedelta(minutes=30)
 
 
 def fetch_last_success(repo: str, token: str, workflow_file: str,
@@ -134,8 +138,12 @@ def _check(env, now, urlopen) -> int:
         try:
             last = fetch_last_success(env.get("GITHUB_REPOSITORY", ""),
                                       env.get("GITHUB_TOKEN", ""), spec.file, urlopen)
+            if last is None:
+                log.info("%s: no successful run yet (not an alarm; nothing resolved).",
+                         spec.file)
+                continue
             if is_overdue(now, last, spec):
-                since = last.strftime("%Y-%m-%d") if last else "okänt datum"
+                since = last.strftime("%Y-%m-%d")
                 alerts.raise_alert(
                     config, spec.key,
                     f"Ingen lyckad körning av {spec.label} sedan {since} UTC. "

@@ -70,7 +70,8 @@ MAX_SWAPS = 2
 MODEL_MAX = 80
 NUMBERS_MAX = 120
 STATUS_MAX = 80
-# A verified order's portal status is followed this long (from verified_at), or until Klar.
+# Safety bound for following a verified order's portal status (from verified_at). In practice
+# tracking ends earlier: at Klar, or when the Klar button expires (KLAR_MAX_AGE, 14 days).
 TRACK_MAX_AGE = timedelta(days=21)
 KLAR_MAX_AGE = timedelta(days=14)
 MAX_TRIES = 10

@@ -36,7 +36,7 @@ approve.py               Daily poller: Approve / Cancel / Byt / Klar taps, 48 h 
                          withdrawal, order checker (verifies placed orders in "Skickade Beställningar"),
                          order status tracking (track_statuses), one shared list read (_SentOrders)
 summary.py               Daily Telegram overview (stdlib + notifier only; reads the state files, writes
-                         nothing, no browser, always exits 0)
+                         nothing, no browser; exit 1 if the send failed)
 order_match.py           Order checker matching (pure): car model / date / registration → one row
 notifier.py              Telegram Bot API client (stdlib): messages, inline buttons (one row or rows),
                          getUpdates
@@ -325,35 +325,46 @@ checker is the fallback for everything it did not verify.)
   (`stale_summary`, label "dagssammanfattningen"). Run it by hand from the Actions tab.
 - Reads `config/orders.json`, `config/alerts.json`, `config/watchdog_alerts.json` (optional) and
   `logs/run_history.jsonl` (last 5 rows) as plain JSON, sends ONE message, never writes state,
-  never opens a browser, and always exits 0 (a send failure is only logged).
+  never opens a browser, and exits 1 when the send failed or building crashed (a short fallback
+  `Dagssammanfattningen kunde inte skapas` is tried first), so the workflow shows red.
 - Only booking numbers and plates (`<id> · <plate>`), never customer data. Sections, in order, each
   booking in at most ONE of the four booking sections (an elif chain over the records, sorted by id):
   1. `Väntar på ditt godkännande`: status `pending`.
-  2. `Väntar på Klar`: status `ordered` or `blocked` and `klar_outstanding`, the mirror of
+  2. `Väntar på Klar`: any status except `pending`/`attempted` with `klar_outstanding`, the mirror of
      `orders_state._open_klar` (int `klar_message_id`, not `handled`, not `klar_closed`,
      `klar_sent_at` not older than 14 days; a missing or unparseable time never expires). The line
-     is annotated `(blockerad)` and/or `(ej verifierad)`; such a booking is listed only here.
-  3. `Beställt, ej verifierat`: status `ordered` without `verified_at` (and not in section 2).
+     is annotated `(blockerad)`, `(avbruten)`, `(misslyckad)`, `(utgången)` or `(ej verifierad)`;
+     such a booking is listed only here.
+  3. `Beställt, ej verifierat`: the order checker's predicate (`approve._to_verify`: `ordered`, no
+     `verified_at`, not `verify_warned`), not in section 2.
   4. `Kräver åtgärd`: `blocked`/`failed`/`expired`, `updated_at` within 7 days or missing/unparseable
-     (fail-open), shown as `<id> (<status>)`.
+     (fail-open), shown as `<id> (blockerad|misslyckad|utgången)`.
   5. `Larm`: active (unresolved) alerts from both alert files, newest first, text whitespace-collapsed
      and cut to 120 characters.
   Each section shows at most 10 items then `+N till`; the whole text is capped at 3000 characters
   (the longest section is collapsed one item at a time). An empty day gives one line:
   `Inget väntar. Senaste lyckade körning: <date> UTC`. The footer is `Senaste lyckade körning:
-  <YYYY-MM-DD> UTC` (last history row with no `login_failed`) or `Ingen körning registrerad`.
+  <YYYY-MM-DD> UTC` (last history row with neither `login_failed` nor `state_unreadable`) or `Ingen körning registrerad`.
 - A file that is missing (orders.json, run_history.jsonl) or unreadable gives empty data plus a line
   `OBS: <fil> kunde inte läsas` at the top (a missing alerts.json / watchdog_alerts.json is normal and
-  silent; a corrupt one gets the note). The notes travel in `orders["_notes"]`.
+  silent; a corrupt one gets the note). The notes travel in `orders["_notes"]`. When orders.json is
+  unreadable and nothing else is listed, the text is the note plus `Läget är okänt.`, never `Inget väntar`.
 - `ordered` + verified records that are not waiting for Klar appear in no section (nothing to do).
+
+## First run after pushing
+Run MECA Booking Agent, MECA Approval Poller and MECA Daily Summary once each from the Actions tab
+(`workflow_dispatch`) and check they are green. The watchdog treats a workflow with NO runs at all
+as not overdue (logged, no alert, nothing resolved), so a new workflow such as daily-summary.yml does
+not raise `stale_summary` before its first run; only a known-old last success is overdue.
 
 ## Order status tracking (approve.py: track_statuses, orders_state: tracked_orders)
 - The checker already reads "Skickade Beställningar"; its "Beställningsstatus" column is the row's
   `order_status`. Record fields (whitelisted in `orders_state`): `portal_status` (text, at most
   80 chars, markup and control/format characters stripped) and `status_changed_at` (ISO time).
 - **Tracked** = status `ordered` + `verified_at` and `verified_numbers` + not `handled` and not
-  `klar_closed` + younger than 21 days (`orders_state.TRACK_MAX_AGE`, counted from `verified_at`,
-  else `updated_at`). Tracking therefore ends at Klar or after 21 days. The row is found with
+  `klar_closed` + younger than 21 days (`orders_state.TRACK_MAX_AGE`, a safety bound, counted from
+  `verified_at`, else `updated_at`). In practice tracking ends when Klar is done or the Klar button
+  expires (14 days; `_close_expired_klar` runs before tracking). The row is found with
   `order_match.find_row(rows, verified_numbers)`; none or several rows: nothing happens.
 - First sighting is silent (stored only). A different status: message `Orderstatus <label>: <old> →
   <new>` and the new status is stored ONLY after the send succeeded, so an undelivered message is
@@ -366,7 +377,7 @@ checker is the fallback for everything it did not verify.)
   the approve run exit 1; the rest of the run is not affected.
 - `approve.py --check` prints `has_pending=true` while `orders_state.outstanding_tracking()` is true,
   so the daily approve run installs Chromium and opens the portal (about one browser run a day, for
-  up to 21 days per order, shared with all other approve work).
+  about 14 days per order, shared with all other approve work).
 
 ## Margin warning (parts_order_helpers.margin_line, rules.min_margin_pct)
 - Shown as one line in the approval message right after `Totalt:` (before the fluids); it never
@@ -532,7 +543,7 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
   owner orders in pro.meca.se manually.
 - An approve run killed mid-checkout is only reported by the next daily booking run's sweep.
 - The portal's order-status vocabulary is unknown, so nothing depends on specific words; tracking
-  costs about one browser run a day per order for up to 21 days. The margin warning ignores fees at
+  costs about one browser run a day per order for about 14 days (21 is only a safety bound). The margin warning ignores fees at
   checkout and hard-codes 25 % VAT. The Telegram summary shows at most 10 items per section.
 - `approve.py` repeats the "invalid rules" warning every poll; a missing secret turns every poll red.
 - Cancel clears the whole vehicle cart, including anything the owner added by hand.

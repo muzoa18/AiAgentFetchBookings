@@ -33,6 +33,27 @@ def test_quiet_day_no_run():
     assert text.startswith("Inget väntar.") and "Ingen körning registrerad" in text
 
 
+def test_unreadable_orders_never_says_inget_vantar(tmp_path):
+    (tmp_path / "config").mkdir()
+    for content in (None, "{nope"):
+        f = tmp_path / "config/orders.json"
+        if content is None:
+            f.unlink(missing_ok=True)
+        else:
+            f.write_text(content, encoding="utf-8")
+        o, a, h = summary.load_state(tmp_path)
+        text = summary.build_summary(o, a, h, NOW)
+        assert text.startswith("OBS: orders.json kunde inte läsas")
+        assert "Läget är okänt" in text and "Inget väntar" not in text
+
+
+def test_state_unreadable_run_is_not_success():
+    hist = [{"timestamp": "2026-10-21T14:29:00", "login_failed": False, "state_unreadable": True},
+            {"timestamp": "2026-10-20T14:29:00", "login_failed": False,
+             "state_unreadable": False}]
+    assert "2026-10-20 UTC" in summary.build_summary(orders(), [], hist, NOW)
+
+
 def test_failed_login_run_is_not_success():
     hist = [{"timestamp": "2026-10-21T14:29:00", "login_failed": True}]
     assert "Ingen körning registrerad" in summary.build_summary(orders(), [], hist, NOW)
@@ -143,6 +164,8 @@ def _env():
 
 def test_main_sends_exactly_one_message(tmp_path, monkeypatch):
     (tmp_path / "config").mkdir()
+    (tmp_path / "config/orders.json").write_text('{"last_update_id": null, "bookings": {}}',
+                                                 encoding="utf-8")
     sent = []
     monkeypatch.setattr(notifier, "send_message", lambda c, t: sent.append((c, t)) or True)
     assert summary.main(_env(), NOW, tmp_path) == 0
@@ -151,16 +174,26 @@ def test_main_sends_exactly_one_message(tmp_path, monkeypatch):
     assert "Inget väntar" in sent[0][1]
 
 
-def test_main_returns_zero_when_sending_fails(tmp_path, monkeypatch):
+def test_main_returns_one_when_sending_fails(tmp_path, monkeypatch):
+    # A failed send must turn the run red so the owner/watchdog can see it.
     monkeypatch.setattr(notifier, "send_message", lambda c, t: False)
-    assert summary.main(_env(), NOW, tmp_path) == 0
+    assert summary.main(_env(), NOW, tmp_path) == 1
 
 
-def test_main_returns_zero_when_sending_raises(tmp_path, monkeypatch):
+def test_main_unexpected_error_sends_fallback_and_returns_one(tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(summary, "build_summary",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(notifier, "send_message", lambda c, t: sent.append(t) or True)
+    assert summary.main(_env(), NOW, tmp_path) == 1
+    assert sent == ["Dagssammanfattningen kunde inte skapas"]
+
+
+def test_main_error_and_failing_fallback_still_contained(tmp_path, monkeypatch):
     def boom(c, t):
         raise RuntimeError("x")
     monkeypatch.setattr(notifier, "send_message", boom)
-    assert summary.main(_env(), NOW, tmp_path) == 0
+    assert summary.main(_env(), NOW, tmp_path) == 1
 
 
 def test_summary_is_stdlib_only():
@@ -214,13 +247,64 @@ def test_klar_not_outstanding_cases_fall_through_or_vanish():
         "O-1": rec("ordered", "OLD111", klar_message_id=5, klar_sent_at=old),
         "T-1": rec("ordered", "BOO111", klar_message_id=True, verified_at="x"),
         "S-1": rec("ordered", "STR111", klar_message_id="5", verified_at="x"),
-        "C-1": rec("cancelled", "CAN111", klar_message_id=5),
+        "C-1": rec("cancelled", "CAN111"),               # no Klar button: never shown
     })
     text = summary.build_summary(o, [], HIST, NOW)
     assert "Väntar på Klar" not in text
     assert "HAN111" not in text and "BOO111" not in text and "STR111" not in text
     assert "CAN111" not in text
     assert "OLD111" in _sect(text, "Beställt, ej verifierat")   # expired Klar: plain unverified
+
+
+def test_open_klar_on_any_non_pending_status_is_listed_once_with_swedish_status():
+    o = orders(**{
+        "C-1": rec("cancelled", "CAN111", klar_message_id=5),
+        "F-1": rec("failed", "FAI111", klar_message_id=6,
+                   updated="2026-10-13T00:00:00+00:00"),   # 9 days old
+        "E-1": rec("expired", "EXP111", klar_message_id=7),
+        "N-1": rec("cancelled", "NOK111"),                 # no Klar: never shown
+    })
+    text = summary.build_summary(o, [], HIST, NOW)
+    k = _sect(text, "Väntar på Klar")
+    assert "CAN111 (avbruten)" in k and "FAI111 (misslyckad)" in k and "EXP111 (utgången)" in k
+    for plate in ("CAN111", "FAI111", "EXP111"):
+        assert text.count(plate) == 1
+    assert "NOK111" not in text and "Kräver åtgärd" not in text
+
+
+def test_attempted_with_klar_is_not_listed():
+    o = orders(**{"A-1": rec("attempted", "ATT111", klar_message_id=5)})
+    assert "ATT111" not in summary.build_summary(o, [], HIST, NOW)
+
+
+def test_unverified_list_matches_the_order_checker(tmp_path, monkeypatch):
+    import approve
+    import orders_state
+    recs = {
+        "a": rec("ordered"),
+        "b": rec("ordered", verify_warned=True),
+        "c": rec("ordered", handled=True, verify_warned=True),   # UNKW-9240-like
+        "d": rec("ordered", verified_at="2026-10-21T13:00:00+00:00"),
+        "e": rec("ordered", handled=True),
+        "f": rec("pending"),
+        "g": rec("blocked"),
+    }
+    path = tmp_path / "orders.json"
+    path.write_text(json.dumps({"last_update_id": None, "bookings": recs}), encoding="utf-8")
+    monkeypatch.setattr(orders_state, "ORDERS_FILE", path)
+    expected = {bid for bid, _ in approve._to_verify()}
+    assert expected == {"a", "e"}
+    text = summary.build_summary(orders(**recs), [], HIST, NOW)
+    listed = {bid for bid in recs if f"{bid} · " in _sect(text, "Beställt, ej verifierat")}
+    assert listed == expected
+
+
+def test_action_section_uses_swedish_status_words():
+    o = orders(**{"B-1": rec("blocked", "BLO111"), "F-1": rec("failed", "FAI111"),
+                  "E-1": rec("expired", "EXP111")})
+    k = _sect(summary.build_summary(o, [], HIST, NOW), "Kräver åtgärd")
+    assert "BLO111 (blockerad)" in k and "FAI111 (misslyckad)" in k and "EXP111 (utgången)" in k
+    assert "blocked" not in k and "failed" not in k and "expired" not in k
 
 
 def test_klar_predicate_matches_orders_state(tmp_path, monkeypatch):
