@@ -65,6 +65,9 @@ REASON_MAX = 200
 # Block reasons that happen before anything is added to the cart. A legacy record (no
 # 'cart_touched' key, written before the field existed) is only re-staged for these.
 PRE_CART_REASONS = ("ingen säker träff", "inga delar")
+# Block reasons that are never re-staged although the cart was not touched: a sent order
+# for the vehicle already exists in pro.meca.se (parts_order duplicate-order guard).
+NO_RESTAGE_REASONS = ("order finns redan",)
 
 
 def _load() -> dict:
@@ -256,7 +259,7 @@ def restage(booking_id: str) -> bool:
     """Re-queue a 'blocked' order for one more automatic staging attempt.
 
     Only when the cart was never touched, fewer than MAX_TRIES retries were made and
-    the booking was not marked Hanterad (Klar).
+    the booking was not marked Hanterad (Klar), and never for NO_RESTAGE_REASONS.
     A legacy record without a 'cart_touched' key qualifies only for PRE_CART_REASONS.
     The record becomes the queued marker (begin() then starts it as usual) with
     tries + 1 and the previous block reason kept as 'last_reason'.
@@ -270,6 +273,8 @@ def restage(booking_id: str) -> bool:
         return False
     plan = record.get("plan")
     reason = plan.get("reason") if isinstance(plan, dict) else None
+    if isinstance(reason, str) and reason.startswith(NO_RESTAGE_REASONS):
+        return False
     if "cart_touched" not in record:
         legacy_reason = reason if isinstance(reason, str) else record.get("last_reason") or ""
         if not legacy_reason.startswith(PRE_CART_REASONS):

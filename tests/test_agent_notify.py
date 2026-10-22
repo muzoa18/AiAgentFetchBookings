@@ -818,6 +818,9 @@ class _Portal:
     def login(self):
         pass
 
+    def list_sent_orders(self):  # duplicate-order guard: nothing sent yet
+        return []
+
     def load_vehicle(self, reg_nr):
         pass
 

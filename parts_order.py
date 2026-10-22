@@ -24,6 +24,11 @@ mixed into the same cart.
 Customer data (name, phone, email, booking message) is never persisted: the plan
 only holds what approval needs (orders.json is committed to git).
 
+Before the first portal step, pro.meca.se "Skickade Beställningar" is read once per
+staging attempt: a sent order for the same vehicle dated within DUPLICATE_WINDOW_DAYS and
+not claimed by another record blocks staging (never re-staged; the owner orders by hand).
+A portal error while checking is never read as "no duplicate".
+
 A 'blocked' order whose cart was never touched is re-staged by agent.py through
 orders_state.restage(). Such a quiet retry sends no message when it blocks again for
 the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
@@ -31,12 +36,12 @@ the same reason; reaching orders_state.MAX_TRIES sends one give-up message.
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import notifier
 import orders_state
 from logsafe import describe
-from order_match import clean_vehicle_model
+from order_match import candidates, claim_tokens, clean_vehicle_model, numbers_text
 from parts_matcher import choose, is_fluid, search_terms
 from parts_portal_parse import PartsPortalError
 from parts_order_helpers import (build_summary, cart_problem, clean_fluids, error_code,
@@ -67,6 +72,14 @@ STAGE_BUDGET_S = 480
 _clock = time.monotonic
 # After these the session cannot add anything more: the remaining parts are not tried.
 STOP_CODES = ("vehicle_lost", "login")
+
+# Duplicate-order guard: a sent order for the vehicle this recent blocks staging. The
+# reason starts with orders_state.NO_RESTAGE_REASONS, so it is never retried quietly.
+DUPLICATE_WINDOW_DAYS = 7
+DUPLICATE_REASON = "order finns redan i pro.meca.se ({numbers})"
+DUPLICATE_TEXT = ("Bokning {label}: en skickad order för fordonet finns redan i pro.meca.se "
+                  "({numbers}). Jag har inte förberett någon ny order. "
+                  "Beställ för hand om delarna ändå behövs.")
 
 EMPTY_CART_TEXT = ("Varukorgen på pro.meca.se är tom – ordern kan redan vara lagd. "
                    "Kontrollera Orderöversikt på pro.meca.se innan du beställer för hand.")
@@ -290,6 +303,35 @@ def _block_transient(config: dict, booking: dict) -> str:
                   text=TRANSIENT_TEXT.format(label=_label(booking)), quiet_reason=quiet_reason)
 
 
+def _claimed_by_others(booking_id) -> set[str]:
+    """Supplier/portal order numbers stored as verified_numbers on any OTHER record."""
+    taken = set()
+    for status in orders_state.STATUSES:
+        for bid, rec in orders_state.by_status(status):
+            if bid != booking_id:
+                taken |= claim_tokens(rec.get("verified_numbers"))
+    return taken
+
+
+def _existing_sent_order(portal, booking: dict, now: datetime) -> dict | None:
+    """The newest "Skickade Beställningar" row that may already be this booking's order:
+    same vehicle (plate when the table has the registration column, else brand + model
+    words; order_match.candidates), dated on or after DUPLICATE_WINDOW_DAYS before `now`
+    (a naive `now` is UTC; the UTC date is never later than the Swedish one, so the window
+    is never shorter), and not claimed by another record. None = no such row.
+    PartsPortalError from list_sent_orders() is raised through (never "no duplicate")."""
+    rows = portal.list_sent_orders()
+    when = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    since = when.astimezone(timezone.utc).date() - timedelta(days=DUPLICATE_WINDOW_DAYS)
+    found = candidates(rows, clean_vehicle_model(booking.get("vehicle")), since,
+                       _claimed_by_others(booking.get("id")),
+                       reg_nr=str(booking.get("reg_nr") or "").strip())
+    if found is None:  # nothing to match by (no plate column and no model)
+        log.warning("Duplicate check for %s: nothing to match sent orders by.", booking.get("id"))
+        return None
+    return found[0] if found else None
+
+
 def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     booking_id, label = booking["id"], _label(booking)
     record = orders_state.get(booking_id) or {}
@@ -322,6 +364,16 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker) -> str:
     wanted, reason = _wanted(order_lines)
     if reason:
         return block(reason)
+
+    # Duplicate-order guard: once per staging attempt (restaged ones too: the order may
+    # have been placed by hand meanwhile), before any portal step that touches a cart.
+    if portal is not None:
+        row = _existing_sent_order(portal, booking, datetime.now(timezone.utc))
+        if row is not None:
+            numbers = numbers_text(row)
+            log.warning("A recent sent order exists for %s — not staging.", booking_id)
+            return block(DUPLICATE_REASON.format(numbers=numbers),
+                         text=DUPLICATE_TEXT.format(label=label, numbers=numbers))
 
     portal.login()
     portal.load_vehicle(reg_nr)

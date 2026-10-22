@@ -109,6 +109,19 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
 - `python approve.py --check` (stdlib only) prints `has_pending=true|false`; the workflow skips
   installing Playwright when nothing is pending.
 
+## Duplicate-order guard (parts_order._stage, before any cart action)
+- Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"
+  once (`PartsPortal.list_sent_orders()`), before login/vehicle/cart steps. A row for the same
+  vehicle (plate when the registration column exists, else brand + model words;
+  `order_match.candidates`) dated within `DUPLICATE_WINDOW_DAYS = 7` (UTC date) and not claimed
+  by another record's `verified_numbers` blocks staging: reason "order finns redan i
+  pro.meca.se (<numbers_text(row)>)", `cart_touched` false, Swedish message "Bokning <nr>: en
+  skickad order för fordonet finns redan i pro.meca.se (…). Jag har inte förberett någon ny
+  order. Beställ för hand om delarna ändå behövs." The reason is in
+  `orders_state.NO_RESTAGE_REASONS`, so `restage()` never retries it.
+- Fail closed: a transient error reading the list (timeout, login, …) is the usual transient
+  block (quiet retry); a parse error fails the booking. Never read as "no duplicate".
+
 ## Order checker (approve.py, after the taps)
 - A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the
   final click); the Beställd message then says "Ordernummer: bekräftas senare (kolla Skickade

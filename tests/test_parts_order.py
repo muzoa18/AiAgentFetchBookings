@@ -49,8 +49,12 @@ class FakePortal:
     """
 
     def __init__(self, catalogue=CATALOGUE, cart=None, ref="ORD-123", initial=None,
-                 carts=None, add_works=True):
+                 carts=None, add_works=True, sent_rows=None, sent_error=None):
         self.catalogue = catalogue
+        # "Skickade Beställningar" (duplicate-order guard); counted, not in `calls`.
+        self.sent_rows = list(sent_rows or [])
+        self.sent_error = sent_error
+        self.sent_calls = 0
         self.cart = cart
         self.initial = initial
         self.carts = list(carts or [])
@@ -68,6 +72,12 @@ class FakePortal:
 
     def login(self):
         self._record("login")
+
+    def list_sent_orders(self):
+        self.sent_calls += 1
+        if self.sent_error is not None:
+            raise self.sent_error
+        return [dict(r) for r in self.sent_rows]
 
     def load_vehicle(self, reg_nr):
         self._record("load_vehicle", reg_nr)
@@ -1820,3 +1830,185 @@ def test_real_reference_is_shown_as_before(tg):
                                       confident) == "ordered"
     assert tg["sent"][0].splitlines()[:2] == ["Beställd: OLRD-0001 (TST001)",
                                               "Ordernummer: 4500012345"]
+
+
+# ── Duplicate-order guard: a recent sent order for the vehicle blocks staging ──
+
+from order_match import numbers_text  # noqa: E402
+
+
+def _days_ago(n):
+    return (datetime.now(timezone.utc).date() - timedelta(days=n)).isoformat()
+
+
+def _sent_row(days_ago=1, reg_nr="TST001", model="VOLKSWAGEN, Passat Variant (B8), 14-",
+              supplier_no="S-90001", order_numbers="70001/70002"):
+    return {"supplier_no": supplier_no, "status": "Skickad", "date": _days_ago(days_ago),
+            "reg_nr": reg_nr, "model": model, "order_numbers": order_numbers,
+            "order_status": ""}
+
+
+DUP_TEXT = ("Bokning OLRD-0001: en skickad order för fordonet finns redan i pro.meca.se "
+            "(S-90001 · 70001/70002). Jag har inte förberett någon ny order. "
+            "Beställ för hand om delarna ändå behövs.")
+
+
+def _assert_duplicate_block(tg, portal, row=None):
+    rec = orders_state.get("B1")
+    numbers = numbers_text(row or _sent_row())
+    assert rec["status"] == "blocked"
+    assert rec["plan"]["reason"] == f"order finns redan i pro.meca.se ({numbers})"
+    assert not rec["plan"]["reason"].startswith(orders_state.PRE_CART_REASONS)
+    assert rec.get("cart_touched") is False
+    assert portal.calls == [] and portal.added == []      # no login, vehicle or cart action
+    assert portal.sent_calls == 1
+    assert tg["buttons"] == []
+    assert orders_state.restage("B1") is False            # never retried automatically
+    assert orders_state.get("B1")["status"] == "blocked"
+
+
+def test_recent_sent_order_for_the_plate_blocks_staging(tg, orders_file):
+    portal = FakePortal(sent_rows=[_sent_row()])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_duplicate_block(tg, portal)
+    assert tg["sent"] == [DUP_TEXT]
+    assert orders_state.get("B1")["klar_message_id"] == _klar_only(tg, DUP_TEXT)
+    _assert_no_pii(orders_file)
+
+
+def test_duplicate_numbers_come_from_the_row_only(tg):
+    row = _sent_row(supplier_no="S-12345", order_numbers="1 / 2,3")
+    portal = FakePortal(sent_rows=[row])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_duplicate_block(tg, portal, row)
+    assert "(S-12345 · 1/2/3)" in tg["sent"][0]
+
+
+def test_sent_order_without_a_registration_column_matches_by_model(tg):
+    portal = FakePortal(sent_rows=[_sent_row(reg_nr=None)])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+    _assert_duplicate_block(tg, portal)
+
+
+def test_sent_order_for_another_model_without_registration_column_proceeds(tg):
+    portal = FakePortal(sent_rows=[_sent_row(reg_nr=None, model="KIA, Rio Kombi-sedan (III)")])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+    assert portal.sent_calls == 1
+
+
+def test_sent_order_exactly_seven_days_old_still_blocks(tg):
+    assert parts_order.DUPLICATE_WINDOW_DAYS == 7
+    portal = FakePortal(sent_rows=[_sent_row(days_ago=7)])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+    _assert_duplicate_block(tg, portal)
+
+
+def test_sent_order_older_than_seven_days_does_not_block(tg):
+    portal = FakePortal(sent_rows=[_sent_row(days_ago=8)])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+
+    assert portal.sent_calls == 1
+    assert "add_to_cart" in portal.names()
+    assert len(tg["buttons"]) == 1
+
+
+def test_sent_order_for_another_plate_does_not_block(tg):
+    portal = FakePortal(sent_rows=[_sent_row(reg_nr="OTH999")])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+    assert portal.sent_calls == 1
+
+
+def test_sent_order_claimed_by_another_record_does_not_block(tg):
+    orders_state.put("B0", "ordered", plan={"booking_id": "B0"})
+    orders_state.update_fields("B0", verified_numbers=numbers_text(_sent_row()),
+                               verified_at=datetime.now(timezone.utc).isoformat())
+    portal = FakePortal(sent_rows=[_sent_row()])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+
+    assert portal.sent_calls == 1
+
+
+def test_unclaimed_row_blocks_even_when_another_row_is_claimed(tg):
+    orders_state.put("B0", "ordered", plan={"booking_id": "B0"})
+    orders_state.update_fields("B0", verified_numbers="S-80000 · 60001")
+    claimed = _sent_row(supplier_no="S-80000", order_numbers="60001")
+    portal = FakePortal(sent_rows=[claimed, _sent_row()])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_duplicate_block(tg, portal)
+
+
+def test_sent_orders_timeout_is_a_transient_block_with_no_cart_action(tg):
+    portal = FakePortal(sent_rows=[_sent_row(reg_nr="OTH999")],
+                        sent_error=PartsPortalError("sent orders did not appear", "search_timeout"))
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    rec = orders_state.get("B1")
+    assert rec["plan"]["reason"] == parts_order.TRANSIENT_REASON
+    assert rec.get("cart_touched") is False
+    assert portal.calls == [] and portal.sent_calls == 1
+    assert tg["sent"] == [TRANSIENT_TEXT] and tg["buttons"] == []
+    assert orders_state.restage("B1") is True             # retried on the next run
+
+
+def test_sent_orders_parse_error_fails_closed_with_no_cart_action(tg):
+    portal = FakePortal(sent_error=PartsPortalError("SECRET-PAGE-TEXT table", "parse"))
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "failed"
+
+    assert portal.calls == [] and portal.added == []
+    assert tg["buttons"] == []
+    assert "SECRET-PAGE-TEXT" not in "".join(tg["sent"])
+
+
+def test_restaged_record_is_checked_again_and_blocked_when_ordered_by_hand(tg):
+    _blocked_then_restaged(AIR_REASON)
+    portal = FakePortal(sent_rows=[_sent_row()])
+
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "blocked"
+
+    _assert_duplicate_block(tg, portal)
+    assert tg["sent"] == [DUP_TEXT]                       # a new reason: the owner is told
+
+
+def test_sent_orders_are_read_once_per_staging_attempt(tg):
+    portal = FakePortal(sent_rows=[_sent_row(days_ago=30), _sent_row(reg_nr="OTH999")])
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+    assert portal.sent_calls == 1
+
+
+def test_guard_runs_before_the_first_portal_step(tg):
+    class Ordered(FakePortal):
+        def list_sent_orders(self):
+            self.calls.append(("list_sent_orders",))
+            return super().list_sent_orders()
+
+    portal = Ordered()
+    assert parts_order.plan_and_stage(CONFIG, BOOKING, portal, APPROVE, confident) == "pending"
+    assert portal.names()[:2] == ["list_sent_orders", "login"]
+
+
+def test_guard_skipped_without_a_portal(tg):
+    booking = {**BOOKING, "parts": [], "fluids": [{"name": "Olja 5W30", "qty": "5"}]}
+    assert parts_order.plan_and_stage(CONFIG, booking, None, APPROVE, confident) == "blocked"
+    assert orders_state.get("B1")["plan"]["reason"] == "inga delar att beställa"
+
+
+def test_existing_sent_order_helper():
+    now = datetime.now(timezone.utc)
+    row = _sent_row()
+    assert parts_order._existing_sent_order(FakePortal(sent_rows=[row]), BOOKING, now) == row
+    assert parts_order._existing_sent_order(FakePortal(), BOOKING, now) is None
+    naive = now.replace(tzinfo=None)                      # treated as UTC
+    assert parts_order._existing_sent_order(FakePortal(sent_rows=[row]), BOOKING, naive) == row
+    with pytest.raises(PartsPortalError):
+        parts_order._existing_sent_order(
+            FakePortal(sent_error=PartsPortalError("x", "login")), BOOKING, now)

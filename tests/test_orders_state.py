@@ -334,6 +334,17 @@ def test_restage_counts_tries_up_to_the_cap():
     assert orders_state.get("B1")["status"] == "blocked"
 
 
+def test_restage_refuses_a_duplicate_order_block():
+    # Blocked before any cart action (cart_touched False) but a real order already exists:
+    # never retried automatically.
+    orders_state.put("B1", "blocked",
+                     plan={"reason": "order finns redan i pro.meca.se (S-1 · 2)"})
+    orders_state.update_fields("B1", cart_touched=False)
+    assert orders_state.restage("B1") is False
+    assert orders_state.get("B1")["status"] == "blocked"
+    assert not orders_state.NO_RESTAGE_REASONS[0].startswith(orders_state.PRE_CART_REASONS)
+
+
 def test_restage_refuses_cart_touched():
     orders_state.put("B1", "blocked", plan={"reason": "x"})
     orders_state.update_fields("B1", cart_touched=True)
