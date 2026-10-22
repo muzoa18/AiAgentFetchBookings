@@ -6,7 +6,9 @@ Fail-closed guards for the entry points (agent.py, approve.py).
 - state_problems / check_state_or_alert: a missing or unreadable config/orders.json
   stops all ordering and raises an alert (orders_state._load() alone treats a missing
   file as empty, which once re-staged an order that was already placed).
-- guarded: wraps a run so a crash or a non-zero exit raises an alert.
+- guarded: wraps a run so a crash or a non-zero exit raises an alert. A successful run
+  also resolves the workflow_failed_<workflow name> alert of alerts_cli (alerts.json has
+  one writer group, bookings/approve; the watchdog keeps its own file).
 
 Alert texts are fixed Swedish strings; they never contain exception messages
 (only the exception class name), since messages can carry page or customer text.
@@ -24,6 +26,8 @@ log = logging.getLogger(__name__)
 STATE_ALERT_KEY = "state_unreadable"
 MISSING = "config/orders.json saknas"
 UNREADABLE = "config/orders.json kan inte läsas"
+# guarded() name -> the workflow name alerts_cli gets ($WORKFLOW_NAME = github.workflow).
+DISPLAY_NAMES = {"booking_agent": "MECA Booking Agent", "approve": "MECA Approval Poller"}
 
 
 def state_problems() -> list[str]:
@@ -63,6 +67,8 @@ def guarded(name: str, fn: Callable[[], int], config_loader=load_config) -> int:
     if code == 0:
         alerts.resolve(f"crash_{name}")
         alerts.resolve(f"run_failed_{name}")
+        if name in DISPLAY_NAMES:
+            alerts.resolve(f"workflow_failed_{DISPLAY_NAMES[name]}")
     else:
         alerts.raise_alert(config, f"run_failed_{name}",
                            f"Körningen av {name} slutade med fel – se GitHub Actions-loggen.")

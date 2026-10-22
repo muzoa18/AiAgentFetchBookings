@@ -58,7 +58,7 @@ failures that happen before or outside Python.
 
 ### Dead-man switch (`watchdog.py`, `.github/workflows/watchdog.yml`)
 Cron every 6 hours (`17 */6 * * *`, off the hour), stdlib only, permissions `contents:
-write` + `actions: read`, concurrency group `meca-bookings`. Pure functions:
+write` + `actions: read`, concurrency group `meca-watchdog` (see below). Pure functions:
 `last_slot(now, spec)` returns the most recent expected run time (bookings: Mon-Sat 15:00
 UTC; approve: daily 06:00 UTC); `is_overdue(now, last_success, spec, grace=3h)`. The last
 success comes from the Actions API
@@ -67,6 +67,16 @@ success comes from the Actions API
 An API error is logged and raises nothing (it is not evidence of a stale run). Note: the
 watchdog cannot detect GitHub disabling scheduled workflows after 60 days of repository
 inactivity; the dashboard's last-run age covers that.
+
+*Revised (Task 5 review):* the watchdog runs in its own concurrency group `meca-watchdog`
+(in `meca-bookings` a queued watchdog run would replace a pending bookings/approve run), so
+it can overlap them. It therefore never writes `config/alerts.json`: its alerts go to its own
+`config/watchdog_alerts.json`, committed by its own persist step. With two writers of one
+file, a rebase conflict would make the losing run drop its whole state commit (orders.json,
+seen_ids, last_update_id). `workflow_failed_<workflow name>` is resolved by
+`preflight.guarded` when a run succeeds (inside the single writer group), not by the
+watchdog. The dashboard (Task 6) reads and merges both `config/alerts.json` and
+`config/watchdog_alerts.json`.
 
 ### Duplicate-order guard (in `parts_order.plan_and_stage`)
 When a portal is available and the booking has just been queued (no order evidence), call

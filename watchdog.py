@@ -6,6 +6,11 @@ when bookings.yml and approve.yml last succeeded and raises a Telegram alert if
 a scheduled slot was missed. A failing API call is NOT evidence of a stale run:
 it is logged and nothing is raised.
 
+Its alerts live in their own file, config/watchdog_alerts.json (WATCHDOG_ALERTS_FILE),
+never config/alerts.json: the watchdog has its own concurrency group, so a shared file
+could make its state commit conflict with a bookings/approve commit. The dashboard
+merges both files. workflow_failed_* alerts are resolved by preflight.guarded.
+
 Env: GITHUB_TOKEN, GITHUB_REPOSITORY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
 Always exits 0.
 """
@@ -18,10 +23,13 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import alerts
 
 log = logging.getLogger("watchdog")
+
+WATCHDOG_ALERTS_FILE = Path("config/watchdog_alerts.json")
 
 
 class WatchdogError(Exception):
@@ -102,17 +110,18 @@ def fetch_last_success(repo: str, token: str, workflow_file: str,
         raise WatchdogError(f"GitHub API lookup failed ({type(e).__name__})") from None
 
 
-def _resolve_old_failure(spec: Spec, last_success: datetime) -> None:
-    key = f"workflow_failed_{spec.display_name}"
-    for a in alerts.active():
-        if a["key"] != key:
-            continue
-        seen = alerts._parse(a.get("last_seen"))
-        if seen is not None and seen < last_success:
-            alerts.resolve(key)
-
-
 def main(env=None, now=None, urlopen=urllib.request.urlopen) -> int:
+    """Check both workflows; alerts go to WATCHDOG_ALERTS_FILE only (alerts.ALERTS_FILE is
+    pointed there for the run and restored afterwards)."""
+    previous = alerts.ALERTS_FILE
+    alerts.ALERTS_FILE = WATCHDOG_ALERTS_FILE
+    try:
+        return _check(env, now, urlopen)
+    finally:
+        alerts.ALERTS_FILE = previous
+
+
+def _check(env, now, urlopen) -> int:
     env = os.environ if env is None else env
     now = now or datetime.now(timezone.utc)
     config = {"telegram": {"bot_token": env.get("TELEGRAM_BOT_TOKEN", ""),
@@ -129,8 +138,6 @@ def main(env=None, now=None, urlopen=urllib.request.urlopen) -> int:
                     "Kontrollera GitHub Actions.")
             else:
                 alerts.resolve(spec.key)
-                if last is not None:
-                    _resolve_old_failure(spec, last)
         except WatchdogError as e:
             log.error("%s: %s (no alert raised).", spec.file, e)
         except Exception as e:

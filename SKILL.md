@@ -186,6 +186,10 @@ bookings.yml and approve.yml share the concurrency group `meca-bookings`, so the
 (single writer of `orders.json`, one cart per vehicle). Run approve.yml by hand from the Actions
 tab to process a tap immediately. Telegram keeps unread taps for 24 h only, so the poller runs
 every day; tap within ~36 h of the staging message.
+watchdog.yml (every 6 h at :17) has its own group `meca-watchdog` and writes only
+`config/watchdog_alerts.json` (stale_bookings / stale_approve); `config/alerts.json` is written
+only by bookings/approve, and a successful run (`preflight.guarded`) resolves its
+`workflow_failed_<workflow name>` alert.
 
 ### Weekly self-improve
 `python improve.py --apply-all` sends source + SKILL.md + recent logs to Claude

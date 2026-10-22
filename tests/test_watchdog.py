@@ -123,7 +123,9 @@ def test_fetch_last_success_raises_watchdog_error(bad):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    # The watchdog writes only its own file; the tests read it back through alerts.
     monkeypatch.setattr(alerts, "ALERTS_FILE", tmp_path / "alerts.json")
+    monkeypatch.setattr(watchdog, "WATCHDOG_ALERTS_FILE", tmp_path / "alerts.json")
     return {"GITHUB_TOKEN": GH_TOKEN, "GITHUB_REPOSITORY": "o/r",
             "TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": "42"}
 
@@ -164,20 +166,33 @@ def test_main_fresh_resolves_stale_alert(env, sent):
     assert alerts.active() == []
 
 
-def test_main_fresh_resolves_old_workflow_failed_alert(env, sent):
+def test_main_writes_only_the_watchdog_file_and_restores_the_alerts_path(
+        tmp_path, monkeypatch, sent):
+    shared = tmp_path / "alerts.json"              # bookings/approve's file: never written
+    own = tmp_path / "watchdog_alerts.json"
+    monkeypatch.setattr(alerts, "ALERTS_FILE", shared)
+    monkeypatch.setattr(watchdog, "WATCHDOG_ALERTS_FILE", own)
+    env = {"GITHUB_TOKEN": GH_TOKEN, "GITHUB_REPOSITORY": "o/r",
+           "TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": "42"}
+    data = dict(FRESH, **{"bookings.yml": runs("2026-10-20T15:02:00Z")})
+
+    assert watchdog.main(env, NOW, fake_urlopen(data)) == 0
+
+    assert not shared.exists()
+    assert set(json.loads(own.read_text(encoding="utf-8"))["alerts"]) == {"stale_bookings"}
+    assert alerts.ALERTS_FILE == shared             # global restored after main
+
+
+def test_default_watchdog_file():
+    assert watchdog.WATCHDOG_ALERTS_FILE == Path("config/watchdog_alerts.json")
+
+
+def test_main_no_longer_touches_workflow_failed_alerts(env, sent):
     alerts.raise_alert({}, "workflow_failed_MECA Booking Agent", "x",
                        now=utc(2026, 10, 20, 15, 5))
-    alerts.raise_alert({}, "workflow_failed_MECA Approval Poller", "y",
-                       now=utc(2026, 10, 21, 6, 30))  # after last approve success
-    watchdog.main(env, NOW, fake_urlopen(FRESH))
-    assert [a["key"] for a in alerts.active()] == ["workflow_failed_MECA Approval Poller"]
-
-
-def test_main_keeps_failure_newer_than_last_success(env, sent):
-    alerts.raise_alert({}, "workflow_failed_MECA Booking Agent", "x",
-                       now=utc(2026, 10, 21, 16, 0))
     watchdog.main(env, NOW, fake_urlopen(FRESH))
     assert [a["key"] for a in alerts.active()] == ["workflow_failed_MECA Booking Agent"]
+    assert not hasattr(watchdog, "_resolve_old_failure")
 
 
 @pytest.mark.parametrize("bad", [urllib.error.URLError("boom"), b"garbage"])
@@ -217,7 +232,9 @@ def test_watchdog_workflow_structure():
     assert set(run["env"]) == {"GITHUB_TOKEN", "GITHUB_REPOSITORY",
                                "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
     persist = steps[-1]
-    assert "config/alerts.json" in persist["run"]
-    assert "chore: update alert state [skip ci]" in persist["run"]
+    # Its own state file: bookings/approve own config/alerts.json (no shared writer).
+    assert "git add config/watchdog_alerts.json" in persist["run"]
+    assert "config/alerts.json" not in persist["run"]
+    assert "chore: update watchdog state [skip ci]" in persist["run"]
     assert "pip install" not in yaml.safe_dump(wf)
     assert "cache" not in yaml.safe_dump(steps[1])

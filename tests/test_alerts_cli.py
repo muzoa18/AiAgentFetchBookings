@@ -86,6 +86,7 @@ def test_workflows_list_alerts_json_in_persist(name):
     names = [s["name"] for s in steps]
     persist = steps[names.index("Persist state back to repo")]
     assert "config/alerts.json" in persist["run"]
+    assert "watchdog_alerts" not in persist["run"]     # the watchdog's own file
     alert = steps[names.index("Alert on failure")]
     assert names.index("Alert on failure") < names.index("Persist state back to repo")
     assert alert["if"] == "${{ failure() }}"

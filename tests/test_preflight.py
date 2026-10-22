@@ -87,3 +87,28 @@ def test_check_state_or_alert_resolves_when_fixed(env):
     write_orders_skeleton(path)
     assert preflight.check_state_or_alert({}) is True
     assert alerts.active() == []
+
+
+@pytest.mark.parametrize("name,display", [("booking_agent", "MECA Booking Agent"),
+                                          ("approve", "MECA Approval Poller")])
+def test_guarded_success_resolves_the_workflow_failed_alert(env, name, display):
+    alerts.raise_alert({}, f"workflow_failed_{display}", "x")
+    alerts.raise_alert({}, "workflow_failed_Other", "y")
+    assert preflight.guarded(name, lambda: 0, config_loader=lambda: {}) == 0
+    assert [a["key"] for a in alerts.active()] == ["workflow_failed_Other"]
+
+
+def test_guarded_failure_keeps_the_workflow_failed_alert(env):
+    alerts.raise_alert({}, "workflow_failed_MECA Approval Poller", "x")
+    assert preflight.guarded("approve", lambda: 2, config_loader=lambda: {}) == 2
+    assert "workflow_failed_MECA Approval Poller" in [a["key"] for a in alerts.active()]
+
+
+def test_display_names_are_the_workflow_names():
+    import yaml
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent / ".github" / "workflows"
+    names = {f: yaml.safe_load((root / f).read_text(encoding="utf-8"))["name"]
+             for f in ("bookings.yml", "approve.yml")}
+    assert preflight.DISPLAY_NAMES == {"booking_agent": names["bookings.yml"],
+                                       "approve": names["approve.yml"]}
