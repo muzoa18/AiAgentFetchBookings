@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { summarize, HISTORY_LIMIT } from '../lib/summarize.js';
+import { summarize, HISTORY_LIMIT, STALE_HOURS, LAST_SUCCESS_STALE_HOURS } from '../lib/summarize.js';
 
 const NOW = Date.parse('2026-10-21T12:00:00Z');
 const commit = { sha: '0123456789abcdef', date: '2026-10-21T10:00:00Z' };
@@ -103,6 +103,7 @@ test('freshness: short sha, age and the 36 h stale flag', () => {
   const none = summarize({ commit: null, now: NOW });
   assert.equal(none.freshness.sha, null);
   assert.equal(none.freshness.stale, true);
+  assert.equal(fresh.freshness.staleHours, STALE_HOURS);
 });
 
 test('missing files give an empty but valid view model', () => {
@@ -316,4 +317,20 @@ test('lastSuccessAgeHours: newest run without login_failed, from a fixed now', (
   const allFailed = JSON.stringify({ timestamp: '2026-10-21T10:00:00', login_failed: true });
   assert.equal(summarize({ historyText: allFailed, now: NOW }).lastSuccessAgeHours, null);
   assert.equal(summarize({ now: NOW }).lastSuccessAgeHours, null);
+});
+
+test('lastSuccessAgeHours: a run that stopped at the state guard is not a success', () => {
+  const history = [
+    { timestamp: '2026-10-21T06:00:00', agent: 'booking_agent', login_failed: false, state_unreadable: false },
+    { timestamp: '2026-10-21T10:00:00', agent: 'booking_agent', login_failed: false, state_unreadable: true },
+  ].map((e) => JSON.stringify(e)).join('\n');
+  assert.equal(summarize({ historyText: history, now: NOW }).lastSuccessAgeHours, 6);
+  const onlyState = JSON.stringify({ timestamp: '2026-10-21T10:00:00', state_unreadable: true });
+  assert.equal(summarize({ historyText: onlyState, now: NOW }).lastSuccessAgeHours, null);
+});
+
+test('last-success threshold: 52 h (no Sunday run), separate from the 36 h commit age', () => {
+  assert.equal(LAST_SUCCESS_STALE_HOURS, 52);
+  assert.equal(STALE_HOURS, 36);
+  assert.equal(summarize({ now: NOW }).lastSuccessStaleHours, LAST_SUCCESS_STALE_HOURS);
 });

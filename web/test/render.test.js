@@ -99,6 +99,9 @@ test('verified orders show their order numbers; stale data shows a warning', () 
   const stale = R.freshness(doc, { freshness: { sha: 'abc1234', committedAt: '2026-10-19T00:00:00Z', stale: true } }, NOW).textContent;
   assert.ok(stale.includes('Körs agenten lokalt? Pusha statefilerna för att se dem här'));
   assert.ok(stale.includes('abc1234'));
+  const withHours = R.freshness(doc, { freshness: { sha: 'abc1234', stale: true, staleHours: 36 } }, NOW).textContent;
+  assert.ok(withHours.includes('Över 36 timmar gammal.'));
+  assert.ok(!stale.includes('undefined'));
 });
 
 test('headline reflects what needs attention', () => {
@@ -155,9 +158,22 @@ test('alerts banner: error and warning items, text set via textContent, relative
   assert.equal(R.alerts(doc, {}, NOW), null);
 });
 
-test('stale warning also appears when the last successful run is over 36 h old', () => {
-  const fresh = { freshness: { sha: 'abc1234', committedAt: '2026-10-21T10:00:00Z', stale: false }, lastSuccessAgeHours: 40 };
-  assert.ok(R.freshness(doc, fresh, NOW).textContent.includes('Senaste lyckade körning'));
-  const ok = { freshness: { sha: 'abc1234', committedAt: '2026-10-21T10:00:00Z', stale: false }, lastSuccessAgeHours: 5 };
-  assert.ok(!R.freshness(doc, ok, NOW).textContent.includes('Senaste lyckade körning'));
+test('stale warning appears when the last successful run is older than the view model threshold', () => {
+  const vm = (age) => ({ freshness: { sha: 'abc1234', committedAt: '2026-10-21T10:00:00Z', stale: false },
+    lastSuccessAgeHours: age, lastSuccessStaleHours: 52 });
+  // Saturday 15:00 to Monday 15:00 is 48 h with no Sunday run: no warning.
+  assert.ok(!R.freshness(doc, vm(48), NOW).textContent.includes('Senaste lyckade körning'));
+  assert.ok(!R.freshness(doc, vm(5), NOW).textContent.includes('Senaste lyckade körning'));
+  const late = R.freshness(doc, vm(53), NOW).textContent;
+  assert.ok(late.includes('Senaste lyckade körning för över 52 timmar sedan.'));
+  // No threshold in the view model (older server): no warning rather than a guessed one.
+  const noThreshold = { ...vm(100), lastSuccessStaleHours: undefined };
+  assert.ok(!R.freshness(doc, noThreshold, NOW).textContent.includes('Senaste lyckade körning'));
+});
+
+test('the render thresholds come from the server view model', () => {
+  const vm = summarize({ historyText: JSON.stringify({ timestamp: '2026-10-19T00:00:00', agent: 'booking_agent' }),
+    now: Date.parse('2026-10-21T12:00:00Z') });
+  assert.equal(vm.lastSuccessStaleHours, 52);
+  assert.ok(R.freshness(doc, vm, Date.parse('2026-10-21T12:00:00Z')).textContent.includes('över 52 timmar'));
 });

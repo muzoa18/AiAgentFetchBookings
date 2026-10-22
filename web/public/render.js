@@ -3,8 +3,6 @@
 // Functions take the document as their first argument so tests can pass a fake.
 import { safeHref } from './links.js';
 
-const STALE_HOURS = 36;
-
 export const STATUS = {
   attempted: { label: 'Förbereds', tone: 'neutral', mark: '○' },
   pending: { label: 'Väntar på godkännande', tone: 'wait', mark: '◷' },
@@ -278,13 +276,17 @@ export function freshness(doc, vm, now) {
   const line = f.sha
     ? h(doc, 'span', {}, 'Data från repot, senaste commit ', h(doc, 'code', {}, f.sha), ' ', time(doc, f.committedAt, now))
     : h(doc, 'span', {}, 'Data från repot, ingen commit hittades');
-  const noSuccess = typeof vm.lastSuccessAgeHours === 'number' && vm.lastSuccessAgeHours > STALE_HOURS;
+  // The threshold comes from the server (lib/summarize.js LAST_SUCCESS_STALE_HOURS).
+  const limit = vm.lastSuccessStaleHours;
+  const noSuccess = typeof vm.lastSuccessAgeHours === 'number' && typeof limit === 'number'
+    && vm.lastSuccessAgeHours > limit;
   return h(doc, 'div', { class: `freshness ${f.stale || noSuccess ? 'is-stale' : ''}` },
     line,
     f.stale ? h(doc, 'span', { class: 'stale-warn', role: 'note' },
       h(doc, 'span', { class: 'state-mark', 'aria-hidden': 'true' }, '!'),
-      'Över 36 timmar gammal. Körs agenten lokalt? Pusha statefilerna för att se dem här.') : null,
+      typeof f.staleHours === 'number' ? `Över ${f.staleHours} timmar gammal. ` : 'Gammal data. ',
+      'Körs agenten lokalt? Pusha statefilerna för att se dem här.') : null,
     noSuccess ? h(doc, 'span', { class: 'stale-warn', role: 'note' },
       h(doc, 'span', { class: 'state-mark', 'aria-hidden': 'true' }, '!'),
-      `Senaste lyckade körning för över ${STALE_HOURS} timmar sedan.`) : null);
+      `Senaste lyckade körning för över ${limit} timmar sedan.`) : null);
 }

@@ -205,7 +205,7 @@ start `approve.yml` or `bookings.yml`.
 The dashboard shows the state files as they are in the latest commit on
 `GITHUB_BRANCH`. They are only as fresh as the last workflow run that pushed
 them. If the agent runs locally and does not push, the page shows old data.
-It says so when the newest commit is older than 36 hours. After you press
+It says so when the newest commit is older than 36 hours (`STALE_HOURS`). After you press
 "Kör nu", the result appears once the workflow has committed. The page
 refreshes every 60 s while the tab is visible.
 
@@ -215,8 +215,11 @@ Active alerts are read from two files, one writer group each:
 page merges them (same key in both: the later `last_seen` wins), drops resolved
 ones, shows at most 20 newest first in a red (error) or amber (warning) banner
 above the orders, and lists an unreadable file under `problems` in the status
-response and in the page footer. The stale warning also fires when the newest
-run without `login_failed` is over 36 hours old (`lastSuccessAgeHours`).
+response and in the page footer. A second warning fires when the newest
+successful run (neither `login_failed` nor `state_unreadable`) is over 52 hours
+old (`lastSuccessAgeHours` against `LAST_SUCCESS_STALE_HOURS`, sent to the page
+as `lastSuccessStaleHours`). Not 36: Saturday 15:00 to Monday 15:00 UTC is 48
+hours with no Sunday booking run, and 36 false-alarmed every Monday morning.
 
 ## Files
 

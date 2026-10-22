@@ -151,7 +151,10 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   GitHub disabling scheduled workflows after 60 days of repo inactivity (the watchdog is itself
   scheduled).
 - **Dashboard** (`web/`): shows a banner with the active alerts from BOTH files and warns when the
-  last successful run is older than 36 h.
+  last successful run (run_history entry with neither `login_failed` nor `state_unreadable`; agent.py
+  logs `state_unreadable: true` when the state guard stops it) is older than
+  `LAST_SUCCESS_STALE_HOURS` = 52 h (Saturday 15:00 to Monday 15:00 is 48 h with no Sunday run).
+  The commit-age warning keeps `STALE_HOURS` = 36. Both reach the page in the view model.
 
 ## Duplicate-order guard (parts_order._stage, before any cart action)
 - Every staging attempt with a portal (restaged ones too) first reads "Skickade Beställningar"

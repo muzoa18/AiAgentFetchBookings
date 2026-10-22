@@ -9,7 +9,12 @@ import { safeHref } from '../public/links.js';
 
 export const HISTORY_LIMIT = 30;
 export const ORDERS_LIMIT = 200;
+// Newest commit older than this: the state files are stale.
 export const STALE_HOURS = 36;
+// Newest successful run older than this: warn. Not 36: Saturday 15:00 UTC to Monday
+// 15:00 UTC is 48 h with no Sunday booking run, which false-alarmed every Monday.
+// Sent to the page in the view model (lastSuccessStaleHours) so the two cannot drift.
+export const LAST_SUCCESS_STALE_HOURS = 52;
 const STR_MAX = 300;
 const LIST_MAX = 50;
 export const ALERTS_LIMIT = 20;
@@ -252,7 +257,8 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
 
   const alerts = mergeAlerts([[alertsText, 'alerts_unreadable'],
     [watchdogAlertsText, 'watchdog_alerts_unreadable']], problems);
-  const lastSuccess = runs.findLast((r) => !r.entry.login_failed);
+  // A run that failed to log in or stopped at the state guard is not a success.
+  const lastSuccess = runs.findLast((r) => !r.entry.login_failed && !r.entry.state_unreadable);
   const lastSuccessAgeHours = lastSuccess
     ? Math.round(Math.max(0, (now - Date.parse(lastSuccess.timestamp)) / 3_600_000) * 10) / 10 : null;
 
@@ -270,6 +276,7 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
       committedAt,
       ageHours: ageHours == null ? null : Math.round(ageHours * 10) / 10,
       stale: ageHours == null || ageHours > STALE_HOURS,
+      staleHours: STALE_HOURS,
     },
     tiles,
     counts,
@@ -282,6 +289,7 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
     seenCount,
     alerts,
     lastSuccessAgeHours,
+    lastSuccessStaleHours: LAST_SUCCESS_STALE_HOURS,
     problems,
   };
 }

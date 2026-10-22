@@ -128,7 +128,8 @@ function historyFile(now) {
     const bookings = i % 2 === 0;
     const entry = bookings
       ? { agent: 'booking_agent', bookings_found: (i * 7) % 4, notified: (i * 7) % 4, notify_failed: 0,
-        orders_staged: (i * 3) % 3, orders_failed: 0, handled_failed: 0, login_failed: false }
+        orders_staged: (i * 3) % 3, orders_failed: 0, handled_failed: 0, login_failed: false,
+        state_unreadable: false }
       : { agent: 'approve_agent', approved: i % 3, ordered: i % 3, orders_failed: 0 };
     if (i === 6) Object.assign(entry, { login_failed: true, bookings_found: 0, notified: 0, orders_staged: 0 });
     if (i === 13) Object.assign(entry, { orders_failed: 1 });

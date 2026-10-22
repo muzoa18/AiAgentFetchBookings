@@ -105,8 +105,9 @@ booking if an order for the same vehicle was sent in the last 7 days ("order fin
 pro.meca.se"), or if the list cannot be matched ("kan inte kontrollera tidigare order"). If
 you still need the parts, order them by hand in pro.meca.se. Only the first ~50 sent rows are read.
 
-**Dashboard** (`web/`): shows active alerts from both alert files and warns when the last
-successful run is older than 36 h.
+**Dashboard** (`web/`): shows active alerts from both alert files, warns when the newest commit
+is older than 36 h, and warns when the last successful run (no `login_failed`, no
+`state_unreadable`) is older than 52 h (Saturday to Monday is 48 h without a Sunday run).
 
 ---
 

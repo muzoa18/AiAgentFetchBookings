@@ -137,7 +137,7 @@ def test_notify_failure_does_not_mark_seen(env):
     assert env["handled"] == []
     assert env["logged"] == {"bookings_found": 1, "notified": 0, "notify_failed": 1,
                              "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
-                             "login_failed": False}
+                             "login_failed": False, "state_unreadable": False}
 
 
 def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
@@ -150,7 +150,7 @@ def test_notify_success_marks_seen_and_calls_hanterad_for_bokning_only(env):
     assert env["handled"] == ["http://x/B1"]
     assert env["logged"] == {"bookings_found": 3, "notified": 3, "notify_failed": 0,
                              "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
-                             "login_failed": False}
+                             "login_failed": False, "state_unreadable": False}
 
 
 def test_already_seen_booking_is_not_resent(env):
@@ -169,7 +169,7 @@ def test_no_bookings_returns_zero_and_logs(env):
     assert agent.run() == 0
     assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
                              "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
-                             "login_failed": False}
+                             "login_failed": False, "state_unreadable": False}
 
 
 # ── Parts ordering hook ──────────────────────────────────────────────────────
@@ -381,7 +381,7 @@ def test_failed_login_alerts_once_and_exits_1(env, monkeypatch):
         "Orsak: Fel användarnamn eller lösenord (portalen avvisade inloggningen)")
     assert env["logged"] == {"bookings_found": 0, "notified": 0, "notify_failed": 0,
                              "orders_staged": 0, "orders_failed": 0, "handled_failed": 0,
-                             "login_failed": True}
+                             "login_failed": True, "state_unreadable": False}
     assert env["saved"] is None          # seen_ids untouched
     assert env["staged"] == [] and env["handled"] == []
 
@@ -545,7 +545,7 @@ def test_seen_forfragan_offert_are_not_retried(env):
 # ── Task 16a: the portal is the truth for Bokningar ──────────────────────────
 
 LOG_KEYS = {"bookings_found", "notified", "notify_failed", "orders_staged", "orders_failed",
-            "handled_failed", "login_failed"}
+            "handled_failed", "login_failed", "state_unreadable"}
 GIVE_UP = "Försöker inte mer automatiskt för OLRD-0001 – beställ för hand eller åtgärda orsaken."
 
 
@@ -798,7 +798,10 @@ def test_log_run_keys_are_identical_in_every_path(env, monkeypatch):
     _login_fails(env, monkeypatch)
     agent.run()
     keys.append(set(env["logged"]))
-    assert keys == [LOG_KEYS] * 3
+    orders_state.ORDERS_FILE.unlink()      # the state guard path
+    agent.run()
+    keys.append(set(env["logged"]))
+    assert keys == [LOG_KEYS] * 4
 
 
 # ── Task 16a: quiet retry end to end through the real plan_and_stage ─────────
@@ -1060,4 +1063,7 @@ def test_agent_run_stops_before_portal_when_orders_json_missing(env, monkeypatch
 
     assert env["staged"] == []
     assert env["logged"] is not None
+    # The dashboard must not count this run as a success (web/lib/summarize.js).
+    assert env["logged"]["state_unreadable"] is True
+    assert env["logged"]["login_failed"] is False
     assert [a["text"] for a in alerts.active()] == ["config/orders.json saknas"]

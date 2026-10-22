@@ -101,8 +101,9 @@ NO_BUTTON_TEXT = ("Bokning {nr} verkar sakna Hanterad-knapp (typen är osäker) 
 
 
 def _log_summary(bookings_found: int, counts: Counter, orders_staged: int, orders_failed: int,
-                 login_failed: bool = False) -> None:
-    """One log_run entry; the same keys on every path."""
+                 login_failed: bool = False, state_unreadable: bool = False) -> None:
+    """One log_run entry; the same keys on every path. login_failed / state_unreadable
+    mark a run the dashboard must not count as a success."""
     log_run("booking_agent", {
         "bookings_found": bookings_found,
         "notified":       counts["notified"],
@@ -111,6 +112,7 @@ def _log_summary(bookings_found: int, counts: Counter, orders_staged: int, order
         "orders_failed":  orders_failed + counts["give_up_failed"],
         "handled_failed": counts["handled_failed"],
         "login_failed":   login_failed,
+        "state_unreadable": state_unreadable,
     })
 
 
@@ -123,7 +125,7 @@ def run() -> int:
 
     # Fail closed: without readable order state nothing may be ordered or fetched.
     if not check_state_or_alert(config):
-        _log_summary(0, Counter(), 0, 0)
+        _log_summary(0, Counter(), 0, 0, state_unreadable=True)
         return 1
 
     # Before this run queues anything: report orders a previous run left unfinished.
