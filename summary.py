@@ -26,6 +26,7 @@ log = logging.getLogger("summary")
 MAX_CHARS = 3000
 ALERT_MAX = 120
 ACTION_WINDOW = timedelta(days=7)
+KLAR_MAX_AGE = timedelta(days=14)   # as orders_state.KLAR_MAX_AGE
 HISTORY_ROWS = 5
 SECTION_MAX = 10   # items shown per section before "+N till"
 
@@ -55,6 +56,24 @@ def _last_success(history):
     return best
 
 
+def klar_outstanding(rec: dict, now: datetime) -> bool:
+    """Mirror of orders_state._open_klar's "outstanding" side (kept here so summary.py stays
+    stdlib-only; tests/test_summary.py pins both to the same records). A missing or
+    unparseable klar_sent_at never expires (orders_state itself would raise on the latter)."""
+    if (type(rec.get("klar_message_id")) is not int or rec.get("handled") is True
+            or rec.get("klar_closed") is True):
+        return False
+    sent = rec.get("klar_sent_at")
+    if isinstance(sent, str):
+        try:
+            when = datetime.fromisoformat(sent)
+        except ValueError:
+            return True
+        if when.tzinfo is not None and now - when > KLAR_MAX_AGE:
+            return False
+    return True
+
+
 def _sections(orders, alerts, now):
     pending, klar, unverified, action = [], [], [], []
     bookings = orders.get("bookings") if isinstance(orders, dict) else None
@@ -65,18 +84,24 @@ def _sections(orders, alerts, now):
         line = _label(bid, rec)
         if status == "pending":
             pending.append(line)
-        if status in ("ordered", "blocked") and rec.get("klar_message_id") \
-                and not rec.get("klar_closed"):
-            klar.append(line)
-        if status == "ordered" and not rec.get("verified_at"):
+        elif status in ("ordered", "blocked") and klar_outstanding(rec, now):
+            # Each booking once: a Klar-waiting one is listed only here, annotated.
+            notes = []
+            if status == "blocked":
+                notes.append("blockerad")
+            if status == "ordered" and not rec.get("verified_at"):
+                notes.append("ej verifierad")
+            klar.append(line + (f" ({', '.join(notes)})" if notes else ""))
+        elif status == "ordered" and not rec.get("verified_at"):
             unverified.append(line)
-        if status in ("blocked", "failed", "expired"):
+        elif status in ("blocked", "failed", "expired"):
             when = _parse(rec.get("updated_at"))
-            if when and now - when <= ACTION_WINDOW:
+            # A missing or unparseable updated_at is shown (fail-open), never dropped.
+            if when is None or now - when <= ACTION_WINDOW:
                 action.append(f"{line} ({status})")
     alert_lines = []
     for a in alerts:
-        text = " ".join(str(a.get("text", "")).split())[:ALERT_MAX]
+        text = " ".join(str(a.get("text") or "").split())[:ALERT_MAX]
         if text:
             alert_lines.append(text)
     return [("Väntar på ditt godkännande", pending), ("Väntar på Klar", klar),
@@ -151,7 +176,7 @@ def load_state(root: Path = Path(".")):
                 raise ValueError("shape")
             for key, e in entries.items():
                 if isinstance(e, dict) and not e.get("resolved_at"):
-                    active.append({"key": key, "text": e.get("text", ""),
+                    active.append({"key": key, "text": e.get("text") or "",
                                    "severity": e.get("severity", "error"),
                                    "last_seen": e.get("last_seen") or ""})
         except Exception:

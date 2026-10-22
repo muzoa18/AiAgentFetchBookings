@@ -115,7 +115,7 @@ def fetch_last_success(repo: str, token: str, workflow_file: str,
 
 
 def main(env=None, now=None, urlopen=urllib.request.urlopen) -> int:
-    """Check both workflows; alerts go to WATCHDOG_ALERTS_FILE only (alerts.ALERTS_FILE is
+    """Check the three workflows (bookings, approve, daily summary); alerts go to WATCHDOG_ALERTS_FILE only (alerts.ALERTS_FILE is
     pointed there for the run and restored afterwards)."""
     previous = alerts.ALERTS_FILE
     alerts.ALERTS_FILE = WATCHDOG_ALERTS_FILE

@@ -76,7 +76,7 @@ def test_sixty_pending_collapse_under_cap():
     o = orders(**{f"BOK-{i:03d}": rec("pending", f"PLT{i:03d}") for i in range(60)})
     text = summary.build_summary(o, [], HIST, NOW)
     assert len(text) <= 3000
-    assert re.search(r"\+\d+ till", text)
+    assert text.count("BOK-") == 10 and "+50 till" in text
 
 
 def test_cap_holds_with_many_long_alerts():
@@ -133,7 +133,8 @@ def test_load_state_merges_unresolved_alerts_and_last_five_history(tmp_path):
     assert {x["text"] for x in a} == {"ett", "två"}
     assert [x["timestamp"][:10] for x in h] == [f"2026-10-0{i}" for i in range(4, 9)]
     text = summary.build_summary(o, a, h, NOW)
-    assert "OBS" not in text.replace("OBS: orders.json", "") or "kunde inte" not in text
+    assert "kunde inte läsas" not in text.replace("OBS: orders.json kunde inte läsas", "")
+    assert "ett" in text and "två" in text and "klart" not in text
 
 
 def _env():
@@ -185,3 +186,85 @@ def test_summary_workflow_structure():
     assert "git commit" not in dumped and "alerts" not in dumped
     assert "cache" not in yaml.safe_dump(steps[1])
     assert steps[-1] is run
+
+
+def _sect(text, title):
+    m = re.search(rf"^{re.escape(title)} \(\d+\):\n((?:  .*\n?)*)", text, re.M)
+    return m.group(1) if m else ""
+
+
+def test_klar_section_each_booking_once_and_annotated():
+    o = orders(**{
+        "U-1": rec("ordered", "UNV111", klar_message_id=5),
+        "B-1": rec("blocked", "BLO111", klar_message_id=6),
+        "V-1": rec("ordered", "VER111", klar_message_id=7, verified_at="x"),
+    })
+    text = summary.build_summary(o, [], HIST, NOW)
+    for plate in ("UNV111", "BLO111", "VER111"):
+        assert text.count(plate) == 1
+    k = _sect(text, "Väntar på Klar")
+    assert "UNV111 (ej verifierad)" in k and "BLO111 (blockerad)" in k and "VER111" in k
+    assert "Beställt, ej verifierat" not in text and "Kräver åtgärd" not in text
+
+
+def test_klar_not_outstanding_cases_fall_through_or_vanish():
+    old = "2026-10-01T00:00:00+00:00"   # 21 days before NOW
+    o = orders(**{
+        "H-1": rec("ordered", "HAN111", klar_message_id=5, handled=True, verified_at="x"),
+        "O-1": rec("ordered", "OLD111", klar_message_id=5, klar_sent_at=old),
+        "T-1": rec("ordered", "BOO111", klar_message_id=True, verified_at="x"),
+        "S-1": rec("ordered", "STR111", klar_message_id="5", verified_at="x"),
+        "C-1": rec("cancelled", "CAN111", klar_message_id=5),
+    })
+    text = summary.build_summary(o, [], HIST, NOW)
+    assert "Väntar på Klar" not in text
+    assert "HAN111" not in text and "BOO111" not in text and "STR111" not in text
+    assert "CAN111" not in text
+    assert "OLD111" in _sect(text, "Beställt, ej verifierat")   # expired Klar: plain unverified
+
+
+def test_klar_predicate_matches_orders_state(tmp_path, monkeypatch):
+    import orders_state
+    recs = {
+        "a": rec("ordered", klar_message_id=1),
+        "b": rec("ordered", klar_message_id=1, klar_sent_at="2026-10-20T00:00:00+00:00"),
+        "c": rec("ordered", klar_message_id=1, klar_sent_at="2026-10-01T00:00:00+00:00"),
+        "d": rec("ordered", klar_message_id=1, klar_sent_at="2026-10-08T05:45:00+00:00"),
+        "e": rec("blocked", klar_message_id=1, handled=True),
+        "f": rec("blocked", klar_message_id=1, klar_closed=True),
+        "i": rec("ordered"),
+        "j": rec("ordered", klar_message_id=1, handled=False, klar_closed=False),
+    }
+    path = tmp_path / "orders.json"
+    path.write_text(json.dumps({"last_update_id": None, "bookings": recs}), encoding="utf-8")
+    monkeypatch.setattr(orders_state, "ORDERS_FILE", path)
+    # (bool/str klar_message_id cannot be loaded by orders_state at all: covered above.)
+    expected = {bid for bid, _ in orders_state.outstanding_klar(NOW)}
+    assert expected  # the fixture exercises both outcomes
+    assert {bid for bid, r in recs.items() if summary.klar_outstanding(r, NOW)} == expected
+    assert summary.KLAR_MAX_AGE == orders_state.KLAR_MAX_AGE
+
+
+def test_alert_text_none_is_skipped():
+    alerts = [{"key": "a", "text": None}, {"key": "b", "text": ""}]
+    assert summary.build_summary(orders(), alerts, HIST, NOW).startswith("Inget väntar")
+    text = summary.build_summary(orders(), alerts + [{"key": "c", "text": "ok"}], HIST, NOW)
+    assert "None" not in text and "ok" in _sect(text, "Larm")
+
+
+def test_action_record_without_usable_updated_at_is_shown():
+    o = orders(**{"F-1": {"status": "failed", "plan": {"reg_nr": "FAI111"}},
+                  "F-2": rec("blocked", "BLO111", updated="garbage")})
+    k = _sect(summary.build_summary(o, [], HIST, NOW), "Kräver åtgärd")
+    assert "FAI111" in k and "BLO111" in k
+
+
+def test_collapse_loop_and_hard_slice(monkeypatch):
+    o = orders(**{f"BOK-{i:03d}": rec("pending", f"PLT{i:03d}") for i in range(8)})
+    monkeypatch.setattr(summary, "SECTION_MAX", 8)
+    monkeypatch.setattr(summary, "MAX_CHARS", 200)
+    text = summary.build_summary(o, [], HIST, NOW)
+    assert len(text) <= 200 and "+" in text and "till" in text
+    monkeypatch.setattr(summary, "MAX_CHARS", 30)     # even the header+footer overflow
+    text = summary.build_summary(o, [], HIST, NOW)
+    assert len(text) == 30

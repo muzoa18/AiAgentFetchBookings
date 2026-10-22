@@ -1,6 +1,6 @@
 name: MECA Watchdog
 
-# Dead-man switch: alerts when the booking run or the approval poll has not
+# Dead-man switch: alerts when the booking run, the approval poll or the daily summary has not
 # succeeded for a scheduled slot. Stdlib only: nothing is installed.
 on:
   schedule:
