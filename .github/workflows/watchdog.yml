@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write                  # commit config/alerts.json
+  contents: write                  # commit config/watchdog_alerts.json
   actions: read                    # read workflow run history
 
 jobs:
