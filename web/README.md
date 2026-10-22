@@ -9,8 +9,8 @@ workflows immediately instead of waiting for the schedule.
 At the top, four tiles show the same counts as the daily Telegram summary, one
 number per concept (the headline uses the same numbers). Each booking is in at
 most one tile: "Väntar på godkännande" (status `pending`), "Väntar på Klar"
-(ordered or blocked with an open Klar button: not handled, not closed, sent
-within 14 days), "Beställda" (status `ordered` and not counted under Klar, so
+(any record except pending and attempted with an open Klar button: not handled,
+not closed, sent within 14 days), "Beställda" (status `ordered` and not counted under Klar, so
 it does not overlap the Klar tile; it includes unverified orders) and "Behöver
 åtgärd" (blocked, failed or expired, updated within 7 days or of unknown age,
 and not under Klar). The view model's `counts.ordered` is this non-overlapping

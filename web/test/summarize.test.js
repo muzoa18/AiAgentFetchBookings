@@ -394,3 +394,38 @@ test('counts follow the daily Telegram summary rules', () => {
   const empty = summarize({ ordersText: null, now: NOW });
   assert.deepEqual([empty.counts.waiting, empty.counts.klar, empty.counts.ordered, empty.counts.needsAction], [0, 0, 0, 0]);
 });
+
+test('Klar counts any record with an open Klar button except pending and attempted', () => {
+  const day = (d) => new Date(NOW - d * 86_400_000).toISOString();
+  const klar = (extra = {}) => ({ klar_message_id: 9, klar_sent_at: day(1), ...extra });
+  const vm = summarize({
+    ordersText: orders({
+      c1: rec('cancelled', klar()),
+      f1: rec('failed', klar({ klar_sent_at: day(9) }), {}),
+      x1: rec('expired', klar()),
+      p1: rec('pending', klar()),
+      a1: rec('attempted', klar()),
+      f2: rec('failed', klar({ klar_closed: true })),
+      b1: rec('blocked', klar({ klar_message_id: '9' })),
+      o1: rec('ordered', klar()),
+    }),
+    commit, now: NOW,
+  });
+  const by = Object.fromEntries(vm.orders.map((o) => [o.bookingId, o]));
+  assert.deepEqual(['c1', 'f1', 'x1', 'o1'].map((k) => by[k].klarOpen), [true, true, true, true]);
+  assert.equal(by.p1.klarOpen, false);
+  assert.equal(by.a1.klarOpen, false);
+  assert.equal(by.b1.klarOpen, false, 'klar_message_id must be an int');
+  assert.equal(vm.counts.klar, 4);
+  assert.equal(vm.counts.waiting, 1, 'pending is waiting, never klar');
+  assert.equal(vm.counts.ordered, 0, 'o1 is under Klar');
+  assert.equal(vm.counts.needsAction, 2, 'f2 (Klar closed) and b1; f1 and x1 are under Klar');
+});
+
+test('format and control characters are stripped from shown strings', () => {
+  const vm = summarize({
+    ordersText: orders({ a: rec('ordered', { portal_status: 'Lev‮erad​\u0007!' }) }),
+    commit, now: NOW,
+  });
+  assert.equal(vm.orders[0].portalStatus, 'Leverad !');
+});

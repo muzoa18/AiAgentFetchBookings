@@ -33,8 +33,9 @@ const RUN_COUNTERS = ['bookings_found', 'notified', 'orders_staged', 'orders_fai
 function str(value, max = STR_MAX) {
   if (typeof value === 'number' && Number.isFinite(value)) value = String(value);
   if (typeof value !== 'string') return null;
-  // Strip control characters (keeps normal whitespace as a space).
-  const clean = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  // Strip format characters (Unicode Cf, e.g. right-to-left override) and turn control
+  // characters into a space.
+  const clean = value.replace(/\p{Cf}+/gu, '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
   if (!clean) return null;
   return clean.length > max ? clean.slice(0, max - 1) + '…' : clean;
 }
@@ -161,7 +162,8 @@ function isWaitingKlar(r) {
 // klar_message_id, not handled, not klar_closed, and klar_sent_at not older than 14 days.
 // A missing or zone-less klar_sent_at never expires.
 function isKlarOpen(r, now) {
-  if (!isWaitingKlar(r)) return false;
+  // Any status except pending and attempted (the Telegram summary has no other status filter).
+  if (r.status === 'pending' || r.status === 'attempted' || !isWaitingKlar(r)) return false;
   const sent = r.klar_sent_at;
   if (typeof sent === 'string' && /([zZ]|[+-]\d\d:?\d\d)$/.test(sent)) {
     const ms = Date.parse(sent);
@@ -267,14 +269,14 @@ export function summarize({ ordersText = null, historyText = null, seenText = nu
 
   const all = parseOrders(ordersText, problems).map(([id, r]) => [order(id, r, now), r]);
   // Per-status counts plus the daily summary's four numbers: waiting (pending), klar
-  // (ordered/blocked with an open Klar button), ordered (status ordered and not under Klar)
+  // (any record except pending/attempted with an open Klar button), ordered (status ordered and not under Klar)
   // and needsAction (blocked/failed/expired, updated within 7 days or of unknown age).
   // Each booking is in at most one of the four (the summary's elif chain), so they add up.
   // `ordered` is therefore not the plain per-status count of ordered records.
   const counts = Object.fromEntries([...STATUSES, 'waiting', 'klar', 'needsAction'].map((s) => [s, 0]));
   for (const [o] of all) {
     if (o.status === 'pending') counts.waiting += 1;
-    if ((o.status === 'ordered' || o.status === 'blocked') && o.klarOpen) counts.klar += 1;
+    if (o.klarOpen) counts.klar += 1;
     else if (NEEDS_ACTION.has(o.status)
       && (o.updatedAt == null || now - Date.parse(o.updatedAt) <= ACTION_WINDOW_MS)) counts.needsAction += 1;
     if (STATUSES.includes(o.status) && !(o.status === 'ordered' && o.klarOpen)) counts[o.status] += 1;
