@@ -1860,7 +1860,17 @@ def test_swap_refusals_change_nothing(tgs, why, setup, kw, answer):
     assert (actions, problem) == (0, False)
     assert orders_state.get("B1") == before
     assert tgs["answers"] == ([] if answer is None else [("cb1", answer)])
-    assert tgs["cleared"] == [] and tgs["sent"] == [] and tgs["approvals"] == []
+    assert tgs["cleared"] == [] and tgs["approvals"] == []
+    # Taps are handled once a day, so the toast may come too late: a swap refusal and a
+    # stale button are also told as a plain message (final fix round, I-3).
+    if answer == approve.SWAP_REFUSED:
+        (text,) = tgs["sent"]
+        assert approve.SWAP_REFUSED in text and "OLRD-0001" in text
+    elif answer == "Knappen är inte längre giltig.":
+        (text,) = tgs["sent"]
+        assert "inte längre giltig" in text and "OLRD-0001" in text
+    else:
+        assert tgs["sent"] == []
 
 
 @pytest.mark.parametrize("alt", [
@@ -1937,30 +1947,48 @@ def test_second_swap_on_the_new_message_is_the_last(tgs):
     assert tgs["cleared"] == [77, 500]
 
 
-def test_cart_clear_failure_keeps_the_old_record(tgs):
-    stage_swap()
-    before = orders_state.get("B1")
-    portal = SwapPortal(clear_fails=True)
+class PartialClear(SwapPortal):
+    """clear_cart removes one line, then raises: the cart is partly emptied."""
 
-    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], portal)
+    def clear_cart(self, reg_nr=None):
+        self.calls.append("clear_cart")
+        self.cart = self.cart[1:]
+        raise RuntimeError("clear broke half way")
+
+
+def _assert_approval_withdrawn(tgs):
+    rec = orders_state.get("B1")
+    assert rec["status"] == "blocked" and rec["cart_touched"] is True
+    assert orders_state.restage("B1") is False            # never retried automatically
+    assert tgs["cleared"] == [77]                         # the old approval is withdrawn
+    assert tgs["approvals"] == []
+    (text, buttons, _), = tgs["klar"]
+    assert text == parts_order.SWAP_CLEAR_FAILED.format(label="OLRD-0001")
+    assert buttons == [("Klar", "klar:B1")]
+
+
+def test_cart_clear_failure_withdraws_the_old_approval(tgs):
+    # Final fix round, I-1 (was: the old approval stayed live on a partly emptied cart).
+    stage_swap()
+    portal = PartialClear()
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0"), tap(2, "approve:B1")], portal)
 
     assert problem is True
-    assert orders_state.get("B1") == before              # still pending, old message valid
     assert portal.added == []
-    assert tgs["cleared"] == [] and tgs["approvals"] == []
-    (text,) = tgs["sent"]
-    assert approve.CART_MANUAL in text and "OLRD-0001" in text
+    _assert_approval_withdrawn(tgs)
+    assert tgs["answers"] == [("cb1", "Byter…"), ("cb2", "Redan hanterad.")]
+    assert orders_state.get("B1")["status"] == "blocked"  # the Godkänn tap did nothing
 
 
 def test_portal_unavailable_is_a_cart_clear_failure(tgs):
     stage_swap()
-    before = orders_state.get("B1")
     tgs["updates"] = [tap(1, "swap:B1:0")]
 
     actions, problem = approve._handle(CONFIG, PortalFactory(open_fails=True), APPROVE)
 
-    assert problem is True and orders_state.get("B1") == before
-    assert approve.CART_MANUAL in tgs["sent"][0]
+    assert problem is True
+    _assert_approval_withdrawn(tgs)
 
 
 def test_staging_failure_after_the_clear_is_truthful_and_not_pending(tgs):
@@ -2062,3 +2090,82 @@ def test_swap_message_live_price_and_booking_pointer(tgs):
     (text, _, _), = tgs["approvals"]
     assert "Kund: se bokning OLRD-0001" in text
     assert "- Oljefilter -> Mann Oljefilter W712 (Mann) x2 à 200.00 SEK" in text
+
+
+# ── Final fix round: run-level swap cap ──────────────────────────────────────
+
+def test_swap_run_cap_defers_a_swap_that_cannot_finish(tgs, swap_clock, monkeypatch):
+    monkeypatch.setattr(approve, "_run_start", swap_clock["t"])
+    for bid, mid in (("B1", 77), ("B2", 78), ("B3", 79)):
+        stage_swap(bid, message_id=mid)
+    before = orders_state.get("B3")
+    portal = SwapPortal(clock=swap_clock, clear_takes=150)
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0"), tap(2, "swap:B2:0", 78),
+                                         tap(3, "swap:B3:0", 79)], portal)
+
+    # B1 starts at 0 s, B2 at 150 s (250 s of the 400 s left), B3 at 300 s (100 s left).
+    assert problem is False and actions == 2
+    assert orders_state.get("B1")["status"] == orders_state.get("B2")["status"] == "pending"
+    assert orders_state.get("B3") == before               # nothing half-done
+    assert portal.calls.count("clear_cart") == 2
+    assert tgs["cleared"] == [77, 78]                     # B3's buttons still live
+    assert tgs["answers"][-1] == ("cb3", approve.SWAP_DEFERRED)
+    assert tgs["sent"][-1] == f"Byte för OLRD-0001: {approve.SWAP_DEFERRED}"
+    assert len(tgs["approvals"]) == 2
+
+
+def test_swap_starts_with_exactly_its_budget_left(tgs, swap_clock, monkeypatch):
+    monkeypatch.setattr(approve, "_run_start",
+                        swap_clock["t"] - (approve.SWAP_RUN_S - parts_order.SWAP_BUDGET_S))
+    stage_swap()
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")])
+
+    assert (actions, problem) == (1, False)
+    assert orders_state.get("B1")["status"] == "pending"
+
+
+def test_swap_with_less_than_its_budget_left_is_deferred(tgs, swap_clock, monkeypatch):
+    monkeypatch.setattr(approve, "_run_start",
+                        swap_clock["t"] - (approve.SWAP_RUN_S - parts_order.SWAP_BUDGET_S) - 1)
+    stage_swap()
+    before = orders_state.get("B1")
+
+    actions, problem, _ = run_swap(tgs, [tap(1, "swap:B1:0")], allowed=False)
+
+    assert (actions, problem) == (0, False)
+    assert orders_state.get("B1") == before
+    assert tgs["answers"] == [("cb1", approve.SWAP_DEFERRED)]
+    assert tgs["cleared"] == [] and tgs["approvals"] == []
+    # The tap is consumed (the offset moves on, like any answered tap); the text says to
+    # tap Byt again, and the old message's buttons are still live for that.
+    assert orders_state.last_update_id() == 1
+
+
+def test_swap_deadline_is_capped_by_the_run(tgs, swap_clock, monkeypatch):
+    seen = {}
+    real = parts_order.restage_with_pins
+
+    def spy(*a, **k):
+        seen["deadline"] = k["deadline"]
+        return real(*a, **k)
+
+    monkeypatch.setattr(parts_order, "restage_with_pins", spy)
+    monkeypatch.setattr(approve, "_run_start", swap_clock["t"] - 100)
+    stage_swap()
+
+    run_swap(tgs, [tap(1, "swap:B1:0")])
+
+    assert seen["deadline"] == min(swap_clock["t"] + parts_order.SWAP_BUDGET_S,
+                                   approve._run_start + approve.SWAP_RUN_S)
+
+
+def test_stale_approve_button_is_also_told_as_a_plain_message(tgs):
+    stage_swap()
+
+    run_swap(tgs, [tap(1, "approve:B1", message_id=70)], allowed=False)
+
+    assert tgs["answers"] == [("cb1", "Knappen är inte längre giltig.")]
+    (text,) = tgs["sent"]
+    assert "OLRD-0001" in text and "inte längre giltig" in text

@@ -24,7 +24,8 @@ mixed into the same cart.
 Customer data (name, phone, email, booking message) is never persisted: the plan
 only holds what approval needs (orders.json is committed to git).
 
-After a checkout and its Beställd message, verify_now looks for the placed order in
+After a checkout and its Beställd message, _verify_placed (via _verified_row; verify_now
+is the same search as a standalone, test-facing function) looks for the placed order in
 "Skickade Beställningar" with the order checker's matching (approve.py), but stricter: only
 by plate (registration column present) and, for a real checkout reference, only a row that
 carries it. A unique match is stored as verified and told in its own VERIFIED_TEXT message;
@@ -58,11 +59,11 @@ from order_match import (candidates, claim_tokens, clean_vehicle_model, match_ke
 from parts_matcher import (Choice, allowed_for_line, choose_with_alternatives, is_fluid,
                            search_terms)
 from parts_portal_parse import PartsPortalError
-from parts_order_helpers import (ALTERNATIVE_FIELDS, UNVERIFIED_PREFIX, alternative_entry,
-                                 build_summary, cart_problem, clean_fluids, error_code,
-                                 is_transient, order_body, owner_reason, parse_qty,
-                                 prepare_section, reference_line, replaced_entry,
-                                 total_problem)
+from parts_order_helpers import (ALTERNATIVE_FIELDS, TECHNICAL, UNVERIFIED_PREFIX,
+                                 alternative_entry, build_summary, cart_problem, clean_fluids,
+                                 error_code, is_transient, norm_title, order_body,
+                                 owner_reason, parse_qty, prepare_section, reference_line,
+                                 replaced_entry, total_problem)
 from rules import Rules
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,15 @@ SWAP_FAILED = ("Bytet misslyckades – varukorgen är tömd eller delvis fylld, 
 SWAP_FAILED_FULL = ("Bytet misslyckades – varukorgen innehåller delarna, "
                     "kontrollera pro.meca.se")
 SWAP_FAILED_PARTIAL = "Bytet misslyckades – kontrollera pro.meca.se"
+SWAP_PARTIAL_PROMISE = ("Varukorgen tömdes för bytet och innehåller nu bara det som står "
+                        "ovan – kontrollera den på pro.meca.se.")
+# approve._swap could not empty the cart (it may be partly emptied): the old approval is
+# withdrawn (blocked, cart_touched) and the owner checks the cart by hand.
+SWAP_CLEAR_FAILED = ("Byte för {label}: varukorgen kunde inte tömmas och kan vara delvis "
+                     "tömd. Det tidigare godkännandet är återkallat – kontrollera och töm "
+                     "varukorgen på pro.meca.se för hand, och beställ för hand om delarna "
+                     "fortfarande behövs.")
+TECHNICAL_INLINE = "tekniskt fel, se loggen"
 # A swap's own time budget, from the start of approve._swap (cart clear included): it must
 # fit in the approve step's timeout together with expiry, Klar, browser start and login.
 SWAP_BUDGET_S = 240
@@ -132,7 +142,8 @@ UNCHECKED_TEXT = ("Bokning {label}: jag kunde inte kontrollera om en order för 
                   "Skickade Beställningar för hand. Jag försöker igen vid nästa körning.")
 
 
-# Immediate verification after checkout (verify_now): VERIFY_TRIES reads of "Skickade
+# Immediate verification after checkout (_verify_placed -> _verified_row; verify_now is
+# the test-facing wrapper of the same search): VERIFY_TRIES reads of "Skickade
 # Beställningar", VERIFY_WAIT_S apart (injectable _sleep), all within VERIFY_BUDGET_S of
 # wall clock (_clock): the order is already placed, so this only ever adds information.
 VERIFY_TRIES = 3
@@ -528,7 +539,8 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
             added.append((candidate, qty))
     if not_added or partly or untried:
         return block(PARTIAL_REASON, cart_touched=True,
-                     text=_partial_text(label, added, not_added, partly, untried, fluids))
+                     text=_partial_text(label, added, not_added, partly, untried, fluids,
+                                        promise=SWAP_PARTIAL_PROMISE if swap else None))
 
     # What the cart must contain comes from our choices, never from the cart itself.
     expected = [{"title": c.get("title"), "qty": qty, "url_or_id": c.get("url_or_id")}
@@ -541,6 +553,17 @@ def _stage(config: dict, booking: dict, portal, rules: Rules, picker,
 
     live = {str(x["url_or_id"]): x for x in cart.get("lines") or []
             if isinstance(x, dict) and x.get("url_or_id")}
+    if swap:
+        # cart_problem matched the swapped line by url_or_id only: a tampered or reused id
+        # would put another article in the cart. Its live title must be the alternative's.
+        for i in pins:
+            name, c, _ = matched[i]
+            line = live.get(str(c.get("url_or_id")))
+            if line is not None and norm_title(line.get("title")) != norm_title(c.get("title")):
+                log.error("Swap of %s: the cart line for %s is another article.",
+                          booking_id, c.get("url_or_id"))
+                return block(f"artikeln i varukorgen stämmer inte med alternativet för "
+                             f"'{name}'", cart_touched=True)
     parts = []
     for i, ((name, c, qty), choice) in enumerate(zip(matched, choices)):
         price, in_stock = c.get("price_sek"), c.get("in_stock")
@@ -770,6 +793,22 @@ def swap_failed(config: dict, booking: dict, reason: str, full: bool = False,
     return _block(config, booking, reason, fluids, cart_touched=True, text=text)
 
 
+def swap_clear_failed(config: dict, booking: dict) -> str:
+    """The swap's cart clear failed (the cart may be partly emptied): withdraw the old
+    approval for good: 'blocked' with cart_touched (never re-staged) and SWAP_CLEAR_FAILED
+    with a Klar button; 'failed' if that message is not delivered. The caller clears the
+    old message's buttons."""
+    try:
+        orders_state.update_fields(booking["id"], cart_touched=True)
+    except Exception:
+        log.exception("Could not flag cart_touched for %s.", booking.get("id"))
+    fluids = split_lines(booking)[1]
+    text = "\n".join([SWAP_CLEAR_FAILED.format(label=_label(booking))]
+                     + prepare_section(fluids))
+    return _block(config, booking, "varukorgen kunde inte tömmas", fluids, cart_touched=True,
+                  text=text)
+
+
 def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict],
                       rules: Rules, picker, keep: dict[int, dict] | None = None,
                       deadline: float | None = None) -> str:
@@ -808,8 +847,15 @@ def restage_with_pins(config: dict, portal, booking: dict, pins: dict[int, dict]
             return _fail(config, booking_id, label, owner_reason(e))
 
 
+def _inline(reason: str) -> str:
+    """A reason shown inside parentheses: TECHNICAL without its own parentheses."""
+    return TECHNICAL_INLINE if reason == TECHNICAL else reason
+
+
 def _partial_text(label: str, added: list, not_added: list, partly: list, untried: list,
-                  fluids: list[dict]) -> str:
+                  fluids: list[dict], promise: str | None = None) -> str:
+    """`promise` replaces the closing sentence (a swap emptied and refilled the cart, so
+    nothing in it is "untouched": SWAP_PARTIAL_PROMISE)."""
     if added:
         lines = [f"Delbeställning för {label}: i varukorgen: "
                  + ", ".join(f"{c.get('title')} x{qty}" for c, qty in added) + "."]
@@ -819,14 +865,16 @@ def _partial_text(label: str, added: list, not_added: list, partly: list, untrie
         lines = [f"Delbeställning för {label}: Inget lades i varukorgen."]
     if not_added:
         lines.append("Kunde inte läggas till: "
-                     + "; ".join(f"{name} ({reason})" for name, reason in not_added) + ".")
+                     + "; ".join(f"{name} ({_inline(reason)})" for name, reason in not_added)
+                     + ".")
     if partly:
         lines.append("Kan ligga delvis i varukorgen – kontrollera antalet: " + "; ".join(
-            f"{name} (lade {steps} av {qty}, {reason})" for name, steps, qty, reason in partly)
+            f"{name} (lade {steps} av {qty}, {_inline(reason)})"
+            for name, steps, qty, reason in partly)
             + ".")
     if untried:
         lines.append("Inte försökt: " + ", ".join(untried) + ".")
-    lines.append(PARTIAL_PROMISE_CHECK if partly else PARTIAL_PROMISE)
+    lines.append(promise or (PARTIAL_PROMISE_CHECK if partly else PARTIAL_PROMISE))
     return "\n".join(lines + prepare_section(fluids))
 
 
@@ -834,7 +882,8 @@ def _partial_text(label: str, added: list, not_added: list, partly: list, untrie
 
 def _verified_row(portal, booking_id: str, record: dict, others, sleep, tries: int,
                   wait_s: int, ref, deadline) -> dict | None:
-    """verify_now's search; the verified row or None. May raise (verify_now catches)."""
+    """The immediate-verification search used in production by _verify_placed (and by the
+    test-facing verify_now); the verified row or None. May raise (both callers catch)."""
     if deadline is not None and _clock() > deadline:
         log.info("Immediate verification of %s skipped: past the run's deadline.", booking_id)
         return None

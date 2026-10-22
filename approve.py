@@ -63,7 +63,7 @@ log = logging.getLogger(__name__)
 EXPIRY = timedelta(hours=48)
 VERIFY_WARN_AFTER = timedelta(days=3)
 # The approve step has 8 minutes: an immediate verification after an approved checkout
-# (parts_order.verify_now, up to ~90 s each) may only START within this many seconds of the
+# (parts_order._verify_placed, up to ~90 s each) may only START within this many seconds of the
 # run start (_run_start, a parts_order._clock() value set by main), so the order checker
 # and the state push still fit. Without a run start it is counted from the tap.
 VERIFY_START_S = 270
@@ -78,6 +78,13 @@ CART_CLEARED = "Varukorgen är tömd."
 CART_MANUAL = "Varukorgen kunde inte tömmas – töm varukorgen på pro.meca.se för hand."
 CART_LEFT = "Varukorgen på pro.meca.se innehåller fortfarande delarna – töm varukorgen för hand."
 SWAP_REFUSED = "Bytet är inte längre möjligt."
+SWAP_DEFERRED = "Bytet hinns inte med i den här körningen – tryck Byt igen vid nästa körning."
+STALE_TEXT = "Knappen för {label} är inte längre giltig – använd det senaste meddelandet."
+# Run-level swap cap: every swap in a run must END within SWAP_RUN_S of the run start
+# (_run_start), so the 8-minute approve step keeps room for the order checker and the
+# state push. A swap starts only with its whole budget (parts_order.SWAP_BUDGET_S) left
+# before that point; else it is deferred (nothing changes, the owner taps Byt again).
+SWAP_RUN_S = 400
 SWAP_INDEX_DIGITS = 3  # "swap:<id>:<n>": n is 0-999, plain ASCII digits, no sign or leading 0
 
 
@@ -268,27 +275,41 @@ def _swap(config, session, booking_id, record, line_index, rules, cb) -> tuple[i
     'pending' and age already checked): swap that line to its stored alternative.
 
     (actions taken, run must exit 1). Refused (nothing changes) when parts_order.swap_problem
-    says so. Otherwise: empty the vehicle's cart (a failure stops here and leaves the old
-    approval valid: execute_order re-checks the cart anyway), withdraw the old message,
-    count the swap, and restage with the alternative pinned and the other lines as staged.
-    restage_with_pins sends the new approval message or the SWAP_FAILED text. Never orders.
+    says so, and deferred (nothing changes) when the run has less than SWAP_BUDGET_S left
+    before _run_start + SWAP_RUN_S; both are also told as a plain message, because the
+    callback answer may come too late to be seen. Otherwise: empty the vehicle's cart (a
+    failure withdraws the old approval: the cart may be partly emptied), withdraw the old
+    message, count the swap, and restage with the alternative pinned and the other lines as
+    staged. restage_with_pins sends the new approval message or the SWAP_FAILED text.
+    Never orders.
     """
     import notifier
     import parts_order
-    # The swap's own budget, cart clear included (it must fit in the approve step).
-    deadline = parts_order._clock() + parts_order.SWAP_BUDGET_S
+    label = _label(booking_id, record)
     problem = parts_order.swap_problem(record, line_index, rules)
     if problem:
         log.info("Swap of %s line %r refused: %s.", booking_id, line_index, problem)
         notifier.answer_callback(config, cb, SWAP_REFUSED)
+        _tell(config, f"Byte för {label}: {SWAP_REFUSED}")
         return 0, False
-    label = _label(booking_id, record)
+    # The swap's own budget, cart clear included, capped by the run (SWAP_RUN_S).
+    now = parts_order._clock()
+    deadline = now + parts_order.SWAP_BUDGET_S
+    if _run_start is not None:
+        run_end = _run_start + SWAP_RUN_S
+        if run_end - now < parts_order.SWAP_BUDGET_S:
+            log.info("Swap of %s deferred: %.0f s left in this run.", booking_id, run_end - now)
+            notifier.answer_callback(config, cb, SWAP_DEFERRED)
+            _tell(config, f"Byte för {label}: {SWAP_DEFERRED}")
+            return 0, False
+        deadline = min(deadline, run_end)
     plan = record["plan"]
     notifier.answer_callback(config, cb, "Byter…")
     if not _clear_cart(session, plan["reg_nr"]):
-        log.error("Swap of %s stopped: the cart could not be emptied.", booking_id)
-        if not notifier.send_message(config, f"Bytet för {label} gick inte: {CART_MANUAL}"):
-            log.error("Swap failure message for %s was not delivered.", booking_id)
+        log.error("Swap of %s stopped: the cart could not be emptied; the approval is "
+                  "withdrawn.", booking_id)
+        notifier.clear_buttons(config, record["message_id"])
+        parts_order.swap_clear_failed(config, parts_order.swap_booking(booking_id, record))
         return 1, True
     notifier.clear_buttons(config, record["message_id"])
     booking = parts_order.swap_booking(booking_id, record)
@@ -313,6 +334,17 @@ def _swap(config, session, booking_id, record, line_index, rules, cb) -> tuple[i
         _no_picker, keep=keep, deadline=deadline)
     log.info("Swap of %s line %d: %s.", booking_id, line_index, status)
     return 1, status != "pending"
+
+
+def _tell(config, text: str) -> None:
+    """A plain message for a refused tap (taps are handled once a day, so the callback
+    answer alone may never be seen). Best effort: a lost one is only logged."""
+    import notifier
+    try:
+        if not notifier.send_message(config, text):
+            log.warning("Refusal message was not delivered.")
+    except Exception:
+        log.exception("Refusal message failed.")
 
 
 def _no_picker(line, ranked):
@@ -410,6 +442,8 @@ def _handle_one(config, session, rules, update, owner: str, mark=None) -> tuple[
     if not _is_int(stored) or not _is_int(update.get("message_id")) \
             or update.get("message_id") != stored:
         notifier.answer_callback(config, cb, "Knappen är inte längre giltig.")
+        if action != "klar":  # a stale approval-message button: also told plainly
+            _tell(config, STALE_TEXT.format(label=_label(booking_id, record)))
         return 0, False
     if action == "klar":
         return _klar(config, booking_id, record, cb, mark if mark is not None else mark_handled)

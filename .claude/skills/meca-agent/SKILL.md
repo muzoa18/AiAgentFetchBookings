@@ -19,7 +19,8 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   Godkänn/Avbryt message, plus a `Byt <part>` row per part with an alternative) →
   `run_logger.log_run`.
 - `approve.py` (daily 06:00 UTC): `notifier.get_updates` → Approve: `parts_order.execute_order`
-  (then `verify_now`: the placed order is looked up at once, by plate only);
+  (then `_verify_placed` → `_verified_row`: the placed order is looked up at once, by plate
+  only; `verify_now` is the test-facing wrapper of the same search);
   Cancel: clear cart; Byt (`swap:<id>:<index>`): `approve._swap` → `parts_order.restage_with_pins`
   (new approval message, never orders); Klar: `mark_booking_handled`; expire approvals older
   than 48 h.
@@ -45,8 +46,13 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   means no order. Rules live in `parts_rules.yaml` (`mode: approve`).
 - **A swap or an in-stock replacement never orders.** They only change what the owner is asked to
   approve (same ceiling, brand, fluid and cart checks). Swap: owner only, record `pending`, own
-  message id, at most 2 per booking, 240 s budget, each swap refreshes the 48 h window. `auto`
-  mode never replaces or offers alternatives.
+  message id, at most 2 per booking, 240 s budget (only started with 240 s left before run
+  start + 400 s, else deferred: "Bytet hinns inte med …"), each swap refreshes the 48 h window.
+  A failed cart clear withdraws the old approval (`blocked`, `cart_touched`). Refusals: swap
+  checks "Bytet är inte längre möjligt.", old message "Knappen är inte längre giltig.", not
+  pending "Redan hanterad.", expired "Godkännandet har gått ut."; swap refusals, deferrals and
+  stale buttons are also sent as a plain message (the callback answer may come a day late).
+  `auto` mode never replaces or offers alternatives.
 - **Only the owner's private chat can approve** (`TELEGRAM_CHAT_ID`, never a group).
 - **Alerts, never silence.** A crash (`crash_<name>`), a non-zero exit (`run_failed_<name>`), a
   failed workflow (`workflow_failed_<workflow name>`, `alerts_cli.py`), an unreadable order state
@@ -110,7 +116,7 @@ The full description lives in `SKILL.md` at the repo root (also read by `improve
   asked to check Skickade Beställningar by hand; re-staged like a transient problem). Only an
   empty list lets staging proceed without a match.
 
-## Immediate verification (parts_order.verify_now)
+## Immediate verification (parts_order._verify_placed → _verified_row; verify_now = test-facing)
 - After checkout the Beställd message goes first and unchanged; then the order is looked up in
   "Skickade Beställningar" (3 reads, 10 s apart, 90 s budget; not after approve run start + 270 s,
   nor past the staging deadline in auto mode). Only by plate with the registration column; a real

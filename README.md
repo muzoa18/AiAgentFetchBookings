@@ -104,23 +104,44 @@ private chat, within 48 h).
 with the alternative and everything else as before, the old message loses its buttons, and a
 NEW approval message arrives (with the real unit prices from the cart and `Kund: se bokning
 <nr>`). A swap never orders; you approve the new message. Limits: only you, only while the
-booking is waiting for approval, at most **2 swaps per booking**, about 4 minutes per swap. Each
-swap restarts the 48 h approval window. Process a tap right away by running approve.yml by hand.
+booking is waiting for approval, at most **2 swaps per booking**, about 4 minutes per swap, and
+all swaps of one run must finish within about 6½ minutes of its start: a swap that would not
+fit is not started and you get `Bytet hinns inte med i den här körningen – tryck Byt igen vid
+nästa körning.` (nothing changed; the old buttons still work). Each swap restarts the 48 h
+approval window. Process a tap right away by running approve.yml by hand.
 
-**A failed swap** (portal slow or down, ceiling would be exceeded, cart did not match) never
-leaves you guessing. You get a message such as `Bytet misslyckades – varukorgen är tömd eller
+**If the cart cannot be emptied** for a swap, it may be partly emptied, so the old approval is
+withdrawn (its buttons disappear, a later Godkänn does nothing) and you get `Byte för <nr>:
+varukorgen kunde inte tömmas och kan vara delvis tömd. Det tidigare godkännandet är återkallat –
+kontrollera och töm varukorgen på pro.meca.se för hand, och beställ för hand om delarna
+fortfarande behövs.` with a Klar button.
+
+**A failed swap** (portal slow or down, ceiling would be exceeded, cart did not match, or the
+cart holds another article than the alternative) never leaves you guessing. You get a message such as `Bytet misslyckades – varukorgen är tömd eller
 delvis fylld, kontrollera pro.meca.se`, or `… varukorgen innehåller delarna, kontrollera
 pro.meca.se`, or (after a partly filled cart) `Bytet misslyckades – kontrollera pro.meca.se`
 with lines saying what is in the cart and what was not added. The booking is then no longer
-waiting for approval and is not retried: check the cart on pro.meca.se and order by hand. A tap
-that is no longer valid (swap limit, old message, already handled) only gets "Bytet är inte
-längre möjligt." and nothing changes.
+waiting for approval and is not retried: check the cart on pro.meca.se and order by hand.
+
+**Taps that are not valid any more** change nothing. Taps are handled once a day, so the
+short answer on the button may come too late to see; the cases you need to know about are
+also sent as a normal message:
+- swap limit reached, no alternative, or the alternative no longer allowed: `Byte för <nr>:
+  Bytet är inte längre möjligt.` (also as a message);
+- a button on an old message: `Knappen är inte längre giltig.` (also as a message: `Knappen för
+  <nr> är inte längre giltig – använd det senaste meddelandet.`);
+- a swap that does not fit in this run: `Bytet hinns inte med …` (also as a message, see above);
+- a booking already ordered, cancelled or stopped: `Redan hanterad.` (button answer only);
+- an approval older than 48 h: `Godkännandet har gått ut.` (button answer only; the expiry
+  message is sent separately).
 
 **After you approve.** The **Beställd** message arrives first, as before. Then the agent looks
 for the order in "Skickade Beställningar" for up to ~90 seconds (3 tries, 10 s apart). If it finds
 exactly one order for the car's registration number (and the real order number, if it was read,
 is in that row) you get a second message, `Beställning verifierad: …`. Otherwise nothing more
-is sent now; the daily order checker above takes over. Known gap: for an order whose number
+is sent now; the daily order checker above takes over. No lookup starts later than 270 seconds
+after the approve run started (so the run keeps time for the checker); a later approval is left
+to the daily checker. Known gap: for an order whose number
 could not be read, an earlier order for the same plate could be mistaken for it; the 7-day
 duplicate guard makes that unlikely.
 

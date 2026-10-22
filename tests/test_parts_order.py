@@ -1296,7 +1296,7 @@ def test_all_parts_fail(tg):
         "Kupéfilter (delen finns inte bland delarna som passar bilen)",
         "Oljefilter (delen låg redan i varukorgen)",
         "Oljepluggspackning (varukorgen uppdaterades inte)",
-        "Luftfilter (tekniskt fel (se loggen))",
+        "Luftfilter (tekniskt fel, se loggen)",  # final fix round: no nested parentheses
         "Tändstift (fordonet försvann från sidan)"])))
 
 
@@ -2929,6 +2929,10 @@ def test_restage_partial_add_says_which_parts_are_in_the_cart(tg):
     text = tg["sent"][0]
     assert "Bytet misslyckades" in text and "Kunde inte läggas till: Luftfilter" in text
     assert parts_order.SWAP_FAILED not in text
+    # Final fix round, M-6: the cart was emptied and refilled, so nothing is "untouched".
+    assert "orörda" not in text and "orört" not in text
+    assert parts_order.SWAP_PARTIAL_PROMISE in text
+    assert "(tekniskt fel, se loggen)" in text and "loggen))" not in text
 
 
 def test_swapped_line_shows_the_live_cart_unit_price(tg):
@@ -3412,3 +3416,31 @@ def test_out_of_time_error_names_the_budget_in_use(tg, stage_clock):
     with pytest.raises(PartsPortalError, match="480 s"):
         parts_order._stage(CONFIG, BOOKING, Clocked(stage_clock, per_search=500), APPROVE,
                            confident)
+
+
+
+def test_swap_fails_closed_when_the_cart_line_is_another_article(tg):
+    # Final fix round, M-1: a tampered url_or_id adds another article; its id matches the
+    # expected line, so only the title tells. Never shown or approved as the alternative.
+    record = _staged_for_swap(tg)
+    lines = [{"title": "Bosch Luftfilter Lyx", "qty": 2, "url_or_id": "p3", "price_sek": 200.0},
+             {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2",
+              "price_sek": 250.0}]
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT},
+                        cart=_cart(650.0, lines))
+
+    assert _restage(record, portal) in ("blocked", "failed")
+
+    _assert_swap_failed(tg, portal, "stämmer inte", cart_text=parts_order.SWAP_FAILED_FULL)
+
+
+def test_swap_title_check_ignores_case_and_spacing(tg):
+    record = _staged_for_swap(tg)
+    lines = [{"title": "  MANN  oljefilter w712 ", "qty": 2, "url_or_id": "p3",
+              "price_sek": 200.0},
+             {"title": "Bosch Luftfilter S0123", "qty": 1, "url_or_id": "p2",
+              "price_sek": 250.0}]
+    portal = FakePortal(catalogue={"Oljefilter": [OOS, MANN], "Luftfilter": LUFT},
+                        cart=_cart(650.0, lines))
+
+    assert _restage(record, portal) == "pending"

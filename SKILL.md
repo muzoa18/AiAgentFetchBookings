@@ -36,7 +36,8 @@ notifier.py              Telegram Bot API client (stdlib): messages, inline butt
                          getUpdates
 portal_scraper.py        MECA portal (Playwright): login, Nya tab, detail page, Hanterad → Bekräfta
 parts_order.py           Plan, stage (cart), approval message, swap restage, execute_order (checkout),
-                         verify_now (immediate order lookup)
+                         _verify_placed -> _verified_row (immediate order lookup; verify_now is
+                         the test-facing wrapper of the same search)
 parts_order_helpers.py   Pure helpers: quantities, cart/total checks, Swedish message text, alternatives
 parts_matcher.py         Pure matching: brand rank, ProMeister/fluid/placement filters, Claude picker,
                          stock-aware choice and alternatives (choose_with_alternatives)
@@ -207,13 +208,25 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   and swap rows (then the `Bytt från` notes); Godkänn/Avbryt always stay.
 - **Swap flow** (`approve._swap` → `parts_order.restage_with_pins`): checks (owner, record
   `pending`, message id, `swaps` < 2, line + alternative, ceiling estimate) happen BEFORE
-  anything is touched; a refusal only answers the tap ("Bytet är inte längre möjligt."). Then:
-  clear the vehicle's cart (a failure stops the swap and leaves the old approval valid), clear the
+  anything is touched. Refusal answers differ per case (each changes nothing): `swap_problem`
+  refusals `SWAP_REFUSED` ("Bytet är inte längre möjligt."), an old message "Knappen är inte
+  längre giltig.", a non-pending record "Redan hanterad.", an expired one "Godkännandet har gått
+  ut.". Taps are handled once a day, so the callback answer may arrive late: swap refusals,
+  deferred swaps and stale approval-message buttons are ALSO sent as a plain message
+  (`Byte för <nr>: …`, `STALE_TEXT`). **Run cap:** a swap only starts if
+  `_run_start + SWAP_RUN_S (400 s) - now >= SWAP_BUDGET_S (240 s)`; otherwise it is deferred
+  (`SWAP_DEFERRED`, "Bytet hinns inte med i den här körningen – tryck Byt igen vid nästa
+  körning."), nothing changes, the tap is consumed (offset advanced) and the old buttons stay
+  live for a new tap. Then: clear the vehicle's cart (a failure withdraws the old approval: its
+  buttons are cleared, the record becomes `blocked` with `cart_touched` (never re-staged) and
+  `SWAP_CLEAR_FAILED` is sent with Klar: the cart may be partly emptied), clear the
   old message's buttons, record `attempted` + `swaps + 1` + `cart_touched`, restage with the
   alternative pinned for that line and every other line as staged (no new picking), verify the
   cart and ceiling as in normal staging, and send a NEW approval message (new `message_id`; the
-  record is `pending` again). A swap **never orders**. Its own budget is **240 s** from the tap
-  (`SWAP_BUDGET_S`, cart clear included). Each swap refreshes the approval's 48 h window (two
+  record is `pending` again). A swap **never orders**. Its own budget is **240 s** from the
+  start of its handling (`SWAP_BUDGET_S`, cart clear included), capped at run start + 400 s.
+  After the cart check, the swapped line's live cart title (matched by `url_or_id`) must equal
+  the alternative's (normalised); otherwise the swap fails closed (another article). Each swap refreshes the approval's 48 h window (two
   swaps can keep one approval open for up to about 3 × 48 h). The new message shows the unit
   price from the live cart and `Kund: se bokning <nr>` (no customer data is stored).
 - **A failed swap** ends in a truthful Swedish message and the booking is no longer `pending`
@@ -221,9 +234,12 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   kontrollera pro.meca.se` (emptied or unknown), `… varukorgen innehåller delarna, kontrollera
   pro.meca.se` (every add worked but the ceiling, cart check or the message failed), or `Bytet
   misslyckades – kontrollera pro.meca.se` followed by the lines for what is in the cart and what
-  was not added. The owner then orders by hand.
+  was not added, closed by "Varukorgen tömdes för bytet och innehåller nu bara det som står ovan
+  – kontrollera den på pro.meca.se." The owner then orders by hand.
 
-## Immediate verification (parts_order.verify_now, after checkout)
+## Immediate verification (parts_order._verify_placed, after checkout)
+(Production path: `execute_order` → `_verify_placed` → `_verified_row`. `verify_now` runs the
+same `_verified_row` search as a standalone, test-facing function.)
 - After `checkout()` and the **Beställd** message (sent first and unchanged, "bekräftas senare"
   when only an `UNVERIFIED-…` reference was read), `execute_order` looks the order up in
   "Skickade Beställningar" in the same session: 3 reads 10 s apart, within 90 s. It is a
@@ -261,7 +277,7 @@ Optional lines (Tel, Email, Meddelande, Tjänster/Delar/Vätskor, Totalt) are om
   empty list lets staging proceed without a match.
 
 ## Order checker (approve.py, after the taps)
-(The immediate check in `verify_now` uses the same matching rules for a plate; this daily
+(The immediate check in `_verified_row` uses the same matching rules for a plate; this daily
 checker is the fallback for everything it did not verify.)
 - A placed order often gets only an `UNVERIFIED-<UTC>` reference (no number readable after the
   final click); the Beställd message then says "Ordernummer: bekräftas senare (kolla Skickade
@@ -406,8 +422,8 @@ bot_token/chat_id; ordering additionally needs the parts portal login and the An
   `data-placements`, and the 0-stock policy are unverified until the first supervised live order
   (see `docs/superpowers/plans/2026-10-21-parts-ordering-handoff.md`).
 - `max_alternatives` 2-3 behave like 1. Immediate verification is by plate only and has the
-  residual risk described above. A failed swap leaves an empty or partly filled cart that the
-  owner fixes by hand. Exact duplicate keys in `parts_rules.yaml` are not detected.
+  residual risk described above. A failed swap (or a swap whose cart clear failed, which
+  withdraws the approval) leaves an empty or partly filled cart that the owner fixes by hand. Exact duplicate keys in `parts_rules.yaml` are not detected.
 - The axle-specific part list is incomplete (bromsbackar, bromsslang, English lines); title-only
   matching is used when the portal gives no ids; brand preference is enforced within one search
   term only.
